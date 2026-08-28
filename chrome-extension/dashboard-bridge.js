@@ -3,6 +3,16 @@ const EXTENSION_SOURCE = 'douyin-monitor-extension';
 
 window.addEventListener('message', (event) => {
   if (event.source !== window || event.data?.source !== WEB_SOURCE) return;
+  if (event.data.type === 'PING') {
+    chrome.runtime.sendMessage(event.data, () => {
+      if (chrome.runtime.lastError) {
+        window.postMessage({ source: EXTENSION_SOURCE, type: 'COLLECTION_ERROR', message: chrome.runtime.lastError.message }, window.location.origin);
+        return;
+      }
+      window.postMessage({ source: EXTENSION_SOURCE, type: 'BRIDGE_READY' }, window.location.origin);
+    });
+    return;
+  }
   chrome.runtime.sendMessage(event.data, () => {
     if (chrome.runtime.lastError) {
       window.postMessage({ source: EXTENSION_SOURCE, type: 'COLLECTION_ERROR', message: chrome.runtime.lastError.message }, window.location.origin);
