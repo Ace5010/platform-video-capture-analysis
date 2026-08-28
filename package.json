@@ -1,12 +1,14 @@
 {
   "name": "douyin-competitor-monitor",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
   },
   "scripts": {
-    "dev": "vinext dev",
+    "dev": "powershell -ExecutionPolicy Bypass -File scripts/dev.ps1",
+    "dev:web": "vinext dev",
+    "setup:asr": "powershell -ExecutionPolicy Bypass -File scripts/setup-asr.ps1",
     "build": "vinext build",
     "start": "vinext start",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"

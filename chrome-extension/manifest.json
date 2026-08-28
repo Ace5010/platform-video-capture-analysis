@@ -1,10 +1,19 @@
 {
   "manifest_version": 3,
   "name": "抖音对标监控 - 本地采集组件",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "连接本地工作台与当前 Chrome 登录状态，按队列采集公开抖音账号的视频数据。",
-  "permissions": ["alarms", "scripting", "storage", "tabs"],
-  "host_permissions": ["https://www.douyin.com/*"],
+  "permissions": ["alarms", "scripting", "storage", "tabs", "webRequest", "unlimitedStorage"],
+  "host_permissions": [
+    "https://www.douyin.com/*",
+    "https://*.douyinvod.com/*",
+    "https://*.douyinstatic.com/*",
+    "https://*.douyinpic.com/*",
+    "https://*.zjcdn.com/*",
+    "https://*.bytecdn.cn/*",
+    "https://*.byteimg.com/*",
+    "http://127.0.0.1/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },

@@ -1,0 +1,2 @@
+# Local CPU speech recognition service
+faster-whisper==1.2.1

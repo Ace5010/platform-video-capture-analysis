@@ -1,6 +1,11 @@
 'use client';
 
-import { FormEvent, useEffect, useMemo, useState } from 'react';
+/* eslint-disable @next/next/no-img-element -- 抖音封面是运行时采集的外部地址，不能预先配置图片域名。 */
+
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+
+type AccountStatus = 'waiting' | 'checking' | 'ready' | 'error';
+type TranscriptStatus = 'idle' | 'processing' | 'ready' | 'error';
 
 type Account = {
   id: string;
@@ -8,7 +13,7 @@ type Account = {
   name: string;
   addedAt: string;
   lastCheckedAt: string | null;
-  status: 'waiting' | 'checking' | 'ready' | 'error';
+  status: AccountStatus;
 };
 
 type Video = {
@@ -17,32 +22,54 @@ type Video = {
   title: string;
   description: string;
   url: string;
-  publishedAt: string;
+  coverUrl: string | null;
+  publishedAt: string | null;
+  durationSeconds: number | null;
   playCount: number | null;
-  likeCount: number;
-  commentCount: number;
+  likeCount: number | null;
+  commentCount: number | null;
+  favoriteCount: number | null;
+  shareCount: number | null;
   capturedAt: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
   transcript: string | null;
+  transcriptStatus: TranscriptStatus;
+  transcriptUpdatedAt: string | null;
+  transcriptError: string | null;
 };
 
 type Snapshot = {
   videoId: string;
   playCount: number | null;
-  likeCount: number;
-  commentCount: number;
+  likeCount: number | null;
+  commentCount: number | null;
+  favoriteCount: number | null;
+  shareCount: number | null;
   capturedAt: string;
+};
+
+type CollectionMessage = {
+  eventId?: string;
+  messageId?: string;
+  accountId?: string;
+  accountName?: string;
+  capturedAt?: string;
+  videos?: Array<Partial<Video> & Pick<Video, 'id' | 'accountId' | 'url'>>;
+  warning?: string;
 };
 
 const navItems = [
   ['⌂', '主页仪表盘'],
   ['◎', '对标账号'],
   ['▣', '视频数据'],
-  ['Aa', '口播稿'],
 ];
 
 const accountStoreKey = 'douyin-monitor.accounts.v1';
 const videoStoreKey = 'douyin-monitor.videos.v1';
-const snapshotStoreKey = 'douyin-monitor.snapshots.v1';
+const snapshotStoreKey = 'douyin-monitor.snapshots.v2';
+const processedResultStoreKey = 'douyin-monitor.processed-results.v1';
+const requiredExtensionVersion = '0.2.0';
 
 function readStored<T>(key: string, fallback: T): T {
   if (typeof window === 'undefined') return fallback;
@@ -54,11 +81,58 @@ function readStored<T>(key: string, fallback: T): T {
   }
 }
 
+function nullableNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function normalizeVideo(raw: Partial<Video>, capturedAt = new Date().toISOString()): Video {
+  const previousTranscript = typeof raw.transcript === 'string' && raw.transcript.trim() ? raw.transcript : null;
+  const seenAt = raw.capturedAt || raw.lastSeenAt || capturedAt;
+  return {
+    id: String(raw.id || ''),
+    accountId: String(raw.accountId || ''),
+    title: String(raw.title || raw.description || '未命名视频'),
+    description: String(raw.description || raw.title || ''),
+    url: String(raw.url || ''),
+    coverUrl: raw.coverUrl || null,
+    publishedAt: raw.publishedAt || null,
+    durationSeconds: nullableNumber(raw.durationSeconds),
+    playCount: nullableNumber(raw.playCount),
+    likeCount: nullableNumber(raw.likeCount),
+    commentCount: nullableNumber(raw.commentCount),
+    favoriteCount: nullableNumber(raw.favoriteCount),
+    shareCount: nullableNumber(raw.shareCount),
+    capturedAt: seenAt,
+    firstSeenAt: raw.firstSeenAt || seenAt,
+    lastSeenAt: raw.lastSeenAt || seenAt,
+    transcript: previousTranscript,
+    transcriptStatus: previousTranscript ? 'ready' : (raw.transcriptStatus || 'idle'),
+    transcriptUpdatedAt: raw.transcriptUpdatedAt || null,
+    transcriptError: raw.transcriptError || null,
+  };
+}
+
 function formatTime(value: string | null) {
-  if (!value) return '尚未检查';
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '—';
   return new Intl.DateTimeFormat('zh-CN', {
     month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
-  }).format(new Date(value));
+  }).format(date);
+}
+
+function formatMetric(value: number | null) {
+  if (value === null) return '—';
+  return new Intl.NumberFormat('zh-CN').format(value);
+}
+
+function formatDuration(value: number | null) {
+  if (value === null) return null;
+  const seconds = Math.max(0, Math.round(value));
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
 export default function Home() {
@@ -71,13 +145,20 @@ export default function Home() {
   const [loaded, setLoaded] = useState(false);
   const [notice, setNotice] = useState('');
   const [bridgeReady, setBridgeReady] = useState(false);
+  const [bridgeVersion, setBridgeVersion] = useState<string | null>(null);
+  const [bridgeNeedsReload, setBridgeNeedsReload] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [expandedTranscripts, setExpandedTranscripts] = useState<Set<string>>(new Set());
+  const processedResultIds = useRef<Set<string>>(new Set());
 
   useEffect(() => {
+    processedResultIds.current = new Set(readStored<string[]>(processedResultStoreKey, []));
     const frame = window.requestAnimationFrame(() => {
       setAccounts(readStored<Account[]>(accountStoreKey, []));
-      setVideos(readStored<Video[]>(videoStoreKey, []));
-      setSnapshots(readStored<Snapshot[]>(snapshotStoreKey, []));
+      const storedVideos = readStored<Partial<Video>[]>(videoStoreKey, []);
+      setVideos(Array.isArray(storedVideos) ? storedVideos.map((video) => normalizeVideo(video)) : []);
+      const legacySnapshots = readStored<Snapshot[]>('douyin-monitor.snapshots.v1', []);
+      setSnapshots(readStored<Snapshot[]>(snapshotStoreKey, legacySnapshots));
       setLoaded(true);
     });
     return () => window.cancelAnimationFrame(frame);
@@ -96,33 +177,145 @@ export default function Home() {
   }, [snapshots, loaded]);
 
   useEffect(() => {
+    if (!loaded) return;
+    const applyCollectionResult = (payload: CollectionMessage) => {
+      const eventId = payload.eventId || payload.messageId;
+      if (eventId && processedResultIds.current.has(eventId)) {
+        window.postMessage({ source: 'douyin-monitor', type: 'ACK_RESULTS', eventIds: [eventId] }, window.location.origin);
+        return;
+      }
+
+      const capturedAt = payload.capturedAt || new Date().toISOString();
+      const collected = Array.isArray(payload.videos)
+        ? payload.videos.filter((video) => video?.id && video?.url).map((video) => normalizeVideo(video, capturedAt))
+        : [];
+
+      if (!collected.length) {
+        setAccounts((current) => current.map((account) => account.id === payload.accountId ? { ...account, status: 'error' } : account));
+        setNotice('采集失败：页面没有返回任何可用视频，未写入空结果');
+        if (eventId) window.postMessage({ source: 'douyin-monitor', type: 'ACK_RESULTS', eventIds: [eventId] }, window.location.origin);
+        return;
+      }
+
+      setVideos((current) => {
+        const byId = new Map(current.map((video) => [video.id, video]));
+        for (const incoming of collected) {
+          const previous = byId.get(incoming.id);
+          byId.set(incoming.id, {
+            ...incoming,
+            firstSeenAt: previous?.firstSeenAt || incoming.firstSeenAt,
+            transcript: previous?.transcript || incoming.transcript,
+            transcriptStatus: previous?.transcriptStatus === 'ready' ? 'ready' : incoming.transcriptStatus,
+            transcriptUpdatedAt: previous?.transcriptUpdatedAt || incoming.transcriptUpdatedAt,
+            transcriptError: previous?.transcriptError || incoming.transcriptError,
+          });
+        }
+        return [...byId.values()].sort((a, b) => (b.publishedAt || b.lastSeenAt).localeCompare(a.publishedAt || a.lastSeenAt));
+      });
+      setSnapshots((current) => [...current, ...collected.map((video) => ({
+        videoId: video.id,
+        playCount: video.playCount,
+        likeCount: video.likeCount,
+        commentCount: video.commentCount,
+        favoriteCount: video.favoriteCount,
+        shareCount: video.shareCount,
+        capturedAt,
+      }))]);
+      setAccounts((current) => current.map((account) => payload.accountId === account.id ? {
+        ...account,
+        name: payload.accountName || account.name,
+        lastCheckedAt: capturedAt,
+        status: 'ready',
+      } : account));
+      setProgress(100);
+      setActiveNav('视频数据');
+      setNotice(payload.warning || `采集完成，已更新 ${collected.length} 条视频数据`);
+
+      if (eventId) {
+        processedResultIds.current.add(eventId);
+        window.localStorage.setItem(processedResultStoreKey, JSON.stringify([...processedResultIds.current]));
+        window.postMessage({ source: 'douyin-monitor', type: 'ACK_RESULTS', eventIds: [eventId] }, window.location.origin);
+      }
+    };
+
+    const applyTranscriptResult = (payload: CollectionMessage & { videoId?: string; transcript?: string; completedAt?: string; updatedAt?: string }) => {
+      if (!payload.videoId) return;
+      setVideos((current) => current.map((video) => video.id === payload.videoId ? {
+        ...video,
+        transcript: String(payload.transcript || '').trim(),
+        transcriptStatus: 'ready',
+        transcriptUpdatedAt: payload.updatedAt || payload.completedAt || new Date().toISOString(),
+        transcriptError: null,
+      } : video));
+      setExpandedTranscripts((current) => new Set(current).add(payload.videoId as string));
+      setNotice('口播稿已完成本地识别');
+      if (payload.messageId) window.postMessage({ source: 'douyin-monitor', type: 'ACK_RESULTS', messageIds: [payload.messageId] }, window.location.origin);
+    };
+
+    const applyTranscriptError = (payload: CollectionMessage & { videoId?: string; message?: string }) => {
+      if (!payload.videoId) return;
+      setVideos((current) => current.map((video) => video.id === payload.videoId ? {
+        ...video,
+        transcriptStatus: 'error',
+        transcriptError: payload.message || '本地识别失败',
+      } : video));
+      setExpandedTranscripts((current) => new Set(current).add(payload.videoId as string));
+      setNotice(payload.message || '口播稿提取失败');
+      if (payload.messageId) window.postMessage({ source: 'douyin-monitor', type: 'ACK_RESULTS', messageIds: [payload.messageId] }, window.location.origin);
+    };
+
+    const handshakeTimer = window.setTimeout(() => setBridgeNeedsReload(true), 1800);
     const receive = (event: MessageEvent) => {
       if (event.source !== window || event.data?.source !== 'douyin-monitor-extension') return;
-      if (event.data.type === 'BRIDGE_READY') setBridgeReady(true);
-      if (event.data.type === 'COLLECTION_PROGRESS') setProgress(event.data.progress ?? 0);
-      if (event.data.type === 'COLLECTION_ERROR') setNotice(event.data.message ?? '采集失败，请稍后重试');
-      if (event.data.type === 'COLLECTION_RESULT') {
-        const capturedAt = event.data.capturedAt ?? new Date().toISOString();
-        const collected = (event.data.videos ?? []) as Array<Video & { accountName?: string }>;
-        setVideos((current) => {
-          const byId = new Map(current.map((video) => [video.id, video]));
-          for (const video of collected) byId.set(video.id, { ...byId.get(video.id), ...video, capturedAt, transcript: byId.get(video.id)?.transcript ?? null });
-          return [...byId.values()].sort((a, b) => b.publishedAt.localeCompare(a.publishedAt));
+      if (event.data.type === 'BRIDGE_READY') {
+        setBridgeReady(true);
+        if (event.data.extensionVersion) {
+          setBridgeVersion(event.data.extensionVersion);
+          setBridgeNeedsReload(event.data.extensionVersion !== requiredExtensionVersion);
+          window.clearTimeout(handshakeTimer);
+        }
+      }
+      if (event.data.type === 'SYNC_STATE') {
+        const pending = Array.isArray(event.data.pendingResults) ? event.data.pendingResults : [];
+        pending.forEach((result: CollectionMessage & { type?: string }) => {
+          if (result.type === 'COLLECTION_RESULT') applyCollectionResult(result);
+          else if (result.type === 'TRANSCRIPT_RESULT') applyTranscriptResult(result);
+          else if (result.type === 'TRANSCRIPT_ERROR') applyTranscriptError(result);
+          else if (result.messageId) window.postMessage({ source: 'douyin-monitor', type: 'ACK_RESULTS', messageIds: [result.messageId] }, window.location.origin);
         });
-        setSnapshots((current) => [...current, ...collected.map((video) => ({ videoId: video.id, playCount: video.playCount, likeCount: video.likeCount, commentCount: video.commentCount, capturedAt }))]);
-        setAccounts((current) => current.map((account) => event.data.accountId === account.id ? { ...account, name: event.data.accountName || account.name, lastCheckedAt: capturedAt, status: 'ready' } : account));
-        setProgress(100);
-        setNotice(`采集完成，收到 ${collected.length} 条视频数据`);
+      }
+      if (event.data.type === 'COLLECTION_STARTED') {
+        setAccounts((current) => current.map((account) => account.id === event.data.accountId ? { ...account, status: 'checking' } : account));
+        if (event.data.accountName) setNotice(`正在检查：${event.data.accountName}`);
+      }
+      if (event.data.type === 'COLLECTION_PROGRESS') setProgress(event.data.progress ?? 0);
+      if (event.data.type === 'COLLECTION_ERROR') {
+        setAccounts((current) => current.map((account) => account.id === event.data.accountId ? { ...account, status: 'error' } : account));
+        setNotice(event.data.message ?? '采集失败，请稍后重试');
+        if (event.data.messageId) window.postMessage({ source: 'douyin-monitor', type: 'ACK_RESULTS', messageIds: [event.data.messageId] }, window.location.origin);
+      }
+      if (event.data.type === 'COLLECTION_RESULT') applyCollectionResult(event.data);
+      if (event.data.type === 'TRANSCRIPT_PROGRESS') {
+        setVideos((current) => current.map((video) => video.id === event.data.videoId ? { ...video, transcriptStatus: 'processing', transcriptError: null } : video));
+      }
+      if (event.data.type === 'TRANSCRIPT_RESULT') {
+        applyTranscriptResult(event.data);
+      }
+      if (event.data.type === 'TRANSCRIPT_ERROR') {
+        applyTranscriptError(event.data);
       }
     };
     window.addEventListener('message', receive);
     window.postMessage({ source: 'douyin-monitor', type: 'PING' }, window.location.origin);
-    return () => window.removeEventListener('message', receive);
-  }, []);
+    return () => {
+      window.clearTimeout(handshakeTimer);
+      window.removeEventListener('message', receive);
+    };
+  }, [loaded]);
 
   useEffect(() => {
     if (!notice) return;
-    const timer = window.setTimeout(() => setNotice(''), 3400);
+    const timer = window.setTimeout(() => setNotice(''), 4200);
     return () => window.clearTimeout(timer);
   }, [notice]);
 
@@ -132,12 +325,12 @@ export default function Home() {
     return date.getTime();
   }, []);
 
-  const todayVideos = videos.filter((video) => new Date(video.capturedAt).getTime() >= todayStart).length;
-  const pendingTranscripts = videos.filter((video) => !video.transcript).length;
-  const completedTranscripts = videos.filter((video) => video.transcript).length;
+  const todayVideos = videos.filter((video) => new Date(video.firstSeenAt).getTime() >= todayStart).length;
+  const pendingTranscripts = videos.filter((video) => video.transcriptStatus !== 'ready').length;
+  const completedTranscripts = videos.filter((video) => video.transcriptStatus === 'ready').length;
   const lastChecked = accounts
     .map((account) => account.lastCheckedAt)
-    .filter(Boolean)
+    .filter((value): value is string => Boolean(value))
     .sort()
     .at(-1) ?? null;
 
@@ -146,9 +339,7 @@ export default function Home() {
     const value = accountUrl.trim();
     try {
       const parsed = new URL(value);
-      if (!parsed.hostname.endsWith('douyin.com') || !parsed.pathname.includes('/user/')) {
-        throw new Error('invalid');
-      }
+      if (!parsed.hostname.endsWith('douyin.com') || !parsed.pathname.includes('/user/')) throw new Error('invalid');
       if (accounts.some((account) => account.url === value)) {
         setNotice('这个账号已经在监控列表中');
         return;
@@ -164,7 +355,7 @@ export default function Home() {
       setAccounts((current) => [...current, account]);
       setAccountUrl('');
       setShowAddAccount(false);
-      setNotice('账号已加入，等待连接 Chrome 后首次检查');
+      setNotice('账号已加入，可以立即检查');
     } catch {
       setNotice('请输入正确的抖音账号主页链接');
     }
@@ -176,24 +367,59 @@ export default function Home() {
       return;
     }
     if (!bridgeReady) {
-      setNotice('Chrome 采集组件尚未连接，请先加载项目中的浏览器组件');
+      setNotice('Chrome 采集组件尚未连接，请重新加载浏览器组件');
       return;
     }
+    if (bridgeNeedsReload || bridgeVersion !== requiredExtensionVersion) {
+      setNotice(`Chrome 采集组件需要刷新到 v${requiredExtensionVersion}，请在 chrome://extensions 点击扩展卡片的“刷新”`);
+      return;
+    }
+    setAccounts((current) => current.map((account) => ({ ...account, status: 'checking' })));
     setProgress(2);
     window.postMessage({ source: 'douyin-monitor', type: 'CHECK_ALL', accounts }, window.location.origin);
-    setNotice('已发送检查请求，Chrome 正在按顺序采集');
+    setNotice('已开始检查，Chrome 正在读取真实视频数据');
+  };
+
+  const requestTranscript = (video: Video, force = false) => {
+    if (video.transcriptStatus === 'processing') return;
+    if (video.transcript && !force) {
+      setExpandedTranscripts((current) => {
+        const next = new Set(current);
+        if (next.has(video.id)) next.delete(video.id); else next.add(video.id);
+        return next;
+      });
+      return;
+    }
+    if (!bridgeReady) {
+      setNotice('Chrome 采集组件尚未连接，无法提取音频');
+      return;
+    }
+    if (bridgeNeedsReload || bridgeVersion !== requiredExtensionVersion) {
+      setNotice(`Chrome 采集组件需要刷新到 v${requiredExtensionVersion}，请在 chrome://extensions 点击扩展卡片的“刷新”`);
+      return;
+    }
+    setVideos((current) => current.map((item) => item.id === video.id ? { ...item, transcriptStatus: 'processing', transcriptError: null } : item));
+    setExpandedTranscripts((current) => new Set(current).add(video.id));
+    window.postMessage({
+      source: 'douyin-monitor',
+      type: 'EXTRACT_TRANSCRIPT',
+      video: { id: video.id, url: video.url, title: video.title },
+    }, window.location.origin);
+    setNotice('正在提取临时音频并进行本地识别，首次使用会下载识别模型');
   };
 
   const removeAccount = (id: string) => {
+    const removedVideoIds = new Set(videos.filter((video) => video.accountId === id).map((video) => video.id));
     setAccounts((current) => current.filter((account) => account.id !== id));
     setVideos((current) => current.filter((video) => video.accountId !== id));
+    setSnapshots((current) => current.filter((snapshot) => !removedVideoIds.has(snapshot.videoId)));
     setNotice('账号及其本地记录已移除');
   };
 
   const statCards = [
     ['监控账号', accounts.length, accounts.length ? '账号数量不设上限' : '等待添加对标账号'],
     ['收录视频', videos.length, lastChecked ? `${snapshots.length} 份快照 · ${formatTime(lastChecked)}` : '尚未开始首次检查'],
-    ['今日新增', todayVideos, '最近 24 小时采集'],
+    ['今日新增', todayVideos, '今日首次收录的视频'],
     ['待转写', pendingTranscripts, `${completedTranscripts} 条已完成本地识别`],
   ];
 
@@ -213,7 +439,7 @@ export default function Home() {
           ))}
         </nav>
         <div className="sidebarFoot">
-          <div className={bridgeReady ? 'localStatus connected' : 'localStatus'}><i /><span><b>数据仅存本机</b><small>{bridgeReady ? 'Chrome 已连接' : 'Chrome 等待连接'}</small></span></div>
+          <div className={bridgeReady && !bridgeNeedsReload ? 'localStatus connected' : 'localStatus'}><i /><span><b>数据仅存本机</b><small>{bridgeNeedsReload ? `Chrome 组件需刷新到 v${requiredExtensionVersion}` : bridgeReady ? `Chrome 已连接${bridgeVersion ? ` · v${bridgeVersion}` : ''}` : 'Chrome 等待连接'}</small></span></div>
           <button className="settingsButton">⚙ 每 6 小时检查</button>
         </div>
       </aside>
@@ -244,11 +470,11 @@ export default function Home() {
             </div>
             <article className="collectionPanel">
               <div className="collectionHeader">
-                <div><p className="liveLabel"><i /> LOCAL COLLECTION</p><h2>采集任务</h2><span>{bridgeReady ? 'Chrome 已连接，可按顺序检查最新作品' : accounts.length ? '等待 Chrome 采集组件连接' : '添加账号后，系统将按顺序检查最新作品'}</span></div>
+                <div><p className="liveLabel"><i /> LOCAL COLLECTION</p><h2>采集任务</h2><span>{bridgeNeedsReload ? `请先将 Chrome 组件刷新到 v${requiredExtensionVersion}` : bridgeReady ? 'Chrome 已连接，可读取真实视频详情' : accounts.length ? '等待 Chrome 采集组件连接' : '添加账号后，系统将按顺序检查最新作品'}</span></div>
                 <div className="progressValue"><span>PROGRESS</span><b>{progress}%</b></div>
               </div>
               <div className="progressTrack"><span style={{ width: `${Math.max(progress, 2)}%` }} /></div>
-              <div className="progressMarks"><span>等待开始</span><span>检查账号</span><span>生成数据快照</span><span>完成</span></div>
+              <div className="progressMarks"><span>等待开始</span><span>检查账号</span><span>读取视频详情</span><span>完成</span></div>
             </article>
             <SectionHeading label="MONITOR BOARD" title="账号监控" count={`${accounts.length} 个账号`} />
             <AccountBoard accounts={accounts} onAdd={() => setShowAddAccount(true)} onRemove={removeAccount} />
@@ -260,11 +486,7 @@ export default function Home() {
         )}
 
         {activeNav === '视频数据' && (
-          <><SectionHeading label="VIDEO SNAPSHOTS" title="视频与数据快照" count={`${videos.length} 条视频`} /><VideoTable videos={videos} /></>
-        )}
-
-        {activeNav === '口播稿' && (
-          <><SectionHeading label="LOCAL TRANSCRIPTS" title="本地口播稿" count={`${completedTranscripts} 条完成`} /><TranscriptBoard videos={videos} /></>
+          <><SectionHeading label="VIDEO SNAPSHOTS" title="视频与数据快照" count={`${videos.length} 条视频`} /><VideoTable videos={videos} expandedTranscripts={expandedTranscripts} onTranscript={requestTranscript} /></>
         )}
       </section>
 
@@ -291,29 +513,69 @@ function SectionHeading({ label, title, count }: { label: string; title: string;
   return <div className="sectionHeading"><div><p className="eyebrow">{label}</p><h2>{title}</h2></div><span>{count}</span></div>;
 }
 
+const accountStatusLabels: Record<AccountStatus, string> = {
+  waiting: '等待检查',
+  checking: '正在采集',
+  ready: '采集正常',
+  error: '采集失败',
+};
+
 function AccountBoard({ accounts, onAdd, onRemove }: { accounts: Account[]; onAdd: () => void; onRemove: (id: string) => void }) {
   if (!accounts.length) {
-    return <section className="emptyBoard"><div className="emptySymbol">＋</div><h3>添加第一个对标账号</h3><p>粘贴抖音账号主页链接，之后会自动记录最新视频和数据变化。</p><button className="primaryButton" onClick={onAdd}>添加抖音账号</button><small>不保存完整视频 · 不采集评论正文</small></section>;
+    return <section className="emptyBoard"><div className="emptySymbol">＋</div><h3>添加第一个对标账号</h3><p>粘贴抖音账号主页链接，之后会自动记录最新视频和五项互动数据的变化。</p><button className="primaryButton" onClick={onAdd}>添加抖音账号</button><small>不保存完整视频 · 不采集评论正文</small></section>;
   }
   return <section className="accountGrid">{accounts.map((account, index) => (
     <article className="accountCard" key={account.id}>
-      <div className="accountTop"><div className="accountAvatar">{index + 1}</div><span className="statusPill">等待检查</span></div>
+      <div className="accountTop"><div className="accountAvatar">{index + 1}</div><span className={`statusPill ${account.status}`}>{accountStatusLabels[account.status]}</span></div>
       <h3>{account.name}</h3><a href={account.url} target="_blank" rel="noreferrer">打开原账号主页 ↗</a>
-      <div className="accountMeta"><span><small>最近检查</small><b>{formatTime(account.lastCheckedAt)}</b></span><span><small>采集周期</small><b>每 6 小时</b></span></div>
+      <div className="accountMeta"><span><small>最近检查</small><b>{account.lastCheckedAt ? formatTime(account.lastCheckedAt) : '尚未检查'}</b></span><span><small>采集周期</small><b>每 6 小时</b></span></div>
       <button className="dangerLink" onClick={() => onRemove(account.id)}>移除账号</button>
     </article>
   ))}</section>;
 }
 
-function VideoTable({ videos }: { videos: Video[] }) {
-  if (!videos.length) return <EmptyData title="还没有视频数据" detail="首次检查完成后，这里会显示标题、正文、播放量、点赞量、评论量和原视频链接。" />;
-  return <div className="dataTable"><div className="tableRow tableHead"><span>视频</span><span>播放</span><span>点赞</span><span>评论</span><span>采集时间</span></div>{videos.map((video) => <div className="tableRow" key={video.id}><span><a href={video.url} target="_blank" rel="noreferrer">{video.title || '未命名视频'} ↗</a><small>{video.description}</small></span><b>{video.playCount ?? '—'}</b><b>{video.likeCount}</b><b>{video.commentCount}</b><time>{formatTime(video.capturedAt)}</time></div>)}</div>;
-}
-
-function TranscriptBoard({ videos }: { videos: Video[] }) {
-  const transcripts = videos.filter((video) => video.transcript);
-  if (!transcripts.length) return <EmptyData title="还没有本地口播稿" detail="发现新视频后，只提取临时音频并在本机识别；完整视频不会保存。" />;
-  return <section className="transcriptList">{transcripts.map((video) => <article key={video.id}><a href={video.url} target="_blank" rel="noreferrer">{video.title} ↗</a><p>{video.transcript}</p></article>)}</section>;
+function VideoTable({ videos, expandedTranscripts, onTranscript }: {
+  videos: Video[];
+  expandedTranscripts: Set<string>;
+  onTranscript: (video: Video, force?: boolean) => void;
+}) {
+  if (!videos.length) return <EmptyData title="还没有视频数据" detail="检查成功后，这里会显示封面、视频文案、播放、点赞、评论、收藏、分享和原视频链接。空结果不会再被当作成功。" />;
+  return <div className="videoTableScroll"><div className="videoTable">
+    <div className="videoTableHead"><span>视频与文案</span><span>数据快照</span><span>时间</span><span>操作</span></div>
+    {videos.map((video) => {
+      const duration = formatDuration(video.durationSeconds);
+      const expanded = expandedTranscripts.has(video.id);
+      const metrics = [
+        ['播放', video.playCount],
+        ['点赞', video.likeCount],
+        ['评论', video.commentCount],
+        ['收藏', video.favoriteCount],
+        ['分享', video.shareCount],
+      ] as const;
+      return <article className="videoRecord" key={video.id}>
+        <div className="videoMainRow">
+          <div className="videoIdentity">
+            <a className="coverLink" href={video.url} target="_blank" rel="noreferrer" aria-label="打开原视频">
+              {video.coverUrl ? <img src={video.coverUrl} alt="" referrerPolicy="no-referrer" /> : <span>无封面</span>}
+              {duration && <i>{duration}</i>}
+            </a>
+            <div className="videoCopy"><a href={video.url} target="_blank" rel="noreferrer">{video.title || '未命名视频'} ↗</a><p>{video.description || '未提取到视频文案'}</p></div>
+          </div>
+          <div className="metricGrid">{metrics.map(([label, value]) => <span key={label}><small>{label}</small><b>{formatMetric(value)}</b></span>)}</div>
+          <div className="videoTimes"><span><small>发布</small><b>{formatTime(video.publishedAt)}</b></span><span><small>采集</small><b>{formatTime(video.lastSeenAt)}</b></span></div>
+          <button className={`transcriptButton ${video.transcriptStatus}`} disabled={video.transcriptStatus === 'processing'} onClick={() => onTranscript(video)}>
+            {video.transcriptStatus === 'processing' ? '识别中…' : video.transcript ? (expanded ? '收起口播稿' : '查看口播稿') : video.transcriptStatus === 'error' ? '重新提取' : '一键提取口播稿'}
+          </button>
+        </div>
+        {expanded && <div className={`transcriptPanel ${video.transcriptStatus}`}>
+          <div><b>本地口播稿</b>{video.transcriptUpdatedAt && <small>更新于 {formatTime(video.transcriptUpdatedAt)}</small>}</div>
+          {video.transcriptStatus === 'processing' && <p>正在从原视频临时提取音频并在本机识别，请保持 Chrome 和本地服务运行。</p>}
+          {video.transcriptStatus === 'error' && <p className="transcriptError">{video.transcriptError || '识别失败，请重新尝试。'}</p>}
+          {video.transcript && <><p>{video.transcript}</p><button type="button" onClick={() => onTranscript(video, true)}>重新提取</button></>}
+        </div>}
+      </article>;
+    })}
+  </div></div>;
 }
 
 function EmptyData({ title, detail }: { title: string; detail: string }) {
