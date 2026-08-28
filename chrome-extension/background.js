@@ -17,6 +17,7 @@ const MEDIA_URL_PATTERNS = [
 const TRANSCRIBE_ENDPOINT = 'http://127.0.0.1:43128/transcribe';
 
 let pendingResultsMutation = Promise.resolve();
+let collectionInProgress = false;
 
 chrome.runtime.onInstalled.addListener(async () => {
   await ensureSixHourAlarm();
@@ -78,10 +79,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
+    if (collectionInProgress) {
+      sendResponse({ accepted: false, error: '已有采集任务正在运行，请等待当前任务完成' });
+      return;
+    }
+
+    collectionInProgress = true;
+
     void chrome.storage.local.set({ accounts })
       .then(() => {
         sendResponse({ accepted: true });
-        void collectAll(accounts, sender.tab?.id);
+        return collectAll(accounts, sender.tab?.id);
       })
       .catch((error) => {
         sendResponse({ accepted: false, error: errorMessage(error) });
@@ -91,6 +99,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           message: `保存账号列表失败：${errorMessage(error)}`,
           capturedAt: new Date().toISOString(),
         }, sender.tab?.id);
+      })
+      .finally(() => {
+        collectionInProgress = false;
       });
     return true;
   }
@@ -123,6 +134,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 async function runScheduledCollection() {
+  if (collectionInProgress) return;
+  collectionInProgress = true;
   try {
     const { accounts = [] } = await chrome.storage.local.get('accounts');
     const validAccounts = Array.isArray(accounts) ? accounts.filter(isValidAccount) : [];
@@ -134,6 +147,8 @@ async function runScheduledCollection() {
       message: `定时采集启动失败：${errorMessage(error)}`,
       capturedAt: new Date().toISOString(),
     });
+  } finally {
+    collectionInProgress = false;
   }
 }
 
@@ -205,7 +220,7 @@ async function collectAccount(account, onProgress) {
 
   try {
     await waitForTab(tab.id);
-    const readiness = await executeInTab(tab.id, waitForAccountVideoDom, [ACCOUNT_DOM_WAIT_MS]);
+    const readiness = await executeInTab(tab.id, waitForAccountVideoDom, [ACCOUNT_DOM_WAIT_MS, MAX_VISIBLE_VIDEOS]);
     if (!readiness?.ready) {
       const pageLabel = readiness?.title ? `（${readiness.title}）` : '';
       throw new Error(`等待约 25 秒后仍未发现真实 /video/ 作品节点${pageLabel}，可能遇到登录、验证码、风控或页面结构变化`);
@@ -214,6 +229,14 @@ async function collectAccount(account, onProgress) {
     const accountPage = await executeInTab(tab.id, extractAccountPage, [MAX_VISIBLE_VIDEOS]);
     if (!accountPage || !Array.isArray(accountPage.videos)) {
       throw new Error('账号页没有返回可识别的数据结构');
+    }
+    const expectedAccountKey = accountProfileKeyFromUrl(account.url);
+    const observedAccountKey = accountProfileKeyFromUrl(accountPage.pageUrl);
+    if (expectedAccountKey && observedAccountKey !== expectedAccountKey) {
+      throw new Error(`账号页已跳转到其他主页（${accountPage.pageUrl || '未知地址'}），已停止写入`);
+    }
+    if (accountPage.scoped !== true) {
+      throw new Error('未能定位当前账号的作品列表，已停止以避免混入推荐或页脚视频');
     }
     if (accountPage.videos.length === 0) {
       throw new Error('账号页没有可采集的非置顶可见视频');
@@ -263,6 +286,11 @@ async function collectVideoDetails(videoUrl) {
     const readiness = await executeInTab(tab.id, waitForVideoDetailDom, [DETAIL_DOM_WAIT_MS]);
     if (!readiness?.ready) {
       throw new Error('视频详情页未出现 data-e2e 数据节点');
+    }
+    const expectedVideoId = videoIdFromUrl(videoUrl);
+    const observedVideoId = videoIdFromUrl(readiness.url);
+    if (expectedVideoId && observedVideoId !== expectedVideoId) {
+      throw new Error(`详情页已跳转到其他视频（${observedVideoId}），已停止写入`);
     }
     const details = await executeInTab(tab.id, extractVideoDetailPage);
     if (!details) throw new Error('视频详情页没有返回数据');
@@ -578,8 +606,33 @@ function normalizeAckIds(message) {
 function normalizeVideoId(videoId, videoUrl) {
   if (typeof videoId === 'string' && /^\d+$/.test(videoId)) return videoId;
   if (typeof videoId === 'number' && Number.isSafeInteger(videoId) && videoId > 0) return String(videoId);
-  if (typeof videoUrl === 'string') return videoUrl.match(/\/video\/(\d+)/)?.[1] || null;
+  if (typeof videoUrl === 'string') return videoIdFromUrl(videoUrl);
   return null;
+}
+
+function videoIdFromUrl(value) {
+  if (typeof value !== 'string') return null;
+  try {
+    const parsed = new URL(value);
+    const pathMatch = parsed.pathname.match(/\/video\/(\d+)/);
+    if (pathMatch) return pathMatch[1];
+    const modalId = parsed.searchParams.get('modal_id');
+    return /^\d+$/.test(modalId || '') ? modalId : null;
+  } catch {
+    return value.match(/\/video\/(\d+)/)?.[1]
+      || value.match(/[?&]modal_id=(\d+)/)?.[1]
+      || null;
+  }
+}
+
+function accountProfileKeyFromUrl(value) {
+  if (typeof value !== 'string') return null;
+  try {
+    const parsed = new URL(value);
+    return parsed.pathname.match(/^\/user\/([^/]+)/)?.[1] || null;
+  } catch {
+    return value.match(/\/user\/([^/?#]+)/)?.[1] || null;
+  }
 }
 
 function normalizeVideoUrl(videoUrl, videoId) {
@@ -654,25 +707,39 @@ async function waitForTab(tabId, timeoutMs = 45_000) {
   });
 }
 
-function waitForAccountVideoDom(timeoutMs) {
+function waitForAccountVideoDom(timeoutMs, minimumVideos = 1) {
   const isVisible = (element) => {
     if (!(element instanceof HTMLElement)) return false;
     const style = getComputedStyle(element);
     if (style.display === 'none' || style.visibility === 'hidden') return false;
     return element.getClientRects().length > 0 || Boolean(element.querySelector('img, video'));
   };
+  const findAccountRoot = () => {
+    const preferredRoots = [
+      document.querySelector('#user_detail_element'),
+      document.querySelector('[data-e2e="user-detail"]'),
+      document.querySelector('[data-e2e="user-post-list"]'),
+    ].filter(Boolean);
+    return preferredRoots.find((root) => root.querySelector('a[href*="/video/"]'))
+      || preferredRoots[0]
+      || null;
+  };
   const inspect = () => {
-    const anchors = [...document.querySelectorAll('a[href*="/video/"]')]
+    const root = findAccountRoot();
+    const anchors = [...(root || document.body).querySelectorAll('a[href*="/video/"]')]
+      .filter((anchor) => !anchor.closest('footer, .user-page-footer'))
       .filter((anchor) => /\/video\/\d+/.test(anchor.href) && isVisible(anchor));
     return {
       ready: anchors.length > 0,
+      enough: anchors.length >= minimumVideos,
       count: anchors.length,
+      scoped: Boolean(root),
       title: document.title,
       url: location.href,
     };
   };
   const immediate = inspect();
-  if (immediate.ready) return Promise.resolve(immediate);
+  if (immediate.enough) return Promise.resolve(immediate);
   return new Promise((resolve) => {
     let settled = false;
     const finish = (result) => {
@@ -685,7 +752,7 @@ function waitForAccountVideoDom(timeoutMs) {
     };
     const check = () => {
       const result = inspect();
-      if (result.ready) finish(result);
+      if (result.enough) finish(result);
     };
     const observer = new MutationObserver(check);
     observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
@@ -801,6 +868,25 @@ function extractAccountPage(maxVideos) {
       && style.visibility !== 'hidden'
       && (element.getClientRects().length > 0 || Boolean(element.querySelector('img, video')));
   };
+  const accountName = document.querySelector('[data-e2e="user-title"]')?.textContent?.trim()
+    || document.querySelector('h1')?.textContent?.trim()
+    || document.title.replace(/[-_].*$/, '').trim()
+    || '抖音账号';
+  const findAccountRoot = () => {
+    const candidates = [
+      document.querySelector('#user_detail_element'),
+      document.querySelector('[data-e2e="user-detail"]'),
+      document.querySelector('[data-e2e="user-post-list"]'),
+    ];
+    const selectedWorkTab = [...document.querySelectorAll('[role="tab"][aria-selected="true"]')]
+      .find((tab) => /作品/.test(tab.textContent || tab.getAttribute('aria-label') || ''));
+    const controlledPanelId = selectedWorkTab?.getAttribute('aria-controls');
+    if (controlledPanelId) candidates.push(document.getElementById(controlledPanelId));
+    return candidates.find((candidate) => candidate?.querySelector('a[href*="/video/"]')) || null;
+  };
+  const accountRoot = findAccountRoot();
+  const scopedToAccountPage = Boolean(accountRoot && accountRoot !== document.body);
+  const anchorScope = accountRoot || document.body;
   const findCard = (anchor) => {
     let current = anchor;
     let candidate = anchor;
@@ -847,9 +933,15 @@ function extractAccountPage(maxVideos) {
 
   const seen = new Set();
   const videos = [];
-  for (const anchor of document.querySelectorAll('a[href*="/video/"]')) {
+  for (const anchor of anchorScope.querySelectorAll('a[href*="/video/"]')) {
+    if (anchor.closest('footer, .user-page-footer')) continue;
     const match = anchor.href.match(/\/video\/(\d+)/);
     if (!match || seen.has(match[1]) || !isVisible(anchor)) continue;
+    if (!scopedToAccountPage) {
+      const imageAlt = anchor.querySelector('img')?.getAttribute('alt')?.trim() || '';
+      const anchorText = anchor.textContent?.trim() || '';
+      if (!accountName || (!imageAlt.startsWith(accountName) && !anchorText.includes(accountName))) continue;
+    }
     const id = match[1];
     const card = findCard(anchor);
     const data = structured.get(id) || {};
@@ -882,11 +974,13 @@ function extractAccountPage(maxVideos) {
     if (videos.length >= maxVideos) break;
   }
 
-  const accountName = document.querySelector('[data-e2e="user-title"]')?.textContent?.trim()
-    || document.querySelector('h1')?.textContent?.trim()
-    || document.title.replace(/[-_].*$/, '').trim()
-    || '抖音账号';
-  return { accountName, videos, pageUrl: location.href };
+  return {
+    accountName,
+    videos,
+    pageUrl: location.href,
+    scoped: scopedToAccountPage,
+    rootId: accountRoot?.id || null,
+  };
 }
 
 function waitForVideoDetailDom(timeoutMs) {
