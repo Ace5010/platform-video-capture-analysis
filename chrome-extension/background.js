@@ -1,10 +1,14 @@
 const SIX_HOURS_MINUTES = 360;
 const ALARM_NAME = 'douyin-monitor-six-hour-check';
+const SCHEDULER_STATE_KEY = 'schedulerState';
+const COLLECTION_LOCK_KEY = 'collectionLock';
+const COLLECTION_LOCK_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const ACCOUNT_DOM_WAIT_MS = 25_000;
 const DETAIL_DOM_WAIT_MS = 15_000;
 const MEDIA_CAPTURE_WAIT_MS = 22_000;
 const TRANSCRIBE_TIMEOUT_MS = 180_000;
-const MAX_VISIBLE_VIDEOS = 20;
+const INITIAL_HISTORY_VIDEOS = 30;
+const LATEST_CHECK_VIDEOS = 3;
 const DASHBOARD_URL_PATTERNS = ['http://localhost/*', 'http://127.0.0.1/*'];
 const MEDIA_URL_PATTERNS = [
   'https://*.douyinvod.com/*',
@@ -20,7 +24,7 @@ let pendingResultsMutation = Promise.resolve();
 let collectionInProgress = false;
 
 chrome.runtime.onInstalled.addListener(async () => {
-  await ensureSixHourAlarm();
+  await initializeScheduler({ allowCatchUp: true });
   const stored = await chrome.storage.local.get('pendingResults');
   if (!Array.isArray(stored.pendingResults)) {
     await chrome.storage.local.set({ pendingResults: [] });
@@ -28,38 +32,202 @@ chrome.runtime.onInstalled.addListener(async () => {
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  void ensureSixHourAlarm();
+  void initializeScheduler({ allowCatchUp: true });
 });
 
-void ensureSixHourAlarm();
+void initializeScheduler({ allowCatchUp: true });
 
 async function ensureSixHourAlarm() {
-  const existing = await chrome.alarms.get(ALARM_NAME);
+  let existing = await chrome.alarms.get(ALARM_NAME);
   if (!existing) {
     await chrome.alarms.create(ALARM_NAME, {
       delayInMinutes: SIX_HOURS_MINUTES,
       periodInMinutes: SIX_HOURS_MINUTES,
     });
+    existing = await chrome.alarms.get(ALARM_NAME);
+  }
+  return existing;
+}
+
+function emptySchedulerState() {
+  return {
+    enabled: true,
+    alarmRegistered: false,
+    periodMinutes: SIX_HOURS_MINUTES,
+    monitoredAccountCount: 0,
+    registeredAt: null,
+    checkedAt: null,
+    nextRunAt: null,
+    lastAttemptAt: null,
+    lastCompletedAt: null,
+    lastSuccessAt: null,
+    lastRunStatus: 'never',
+    lastTrigger: null,
+    lastError: null,
+    missedRunRecoveredAt: null,
+  };
+}
+
+function normalizeSchedulerState(value) {
+  const fallback = emptySchedulerState();
+  if (!value || typeof value !== 'object') return fallback;
+  return {
+    ...fallback,
+    ...value,
+    enabled: value.enabled !== false,
+    alarmRegistered: value.alarmRegistered === true,
+    periodMinutes: SIX_HOURS_MINUTES,
+    monitoredAccountCount: Number.isFinite(Number(value.monitoredAccountCount))
+      ? Math.max(0, Number(value.monitoredAccountCount))
+      : 0,
+  };
+}
+
+function alarmNextRunAt(alarm) {
+  const scheduledTime = Number(alarm?.scheduledTime);
+  if (!Number.isFinite(scheduledTime)) return null;
+  const futureTime = scheduledTime > Date.now()
+    ? scheduledTime
+    : Date.now() + SIX_HOURS_MINUTES * 60 * 1000;
+  return new Date(futureTime).toISOString();
+}
+
+async function readSchedulerState() {
+  const stored = await chrome.storage.local.get(SCHEDULER_STATE_KEY);
+  return normalizeSchedulerState(stored[SCHEDULER_STATE_KEY]);
+}
+
+async function saveSchedulerState(patch, dashboardTabId) {
+  const current = await readSchedulerState();
+  const alarm = await ensureSixHourAlarm();
+  const definedPatch = Object.fromEntries(Object.entries(patch || {}).filter(([, value]) => value !== undefined));
+  const next = {
+    ...current,
+    ...definedPatch,
+    enabled: true,
+    alarmRegistered: Boolean(alarm),
+    periodMinutes: SIX_HOURS_MINUTES,
+    registeredAt: current.registeredAt || new Date().toISOString(),
+    nextRunAt: alarmNextRunAt(alarm),
+  };
+  await chrome.storage.local.set({ [SCHEDULER_STATE_KEY]: next });
+  await sendToDashboard({ type: 'SCHEDULER_STATE', schedulerState: next }, dashboardTabId);
+  return next;
+}
+
+async function getSchedulerSnapshot() {
+  const stored = await chrome.storage.local.get(['accounts', SCHEDULER_STATE_KEY]);
+  const accounts = Array.isArray(stored.accounts) ? stored.accounts.filter(isValidAccount) : [];
+  return saveSchedulerState({
+    monitoredAccountCount: accounts.filter((account) => account.initialSyncStatus === 'complete').length,
+    checkedAt: new Date().toISOString(),
+  });
+}
+
+async function initializeScheduler({ allowCatchUp = false } = {}) {
+  const stored = await chrome.storage.local.get(['accounts', SCHEDULER_STATE_KEY]);
+  const previous = normalizeSchedulerState(stored[SCHEDULER_STATE_KEY]);
+  const previousNextRun = previous.nextRunAt ? Date.parse(previous.nextRunAt) : Number.NaN;
+  const wasOverdue = Number.isFinite(previousNextRun) && previousNextRun <= Date.now();
+  const existingAlarm = await chrome.alarms.get(ALARM_NAME);
+  const alarm = existingAlarm || await ensureSixHourAlarm();
+  const accounts = Array.isArray(stored.accounts) ? stored.accounts.filter(isValidAccount) : [];
+  const scheduledAccounts = accounts.filter((account) => account.initialSyncStatus === 'complete');
+  const state = await saveSchedulerState({
+    alarmRegistered: Boolean(alarm),
+    monitoredAccountCount: scheduledAccounts.length,
+    checkedAt: new Date().toISOString(),
+  });
+  if (allowCatchUp && !existingAlarm && wasOverdue && scheduledAccounts.length) {
+    void runScheduledCollection('catch-up');
+  }
+  return state;
+}
+
+async function syncAccountsAndScheduler(incomingAccounts, dashboardTabId) {
+  const stored = await chrome.storage.local.get('accounts');
+  const previousAccounts = Array.isArray(stored.accounts) ? stored.accounts : [];
+  const previousById = new Map(previousAccounts.map((account) => [account?.id, account]));
+  const accounts = incomingAccounts.map((incoming) => {
+    const previous = previousById.get(incoming.id);
+    const preserveCompleted = previous?.initialSyncStatus === 'complete' && incoming.initialSyncStatus !== 'complete';
+    return preserveCompleted ? {
+      ...previous,
+      ...incoming,
+      initialSyncStatus: 'complete',
+      initialSyncCompletedAt: previous.initialSyncCompletedAt || incoming.initialSyncCompletedAt || null,
+      syncMode: 'latest',
+    } : incoming;
+  });
+  await chrome.storage.local.set({ accounts });
+  return saveSchedulerState({
+    monitoredAccountCount: accounts.filter((account) => account.initialSyncStatus === 'complete').length,
+    checkedAt: new Date().toISOString(),
+  }, dashboardTabId);
+}
+
+async function acquireCollectionLock(trigger) {
+  if (collectionInProgress) return null;
+  collectionInProgress = true;
+  try {
+    const stored = await chrome.storage.local.get(COLLECTION_LOCK_KEY);
+    const existing = stored[COLLECTION_LOCK_KEY];
+    const existingStartedAt = existing?.startedAt ? Date.parse(existing.startedAt) : Number.NaN;
+    if (existing?.token && Number.isFinite(existingStartedAt) && Date.now() - existingStartedAt < COLLECTION_LOCK_MAX_AGE_MS) {
+      collectionInProgress = false;
+      return null;
+    }
+    const token = createMessageId();
+    await chrome.storage.local.set({
+      [COLLECTION_LOCK_KEY]: { token, trigger, startedAt: new Date().toISOString() },
+    });
+    return token;
+  } catch (error) {
+    collectionInProgress = false;
+    throw error;
+  }
+}
+
+async function releaseCollectionLock(token) {
+  if (!token) return;
+  try {
+    const stored = await chrome.storage.local.get(COLLECTION_LOCK_KEY);
+    if (stored[COLLECTION_LOCK_KEY]?.token === token) {
+      await chrome.storage.local.remove(COLLECTION_LOCK_KEY);
+    }
+  } finally {
+    collectionInProgress = false;
   }
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== ALARM_NAME) return;
-  void runScheduledCollection();
+  void runScheduledCollection('alarm');
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.source !== 'douyin-monitor') return;
 
   if (message.type === 'PING') {
-    void readPendingResults()
-      .then((pendingResults) => {
+    void Promise.all([readPendingResults(), getSchedulerSnapshot()])
+      .then(([pendingResults, schedulerState]) => {
         sendResponse({
           ok: true,
           extensionVersion: chrome.runtime.getManifest().version,
           pendingResults,
+          schedulerState,
         });
       })
+      .catch((error) => sendResponse({ ok: false, error: errorMessage(error) }));
+    return true;
+  }
+
+  if (message.type === 'SYNC_ACCOUNTS') {
+    const accounts = Array.isArray(message.accounts)
+      ? message.accounts.filter(isValidAccount)
+      : [];
+    void syncAccountsAndScheduler(accounts, sender.tab?.id)
+      .then((schedulerState) => sendResponse({ ok: true, schedulerState }))
       .catch((error) => sendResponse({ ok: false, error: errorMessage(error) }));
     return true;
   }
@@ -68,6 +236,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const accounts = Array.isArray(message.accounts)
       ? message.accounts.filter(isValidAccount)
       : [];
+    const allAccounts = Array.isArray(message.allAccounts)
+      ? message.allAccounts.filter(isValidAccount)
+      : accounts;
     if (!accounts.length) {
       sendResponse({ accepted: false, error: '没有可采集的抖音账号' });
       void persistAndDeliver({
@@ -79,30 +250,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (collectionInProgress) {
-      sendResponse({ accepted: false, error: '已有采集任务正在运行，请等待当前任务完成' });
-      return;
-    }
-
-    collectionInProgress = true;
-
-    void chrome.storage.local.set({ accounts })
-      .then(() => {
-        sendResponse({ accepted: true });
-        return collectAll(accounts, sender.tab?.id);
-      })
+    let lockToken = null;
+    let responseSent = false;
+    void (async () => {
+      lockToken = await acquireCollectionLock('manual');
+      if (!lockToken) {
+        sendResponse({ accepted: false, error: '已有采集任务正在运行，请等待当前任务完成' });
+        responseSent = true;
+        return;
+      }
+      await syncAccountsAndScheduler(allAccounts, sender.tab?.id);
+      sendResponse({ accepted: true });
+      responseSent = true;
+      await collectAll(accounts, sender.tab?.id);
+    })()
       .catch((error) => {
-        sendResponse({ accepted: false, error: errorMessage(error) });
+        if (!responseSent) sendResponse({ accepted: false, error: errorMessage(error) });
         void persistAndDeliver({
           type: 'COLLECTION_ERROR',
           accountId: null,
-          message: `保存账号列表失败：${errorMessage(error)}`,
+          message: `采集任务启动失败：${errorMessage(error)}`,
           capturedAt: new Date().toISOString(),
         }, sender.tab?.id);
       })
-      .finally(() => {
-        collectionInProgress = false;
-      });
+      .finally(() => releaseCollectionLock(lockToken));
     return true;
   }
 
@@ -133,27 +304,89 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-async function runScheduledCollection() {
-  if (collectionInProgress) return;
-  collectionInProgress = true;
+async function runScheduledCollection(trigger = 'alarm') {
+  const lockToken = await acquireCollectionLock(trigger);
+  if (!lockToken) {
+    await saveSchedulerState({
+      lastRunStatus: 'skipped',
+      lastError: '到点时已有采集任务运行，本轮由当前采集结果替代',
+      checkedAt: new Date().toISOString(),
+    });
+    return;
+  }
+  const startedAt = new Date().toISOString();
   try {
     const { accounts = [] } = await chrome.storage.local.get('accounts');
-    const validAccounts = Array.isArray(accounts) ? accounts.filter(isValidAccount) : [];
-    if (validAccounts.length) await collectAll(validAccounts);
+    const scheduledAccounts = Array.isArray(accounts)
+      ? accounts
+        .filter((account) => isValidAccount(account) && account.initialSyncStatus === 'complete')
+        .map((account) => ({ ...account, syncMode: 'latest' }))
+      : [];
+    await saveSchedulerState({
+      monitoredAccountCount: scheduledAccounts.length,
+      lastAttemptAt: startedAt,
+      lastRunStatus: scheduledAccounts.length ? 'running' : 'waiting',
+      lastTrigger: trigger,
+      lastError: scheduledAccounts.length ? null : '暂无已完成首次建档的账号',
+      checkedAt: startedAt,
+    });
+    if (!scheduledAccounts.length) return;
+
+    const summary = await collectAll(scheduledAccounts);
+    const completedAt = new Date().toISOString();
+    const lastRunStatus = summary.failed === 0 ? 'success' : summary.succeeded > 0 ? 'partial' : 'error';
+    await saveSchedulerState({
+      lastCompletedAt: completedAt,
+      lastSuccessAt: summary.succeeded > 0 ? completedAt : undefined,
+      lastRunStatus,
+      lastTrigger: trigger,
+      lastError: summary.failed > 0 ? `${summary.failed} 个账号采集失败` : null,
+      missedRunRecoveredAt: trigger === 'catch-up' ? completedAt : undefined,
+      checkedAt: completedAt,
+    });
   } catch (error) {
+    const capturedAt = new Date().toISOString();
+    await saveSchedulerState({
+      lastCompletedAt: capturedAt,
+      lastRunStatus: 'error',
+      lastTrigger: trigger,
+      lastError: errorMessage(error),
+      checkedAt: capturedAt,
+    });
     await persistAndDeliver({
       type: 'COLLECTION_ERROR',
       accountId: null,
       message: `定时采集启动失败：${errorMessage(error)}`,
-      capturedAt: new Date().toISOString(),
+      capturedAt,
     });
   } finally {
-    collectionInProgress = false;
+    await releaseCollectionLock(lockToken);
   }
+}
+
+function collectionModeForAccount(account) {
+  if (account?.syncMode === 'initial' || account?.syncMode === 'latest') return account.syncMode;
+  return account?.initialSyncStatus === 'complete' ? 'latest' : 'initial';
+}
+
+async function markAccountInitialized(accountId, capturedAt) {
+  const stored = await chrome.storage.local.get('accounts');
+  const accounts = Array.isArray(stored.accounts) ? stored.accounts : [];
+  await chrome.storage.local.set({
+    accounts: accounts.map((account) => account?.id === accountId ? {
+      ...account,
+      initialSyncStatus: 'complete',
+      initialSyncCompletedAt: capturedAt,
+      syncMode: 'latest',
+    } : account),
+  });
 }
 
 async function collectAll(accounts, dashboardTabId) {
   const totalAccounts = accounts.length;
+  let succeeded = 0;
+  let failed = 0;
+  const errors = [];
   for (let index = 0; index < totalAccounts; index += 1) {
     const account = accounts[index];
     const accountBaseProgress = Math.round(index / totalAccounts * 90);
@@ -163,16 +396,19 @@ async function collectAll(accounts, dashboardTabId) {
       type: 'COLLECTION_STARTED',
       accountId: account.id,
       accountName: account.name || null,
+      mode: collectionModeForAccount(account),
       progress: Math.max(3, accountBaseProgress),
       startedAt: new Date().toISOString(),
     }, dashboardTabId);
 
     try {
-      const result = await collectAccount(account, async ({ stage, completed, total }) => {
+      const mode = collectionModeForAccount(account);
+      const result = await collectAccount(account, mode, async ({ stage, completed, total }) => {
         const ratio = total > 0 ? completed / total : 0;
         await sendToDashboard({
           type: 'COLLECTION_PROGRESS',
           accountId: account.id,
+          mode,
           stage,
           completed,
           total,
@@ -189,15 +425,22 @@ async function collectAll(accounts, dashboardTabId) {
         type: 'COLLECTION_RESULT',
         accountId: account.id,
         accountName: result.accountName,
+        accountAvatarUrl: result.accountAvatarUrl,
+        mode,
         videos: result.videos.map((video) => ({ ...video, capturedAt })),
         capturedAt,
         warning: result.warning,
       }, dashboardTabId);
+      if (mode === 'initial') await markAccountInitialized(account.id, capturedAt);
+      succeeded += 1;
     } catch (error) {
+      failed += 1;
+      errors.push({ accountId: account.id, message: errorMessage(error) });
       await persistAndDeliver({
         type: 'COLLECTION_ERROR',
         accountId: account.id,
         accountName: account.name || null,
+        mode: collectionModeForAccount(account),
         message: `${account.name || '账号'}：${errorMessage(error)}`,
         capturedAt: new Date().toISOString(),
       }, dashboardTabId);
@@ -212,21 +455,23 @@ async function collectAll(accounts, dashboardTabId) {
     total: totalAccounts,
     progress: 100,
   }, dashboardTabId);
+  return { total: totalAccounts, succeeded, failed, errors };
 }
 
-async function collectAccount(account, onProgress) {
+async function collectAccount(account, mode, onProgress) {
+  const targetCount = mode === 'initial' ? INITIAL_HISTORY_VIDEOS : LATEST_CHECK_VIDEOS;
   const tab = await chrome.tabs.create({ url: account.url, active: false });
   if (!tab.id) throw new Error('无法创建账号采集标签页');
 
   try {
     await waitForTab(tab.id);
-    const readiness = await executeInTab(tab.id, waitForAccountVideoDom, [ACCOUNT_DOM_WAIT_MS, MAX_VISIBLE_VIDEOS]);
+    const readiness = await executeInTab(tab.id, waitForAccountVideoDom, [ACCOUNT_DOM_WAIT_MS, targetCount]);
     if (!readiness?.ready) {
       const pageLabel = readiness?.title ? `（${readiness.title}）` : '';
       throw new Error(`等待约 25 秒后仍未发现真实 /video/ 作品节点${pageLabel}，可能遇到登录、验证码、风控或页面结构变化`);
     }
 
-    const accountPage = await executeInTab(tab.id, extractAccountPage, [MAX_VISIBLE_VIDEOS]);
+    const accountPage = await executeInTab(tab.id, extractAccountPageV3, [targetCount], 'MAIN');
     if (!accountPage || !Array.isArray(accountPage.videos)) {
       throw new Error('账号页没有返回可识别的数据结构');
     }
@@ -242,11 +487,25 @@ async function collectAccount(account, onProgress) {
       throw new Error('账号页没有可采集的非置顶可见视频');
     }
 
+    if (accountPage.hasMore === true && accountPage.videos.length < targetCount) {
+      throw new Error(`账号仍有更多作品，但本轮只完整读取到 ${accountPage.videos.length}/${targetCount} 条，已停止写入半成品`);
+    }
+
     const enrichedVideos = [];
     const total = accountPage.videos.length;
     for (let index = 0; index < total; index += 1) {
       const video = accountPage.videos[index];
       await onProgress({ stage: 'video-detail', completed: index, total });
+      if (video.dataComplete === true) {
+        enrichedVideos.push({
+          ...video,
+          accountId: account.id,
+          transcript: null,
+          detailError: null,
+        });
+        await onProgress({ stage: 'video-detail', completed: index + 1, total });
+        continue;
+      }
       try {
         const details = await collectVideoDetails(video.url);
         enrichedVideos.push(mergeVideoDetails(video, details, account.id));
@@ -261,16 +520,16 @@ async function collectAccount(account, onProgress) {
       await onProgress({ stage: 'video-detail', completed: index + 1, total });
     }
 
-    if (!enrichedVideos.some((video) => !video.detailError)) {
-      throw new Error('已发现视频，但所有详情页都未能返回互动数据，请确认 Chrome 登录状态或稍后重试');
+    const incompleteVideos = enrichedVideos.filter((video) => !hasCompletePublicData(video));
+    if (incompleteVideos.length > 0) {
+      throw new Error(`${incompleteVideos.length} 条视频仍缺少封面、文案或公开互动数据，已停止整批写入`);
     }
 
     return {
       accountName: accountPage.accountName || account.name || '抖音账号',
+      accountAvatarUrl: accountPage.accountAvatarUrl || account.avatarUrl || null,
       videos: enrichedVideos,
-      warning: enrichedVideos.some((video) => video.detailError)
-        ? `${enrichedVideos.filter((video) => video.detailError).length} 条视频详情读取失败，已保留账号页可见数据`
-        : null,
+      warning: null,
     };
   } finally {
     await chrome.tabs.remove(tab.id).catch(() => {});
@@ -305,7 +564,7 @@ function mergeVideoDetails(video, details, accountId) {
   return {
     ...video,
     accountId,
-    title: description,
+    title: video.title || description,
     description,
     coverUrl: details.coverUrl || video.coverUrl || null,
     playCount: valueOrFallback(details.playCount, video.playCount),
@@ -323,6 +582,23 @@ function mergeVideoDetails(video, details, accountId) {
 
 function valueOrFallback(value, fallback) {
   return value !== null && value !== undefined ? value : (fallback ?? null);
+}
+
+function hasCompletePublicData(video) {
+  return Boolean(video?.title)
+    && Boolean(video?.description)
+    && Boolean(video?.coverUrl)
+    && Boolean(video?.publishedAt)
+    && video?.durationSeconds !== null
+    && video?.durationSeconds !== undefined
+    && video?.likeCount !== null
+    && video?.likeCount !== undefined
+    && video?.commentCount !== null
+    && video?.commentCount !== undefined
+    && video?.favoriteCount !== null
+    && video?.favoriteCount !== undefined
+    && video?.shareCount !== null
+    && video?.shareCount !== undefined;
 }
 
 async function extractTranscript({ videoId, accountId, videoUrl, dashboardTabId }) {
@@ -671,9 +947,10 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function executeInTab(tabId, func, args = []) {
+async function executeInTab(tabId, func, args = [], world = 'ISOLATED') {
   const [execution] = await chrome.scripting.executeScript({
     target: { tabId },
+    world,
     func,
     args,
   });
@@ -708,12 +985,7 @@ async function waitForTab(tabId, timeoutMs = 45_000) {
 }
 
 function waitForAccountVideoDom(timeoutMs, minimumVideos = 1) {
-  const isVisible = (element) => {
-    if (!(element instanceof HTMLElement)) return false;
-    const style = getComputedStyle(element);
-    if (style.display === 'none' || style.visibility === 'hidden') return false;
-    return element.getClientRects().length > 0 || Boolean(element.querySelector('img, video'));
-  };
+  try { window.performance?.setResourceTimingBufferSize?.(5000); } catch { /* optional diagnostic buffer */ }
   const findAccountRoot = () => {
     const preferredRoots = [
       document.querySelector('#user_detail_element'),
@@ -728,18 +1000,35 @@ function waitForAccountVideoDom(timeoutMs, minimumVideos = 1) {
     const root = findAccountRoot();
     const anchors = [...(root || document.body).querySelectorAll('a[href*="/video/"]')]
       .filter((anchor) => !anchor.closest('footer, .user-page-footer'))
-      .filter((anchor) => /\/video\/\d+/.test(anchor.href) && isVisible(anchor));
+      .filter((anchor) => /\/video\/\d+/.test(anchor.href));
+    const unique = [...new Map(anchors.map((anchor) => [anchor.href.match(/\/video\/(\d+)/)?.[1], anchor])).values()]
+      .filter(Boolean);
+    const nonPinned = unique.filter((anchor) => {
+      const card = anchor.closest('li') || anchor.parentElement;
+      return !card?.querySelector('[aria-label*="置顶"]')
+        && !/(^|\n)\s*置顶\s*(\n|$)/.test(card?.innerText || card?.textContent || '');
+    });
     return {
-      ready: anchors.length > 0,
-      enough: anchors.length >= minimumVideos,
-      count: anchors.length,
+      ready: nonPinned.length > 0,
+      enough: nonPinned.length >= minimumVideos,
+      count: unique.length,
+      nonPinnedCount: nonPinned.length,
       scoped: Boolean(root),
       title: document.title,
       url: location.href,
     };
   };
+  const requestMore = () => {
+    const root = findAccountRoot();
+    const anchors = [...(root || document.body).querySelectorAll('a[href*="/video/"]')]
+      .filter((anchor) => !anchor.closest('footer, .user-page-footer'));
+    const last = anchors.at(-1);
+    try { last?.scrollIntoView({ block: 'end' }); } catch { /* keep polling */ }
+    try { window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)); } catch { /* keep polling */ }
+  };
   const immediate = inspect();
   if (immediate.enough) return Promise.resolve(immediate);
+  requestMore();
   return new Promise((resolve) => {
     let settled = false;
     const finish = (result) => {
@@ -753,6 +1042,7 @@ function waitForAccountVideoDom(timeoutMs, minimumVideos = 1) {
     const check = () => {
       const result = inspect();
       if (result.enough) finish(result);
+      else requestMore();
     };
     const observer = new MutationObserver(check);
     observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
@@ -761,6 +1051,292 @@ function waitForAccountVideoDom(timeoutMs, minimumVideos = 1) {
   });
 }
 
+async function extractAccountPageV3(maxVideos) {
+  const numberOrNull = (value) => {
+    if (value === null || value === undefined || value === '') return null;
+    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+    const normalized = String(value).trim().replace(/,/g, '').toLowerCase();
+    const match = normalized.match(/(-?\d+(?:\.\d+)?)\s*(亿|万|w|k)?/i);
+    if (!match) return null;
+    const multiplier = match[2] === '亿' ? 100_000_000
+      : (match[2] === '万' || match[2] === 'w') ? 10_000
+        : match[2] === 'k' ? 1_000 : 1;
+    const result = Number(match[1]) * multiplier;
+    return Number.isFinite(result) ? Math.round(result) : null;
+  };
+  const timestampOrNull = (value) => {
+    const number = numberOrNull(value);
+    if (!number || number <= 0) return null;
+    const milliseconds = number > 10_000_000_000 ? number : number * 1000;
+    const date = new Date(milliseconds);
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  };
+  const durationSecondsOrNull = (value) => {
+    const number = numberOrNull(value);
+    if (number === null || number < 0) return null;
+    return number > 1000 ? Math.round(number / 1000) : Math.round(number);
+  };
+  const urlFrom = (...candidates) => candidates
+    .flat(Infinity)
+    .find((value) => typeof value === 'string' && /^https?:\/\//.test(value)) || null;
+  const objectFrom = (value) => {
+    if (value && typeof value === 'object') return value;
+    if (typeof value !== 'string' || !value.trim()) return {};
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  };
+  const completePublicData = (video) => Boolean(video.title)
+    && Boolean(video.description)
+    && Boolean(video.coverUrl)
+    && Boolean(video.publishedAt)
+    && video.durationSeconds !== null
+    && video.likeCount !== null
+    && video.commentCount !== null
+    && video.favoriteCount !== null
+    && video.shareCount !== null;
+  const pageAccountKey = location.pathname.match(/^\/user\/([^/]+)/)?.[1] || null;
+  const domAccountName = document.querySelector('[data-e2e="user-title"]')?.textContent?.trim()
+    || document.querySelector('h1')?.textContent?.trim()
+    || document.title.replace(/[-_].*$/, '').trim()
+    || '抖音账号';
+  const findAccountRoot = () => {
+    const candidates = [
+      document.querySelector('#user_detail_element'),
+      document.querySelector('[data-e2e="user-detail"]'),
+      document.querySelector('[data-e2e="user-post-list"]'),
+    ];
+    const selectedWorkTab = [...document.querySelectorAll('[role="tab"][aria-selected="true"]')]
+      .find((tab) => /作品/.test(tab.textContent || tab.getAttribute('aria-label') || ''));
+    const controlledPanelId = selectedWorkTab?.getAttribute('aria-controls');
+    if (controlledPanelId) candidates.push(document.getElementById(controlledPanelId));
+    return candidates.find((candidate) => candidate?.querySelector('a[href*="/video/"]')) || null;
+  };
+  const accountRoot = findAccountRoot();
+  const scopedToAccountPage = Boolean(accountRoot && accountRoot !== document.body);
+  if (!accountRoot) {
+    return {
+      accountName: domAccountName,
+      videos: [],
+      pageUrl: location.href,
+      scoped: false,
+      rootId: null,
+      hasMore: false,
+      playCountUnavailable: true,
+    };
+  }
+
+  const capturedEntries = Array.isArray(window.__DOUYIN_MONITOR_PUBLIC_POSTS_V3__)
+    ? window.__DOUYIN_MONITOR_PUBLIC_POSTS_V3__
+    : [];
+  const apiItems = new Map();
+  const apiOrder = [];
+  let apiAccountName = null;
+  let apiAccountAvatarUrl = null;
+  let hasMore = false;
+  for (const entry of capturedEntries) {
+    const page = entry?.page || entry;
+    if (!page || page.status_code !== 0 || !Array.isArray(page.aweme_list)) continue;
+    hasMore = page.has_more === 1;
+    for (const item of page.aweme_list) {
+      const id = String(item?.aweme_id || '');
+      if (!/^\d+$/.test(id)) continue;
+      const authorKey = item?.author?.sec_uid || null;
+      if (pageAccountKey && authorKey && authorKey !== pageAccountKey) continue;
+      if (!apiItems.has(id)) apiOrder.push(id);
+      apiItems.set(id, item);
+      if (!apiAccountName && typeof item?.author?.nickname === 'string') {
+        apiAccountName = item.author.nickname.trim();
+      }
+      if (!apiAccountAvatarUrl) {
+        apiAccountAvatarUrl = urlFrom(
+          item?.author?.avatar_thumb?.url_list,
+          item?.author?.avatar_medium?.url_list,
+          item?.author?.avatar_larger?.url_list,
+        );
+      }
+    }
+  }
+
+  const findCard = (anchor) => {
+    const listItem = anchor.closest('li');
+    if (listItem) return listItem;
+    let current = anchor;
+    let candidate = anchor;
+    for (let depth = 0; depth < 7 && current.parentElement; depth += 1) {
+      current = current.parentElement;
+      const links = current.querySelectorAll('a[href*="/video/"]');
+      if (links.length === 1) candidate = current;
+      else if (links.length > 1) break;
+    }
+    return candidate;
+  };
+  const imageUrlFrom = (card, anchor) => {
+    const image = anchor.querySelector('img') || card.querySelector('img');
+    const source = anchor.querySelector('source') || card.querySelector('source');
+    const direct = [image?.currentSrc, image?.src, source?.src]
+      .find((value) => typeof value === 'string' && /^https?:\/\//.test(value));
+    if (direct) return direct;
+    return getComputedStyle(card).backgroundImage
+      .match(/url\(["']?(https?:\/\/[^"')]+)["']?\)/)?.[1] || null;
+  };
+  const cleanImageDescription = (value) => {
+    const text = typeof value === 'string' ? value.trim() : '';
+    for (const prefix of [`${domAccountName}：`, `${domAccountName}:`]) {
+      if (text.startsWith(prefix)) return text.slice(prefix.length).trim();
+    }
+    return text;
+  };
+  const likeCountFromCard = (card) => {
+    const semantic = card.querySelector('.author-card-user-video-like, [class*="author-card-user-video-like"]');
+    const semanticValue = numberOrNull(semantic?.textContent);
+    if (semanticValue !== null) return semanticValue;
+    const lines = (card.innerText || card.textContent || '')
+      .split(/\n+/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    for (const line of lines) {
+      const exact = line.match(/^(\d+(?:\.\d+)?\s*(?:亿|万|w|k)?)$/i);
+      const parsed = exact ? numberOrNull(exact[1]) : null;
+      if (parsed !== null) return parsed;
+    }
+    return null;
+  };
+  const isPinnedCard = (card) => Boolean(card.querySelector('[aria-label*="置顶"]'))
+    || /(^|\n)\s*置顶\s*(\n|$)/.test(card.innerText || card.textContent || '');
+
+  const domItems = new Map();
+  const domOrder = [];
+  for (const anchor of accountRoot.querySelectorAll('a[href*="/video/"]')) {
+    if (anchor.closest('footer, .user-page-footer')) continue;
+    const id = anchor.href.match(/\/video\/(\d+)/)?.[1];
+    if (!id || domItems.has(id)) continue;
+    const card = findCard(anchor);
+    const image = anchor.querySelector('img') || card.querySelector('img');
+    const description = cleanImageDescription(
+      anchor.getAttribute('aria-label') || image?.getAttribute('alt') || '',
+    );
+    domOrder.push(id);
+    domItems.set(id, {
+      id,
+      description,
+      coverUrl: imageUrlFrom(card, anchor),
+      likeCount: likeCountFromCard(card),
+      isPinned: isPinnedCard(card),
+    });
+  }
+
+  const fromApi = (item) => {
+    const id = String(item.aweme_id);
+    const stats = item.statistics || {};
+    const video = item.video || {};
+    const seriesPlayInfo = objectFrom(item.series_play_info);
+    const prefix = typeof seriesPlayInfo?.item_title_prefix?.text === 'string'
+      ? seriesPlayInfo.item_title_prefix.text.trim()
+      : '';
+    const description = typeof item.desc === 'string' ? item.desc.trim() : '';
+    const itemTitle = typeof item.item_title === 'string' && item.item_title.trim()
+      ? item.item_title.trim()
+      : typeof item.preview_title === 'string' && item.preview_title.trim()
+        ? item.preview_title.trim()
+        : description;
+    const title = prefix && !itemTitle.startsWith(prefix)
+      ? `${prefix} | ${itemTitle}`
+      : itemTitle;
+    const rawPlayCount = numberOrNull(stats.play_count);
+    const result = {
+      id,
+      title,
+      description,
+      url: `https://www.douyin.com/video/${id}`,
+      coverUrl: urlFrom(video.cover?.url_list, video.origin_cover?.url_list, video.dynamic_cover?.url_list),
+      publishedAt: timestampOrNull(item.create_time),
+      publishedAtText: null,
+      playCount: rawPlayCount !== null && rawPlayCount > 0 ? rawPlayCount : null,
+      likeCount: numberOrNull(stats.digg_count),
+      commentCount: numberOrNull(stats.comment_count),
+      favoriteCount: numberOrNull(stats.collect_count),
+      shareCount: numberOrNull(stats.share_count),
+      durationSeconds: durationSecondsOrNull(video.duration),
+      capturedAt: new Date().toISOString(),
+      isPinned: item.is_top === 1 || item.is_top === true,
+      dataSource: 'profile-api',
+      dataComplete: false,
+    };
+    result.dataComplete = completePublicData(result);
+    return result;
+  };
+
+  const seen = new Set();
+  const videos = [];
+  for (const id of apiOrder) {
+    const item = apiItems.get(id);
+    const apiVideo = fromApi(item);
+    const domVideo = domItems.get(id);
+    if (apiVideo.isPinned || domVideo?.isPinned) continue;
+    if (domVideo) {
+      apiVideo.coverUrl ||= domVideo.coverUrl;
+      apiVideo.description ||= domVideo.description;
+      apiVideo.title ||= domVideo.description;
+      apiVideo.likeCount ??= domVideo.likeCount;
+      apiVideo.dataComplete = completePublicData(apiVideo);
+    }
+    seen.add(id);
+    videos.push(apiVideo);
+    if (videos.length >= maxVideos) break;
+  }
+
+  for (const id of domOrder) {
+    if (seen.has(id) || videos.length >= maxVideos) continue;
+    const domVideo = domItems.get(id);
+    if (domVideo.isPinned) continue;
+    const video = {
+      id,
+      title: domVideo.description,
+      description: domVideo.description,
+      url: `https://www.douyin.com/video/${id}`,
+      coverUrl: domVideo.coverUrl,
+      publishedAt: null,
+      publishedAtText: null,
+      playCount: null,
+      likeCount: domVideo.likeCount,
+      commentCount: null,
+      favoriteCount: null,
+      shareCount: null,
+      durationSeconds: null,
+      capturedAt: new Date().toISOString(),
+      dataSource: 'profile-dom',
+      dataComplete: false,
+    };
+    seen.add(id);
+    videos.push(video);
+  }
+
+  return {
+    accountName: apiAccountName || domAccountName,
+    accountAvatarUrl: apiAccountAvatarUrl || urlFrom(
+      [...document.querySelectorAll('img')]
+        .find((image) => image.getAttribute('alt') === `${domAccountName}头像`)?.currentSrc,
+      [...document.querySelectorAll('img')]
+        .find((image) => image.getAttribute('alt') === `${domAccountName}头像`)?.src,
+    ),
+    videos,
+    pageUrl: location.href,
+    scoped: scopedToAccountPage,
+    rootId: accountRoot.id || null,
+    hasMore,
+    capturedPageCount: capturedEntries.length,
+    apiBackedCount: videos.filter((video) => video.dataSource === 'profile-api').length,
+    completeCount: videos.filter((video) => video.dataComplete).length,
+    playCountUnavailable: videos.some((video) => video.playCount === null),
+  };
+}
+
+// Kept as a DOM-only fallback reference while v0.4.0 is validated against live pages.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function extractAccountPage(maxVideos) {
   const numberOrNull = (value) => {
     if (value === null || value === undefined || value === '') return null;

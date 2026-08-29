@@ -31,6 +31,7 @@ window.addEventListener('message', (event) => {
         type: 'BRIDGE_READY',
         extensionVersion: response.extensionVersion,
         pendingCount: Array.isArray(response.pendingResults) ? response.pendingResults.length : 0,
+        schedulerState: response.schedulerState || null,
       });
       for (const pendingResult of response.pendingResults || []) {
         postToPage(pendingResult);
@@ -55,7 +56,9 @@ window.addEventListener('message', (event) => {
         event.data.accountId || null,
         requestedVideoId,
       );
+      return;
     }
+    if (response?.schedulerState) postToPage({ type: 'SCHEDULER_STATE', schedulerState: response.schedulerState });
   });
 });
 

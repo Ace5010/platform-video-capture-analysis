@@ -2,8 +2,8 @@ import type { Metadata } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: '抖音对标监控',
-  description: '本机运行的抖音对标账号视频与数据快照工作台',
+  title: '内容情报台',
+  description: '本机运行的多平台对标账号视频监控与总数据分析工具',
 };
 
 export default function RootLayout({

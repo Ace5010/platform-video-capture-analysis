@@ -25,6 +25,7 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+.tmp_*.png
 
 # local environment
 .env*
@@ -32,6 +33,7 @@ yarn-error.log*
 # deployment and generated files
 .vercel
 next-env.d.ts
+*.tsbuildinfo
 /dist/
 /.wrangler/
 /outputs/
