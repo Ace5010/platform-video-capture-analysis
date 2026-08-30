@@ -1350,7 +1350,14 @@ async function collectVideoDetails(videoUrl) {
 
   try {
     await waitForTab(tab.id);
-    const readiness = await executeInTab(tab.id, waitForVideoDetailDom, [DETAIL_DOM_WAIT_MS]);
+    const readiness = await executeUntilPageCondition(
+      tab.id,
+      waitForVideoDetailDom,
+      [],
+      'ISOLATED',
+      DETAIL_DOM_WAIT_MS,
+      (result) => result?.ready === true,
+    );
     if (!readiness?.ready) {
       throw new Error('视频详情页未出现 data-e2e 数据节点');
     }
@@ -1433,7 +1440,15 @@ async function extractTranscript({ videoId, accountId, videoUrl, dashboardTabId 
       progress: 30,
     }, dashboardTabId);
 
-    await executeInTab(tab.id, activateVideoPlayback, [10_000]);
+    const activation = await executeUntilPageCondition(
+      tab.id,
+      activateVideoPlayback,
+      [],
+      'ISOLATED',
+      10_000,
+      (result) => result?.found === true,
+    );
+    if (!activation?.found) throw new Error('视频详情页未出现可播放的视频元素');
     const mediaUrl = await mediaCapture.promise;
     if (!mediaUrl) {
       throw new Error('未捕获到视频详情页的媒体音频 CDN 请求');
@@ -1960,7 +1975,14 @@ async function captureFullVideoForAnalysis({ videoId, accountId, videoUrl }) {
     capture = createFullVideoCapture(tab.id, MEDIA_CAPTURE_WAIT_MS);
     await chrome.tabs.update(tab.id, { url: videoUrl });
     await waitForTab(tab.id);
-    const readiness = await executeInTab(tab.id, waitForVideoDetailDom, [DETAIL_DOM_WAIT_MS]);
+    const readiness = await executeUntilPageCondition(
+      tab.id,
+      waitForVideoDetailDom,
+      [],
+      'ISOLATED',
+      DETAIL_DOM_WAIT_MS,
+      (result) => result?.ready === true,
+    );
     const observedFromReady = videoIdFromUrl(readiness?.url);
     if (!readiness?.ready) throw new Error('目标视频详情页没有完成加载');
     if (observedFromReady !== videoId) {
@@ -1975,10 +1997,18 @@ async function captureFullVideoForAnalysis({ videoId, accountId, videoUrl }) {
     );
     capture.considerStructuredSources(structuredSources);
 
-    const page = await executeInTab(tab.id, activateVerifiedVideoPlayback, [videoId, 10_000]);
+    const page = await executeUntilPageCondition(
+      tab.id,
+      activateVerifiedVideoPlayback,
+      [videoId],
+      'ISOLATED',
+      10_000,
+      (result) => result?.targetMatches === false || result?.found === true,
+    );
     if (!page?.targetMatches) {
       throw new Error(`目标视频校验失败，播放页实际是 ${page?.observedVideoId || '未知视频'}`);
     }
+    if (!page.found) throw new Error('目标视频详情页未出现可播放的视频元素');
     capture.considerCurrentSource(page.currentSrc, {
       width: page.videoWidth,
       height: page.videoHeight,
@@ -2297,6 +2327,33 @@ async function executeInTab(tabId, func, args = [], world = 'ISOLATED', timeoutM
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function executeUntilPageCondition(
+  tabId,
+  func,
+  args = [],
+  world = 'ISOLATED',
+  timeoutMs = 15_000,
+  predicate = (result) => Boolean(result),
+  intervalMs = 350,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let result;
+  do {
+    result = await executeInTab(
+      tabId,
+      func,
+      args,
+      world,
+      Math.min(SCRIPT_EXECUTION_TIMEOUT_MS, Math.max(1_000, deadline - Date.now())),
+    );
+    if (predicate(result)) return result;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return result;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, remaining)));
+  } while (Date.now() < deadline);
+  return result;
 }
 
 async function waitForTab(tabId, timeoutMs = 45_000) {
@@ -2901,7 +2958,7 @@ function extractAccountPage(maxVideos) {
   };
 }
 
-function waitForVideoDetailDom(timeoutMs) {
+function waitForVideoDetailDom() {
   const selectors = [
     '[data-e2e="video-player-digg"]',
     '[data-e2e="feed-comment-icon"]',
@@ -2918,27 +2975,11 @@ function waitForVideoDetailDom(timeoutMs) {
     title: document.title,
     url: location.href,
   });
-  const immediate = inspect();
-  if (immediate.ready) return Promise.resolve(immediate);
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      clearInterval(interval);
-      clearTimeout(timeout);
-      observer.disconnect();
-      resolve(result);
-    };
-    const check = () => {
-      const result = inspect();
-      if (result.ready) finish(result);
-    };
-    const observer = new MutationObserver(check);
-    observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
-    const interval = setInterval(check, 300);
-    const timeout = setTimeout(() => finish(inspect()), timeoutMs);
-  });
+  // Keep this page-world probe synchronous. A Promise that waits on a page
+  // timer/MutationObserver can remain unresolved indefinitely when Chrome
+  // throttles a background tab. The service worker performs the bounded poll
+  // instead, so the page probe itself can never hold the job lease hostage.
+  return inspect();
 }
 
 function extractVideoDetailPage() {
@@ -3046,100 +3087,67 @@ function extractVideoDetailPage() {
   };
 }
 
-function activateVideoPlayback(timeoutMs) {
+function activateVideoPlayback() {
   const findVideo = () => document.querySelector('video');
-  const immediate = findVideo();
-  const waitForVideo = immediate ? Promise.resolve(immediate) : new Promise((resolve) => {
-    let settled = false;
-    const finish = (video) => {
-      if (settled) return;
-      settled = true;
-      clearInterval(interval);
-      clearTimeout(timeout);
-      resolve(video);
-    };
-    const interval = setInterval(() => {
-      const video = findVideo();
-      if (video) finish(video);
-    }, 250);
-    const timeout = setTimeout(() => finish(null), timeoutMs);
-  });
-
-  return waitForVideo.then(async (video) => {
-    if (!video) return { found: false };
-    video.muted = true;
-    video.preload = 'auto';
-    // Hidden tabs can leave HTMLMediaElement.play() pending forever while
-    // Chrome throttles background playback. It is only a trigger for the
-    // network request, not a prerequisite for reading currentSrc, so never
-    // await it in a background tab.
-    try {
-      const playResult = video.play();
-      playResult?.catch?.(() => {});
-    } catch { /* media requests may already be active */ }
-    return { found: true, currentSrc: video.currentSrc || video.src || null };
-  });
+  const video = findVideo();
+  if (!video) return { found: false };
+  video.muted = true;
+  video.preload = 'auto';
+  // Hidden tabs can leave HTMLMediaElement.play() pending forever while
+  // Chrome throttles background playback. It is only a trigger for the
+  // network request, not a prerequisite for reading currentSrc, so never
+  // await it in a background tab.
+  try {
+    const playResult = video.play();
+    playResult?.catch?.(() => {});
+  } catch { /* media requests may already be active */ }
+  return { found: true, currentSrc: video.currentSrc || video.src || null };
 }
 
-function activateVerifiedVideoPlayback(expectedVideoId, timeoutMs) {
+function activateVerifiedVideoPlayback(expectedVideoId) {
   const observedVideoId = () => location.pathname.match(/\/video\/(\d+)/)?.[1]
     || new URL(location.href).searchParams.get('modal_id')
     || null;
   const currentObservedId = observedVideoId();
   if (currentObservedId !== expectedVideoId) {
-    return Promise.resolve({
+    return {
       targetMatches: false,
       observedVideoId: currentObservedId,
       pageUrl: location.href,
-    });
+    };
   }
   const findVideo = () => [...document.querySelectorAll('video')]
     .find((candidate) => candidate.getClientRects().length > 0)
     || document.querySelector('video');
-  const immediate = findVideo();
-  const waitForVideo = immediate ? Promise.resolve(immediate) : new Promise((resolve) => {
-    let settled = false;
-    const finish = (video) => {
-      if (settled) return;
-      settled = true;
-      clearInterval(interval);
-      clearTimeout(timeout);
-      resolve(video);
-    };
-    const interval = setInterval(() => {
-      const video = findVideo();
-      if (video) finish(video);
-    }, 250);
-    const timeout = setTimeout(() => finish(null), timeoutMs);
-  });
-  return waitForVideo.then(async (video) => {
-    const finalObservedId = observedVideoId();
-    if (!video || finalObservedId !== expectedVideoId) {
-      return {
-        targetMatches: false,
-        observedVideoId: finalObservedId,
-        pageUrl: location.href,
-      };
-    }
-    video.muted = true;
-    video.preload = 'auto';
-    // See activateVideoPlayback: do not let a background-tab play() promise
-    // consume the whole page-script deadline.
-    try {
-      const playResult = video.play();
-      playResult?.catch?.(() => {});
-    } catch { /* network media requests may already be active */ }
-    const duration = Number(video.duration);
+  const video = findVideo();
+  const finalObservedId = observedVideoId();
+  if (!video || finalObservedId !== expectedVideoId) {
     return {
-      targetMatches: true,
+      targetMatches: finalObservedId === expectedVideoId,
+      found: false,
       observedVideoId: finalObservedId,
       pageUrl: location.href,
-      currentSrc: video.currentSrc || video.src || null,
-      videoWidth: Number(video.videoWidth) || null,
-      videoHeight: Number(video.videoHeight) || null,
-      durationSeconds: Number.isFinite(duration) && duration > 0 ? duration : null,
     };
-  });
+  }
+  video.muted = true;
+  video.preload = 'auto';
+  // See activateVideoPlayback: do not let a background-tab play() promise
+  // consume the whole page-script deadline.
+  try {
+    const playResult = video.play();
+    playResult?.catch?.(() => {});
+  } catch { /* network media requests may already be active */ }
+  const duration = Number(video.duration);
+  return {
+    targetMatches: true,
+    found: true,
+    observedVideoId: finalObservedId,
+    pageUrl: location.href,
+    currentSrc: video.currentSrc || video.src || null,
+    videoWidth: Number(video.videoWidth) || null,
+    videoHeight: Number(video.videoHeight) || null,
+    durationSeconds: Number.isFinite(duration) && duration > 0 ? duration : null,
+  };
 }
 
 function inspectVerifiedVideoTarget(expectedVideoId) {
