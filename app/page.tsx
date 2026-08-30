@@ -1461,8 +1461,6 @@ export default function Home() {
                     <SectionHeading title="全部视频数据" count={`${selectedAccountVideos.length} 条 · 当前账号内去重`} />
                     <VideoTable
                       videos={selectedAccountVideos}
-                      snapshots={selectedAccountSnapshots}
-                      showSnapshotChanges
                       jobs={hostJobs}
                       expandedAnalyses={expandedAnalyses}
                       onAnalysis={requestAnalysis}
@@ -1626,7 +1624,7 @@ function MetricBarComparison({ videos, metricKey, sortMode, selectedVideoId, onM
       if (rightValue === null) return -1;
       return rightValue - leftValue || (chronologicalIndex.get(left.id) || 0) - (chronologicalIndex.get(right.id) || 0);
     });
-  const width = Math.max(760, displayedVideos.length * 58 + 74);
+  const width = Math.max(760, displayedVideos.length * 68 + 74);
   const height = 300;
   const paddingLeft = 58;
   const paddingRight = 16;
@@ -1829,10 +1827,8 @@ function AccountBoard({ accounts, onAdd, onRemove, onInitialSync, isCollecting }
   })}</section>;
 }
 
-function VideoTable({ videos, snapshots = [], showSnapshotChanges = false, jobs, expandedAnalyses, onAnalysis }: {
+function VideoTable({ videos, jobs, expandedAnalyses, onAnalysis }: {
   videos: Video[];
-  snapshots?: Snapshot[];
-  showSnapshotChanges?: boolean;
   jobs: HostJob[];
   expandedAnalyses: Set<string>;
   onAnalysis: (video: Video) => void;
@@ -1867,10 +1863,10 @@ function VideoTable({ videos, snapshots = [], showSnapshotChanges = false, jobs,
               ? '重新分析'
               : 'AI分析';
       const metrics = [
-        ['点赞', 'likeCount', video.likeCount],
-        ['评论', 'commentCount', video.commentCount],
-        ['收藏', 'favoriteCount', video.favoriteCount],
-        ['分享', 'shareCount', video.shareCount],
+        ['点赞', video.likeCount],
+        ['评论', video.commentCount],
+        ['收藏', video.favoriteCount],
+        ['分享', video.shareCount],
       ] as const;
       return <article className="videoRecord" key={`${video.accountId}:${video.id}`}>
         <div className="videoMainRow">
@@ -1881,16 +1877,7 @@ function VideoTable({ videos, snapshots = [], showSnapshotChanges = false, jobs,
             </a>
             <div className="videoCopy"><a href={video.url} target="_blank" rel="noreferrer">{video.title || '未命名视频'} ↗</a>{video.description.trim() && video.description.trim() !== video.title.trim() ? <p>{video.description}</p> : null}</div>
           </div>
-          <div className="metricGrid">{metrics.map(([label, key, value]) => {
-            const snapshotChange = showSnapshotChanges ? snapshotMetricChange(video, snapshots, key) : null;
-            const change = snapshotChange?.delta || null;
-            const changeLabel = !snapshotChange
-              ? null
-              : change
-                ? change.absolute === 0 ? '较首次 持平' : `较首次 ${formatSignedMetric(change.absolute, true)}`
-                : snapshotChange.sampleCount < 2 ? '快照不足' : '首末缺数据';
-            return <span key={label}><small>{label}</small><b>{formatMetric(value)}</b>{changeLabel && <em className={`metricDeltaTag ${deltaTone(change)}`}>{changeLabel}</em>}</span>;
-          })}</div>
+          <div className="metricGrid">{metrics.map(([label, value]) => <span key={label}><small>{label}</small><b>{formatMetric(value)}</b></span>)}</div>
           <div className="videoTimes"><span><small>发布</small><b>{formatTime(video.publishedAt)}</b></span><span><small>采集</small><b>{formatTime(video.lastSeenAt)}</b></span></div>
           <button className={`analysisButton ${analysisStatus}`} onClick={() => onAnalysis({ ...video, analysisStatus })}>
             {buttonLabel}

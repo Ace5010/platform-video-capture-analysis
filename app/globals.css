@@ -190,9 +190,9 @@ h1 { margin-bottom: 8px; font-size: clamp(27px, 2.4vw, 32px); line-height: 1.2; 
 .analysisStatRows b { font: 700 12px/1.2 Consolas, monospace; }
 .summaryDelta { min-height: 34px; margin: 10px 0 0; color: #77756f; font-size: 11px; line-height: 1.55; }
 .analysisMethodNote { margin: 9px 2px 0; color: #77756f; font-size: 11px; line-height: 1.6; }
-.summaryDelta.positive, .metricDeltaTag.positive { color: #137563; }
-.summaryDelta.negative, .metricDeltaTag.negative { color: #a64545; }
-.summaryDelta.neutral, .metricDeltaTag.neutral { color: #77756f; }
+.summaryDelta.positive { color: #137563; }
+.summaryDelta.negative { color: #a64545; }
+.summaryDelta.neutral { color: #77756f; }
 .metricComparisonCard { min-width: 0; margin-top: 14px; padding: 20px; }
 .metricComparisonHeader { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .metricComparisonHeader h3 { margin: 0 0 5px; font-size: 17px; }
@@ -206,8 +206,9 @@ h1 { margin-bottom: 8px; font-size: clamp(27px, 2.4vw, 32px); line-height: 1.2; 
 .metricBarChartScroll { width: 100%; min-width: 0; max-width: 100%; margin-top: 16px; overflow-x: auto; border: 1px solid #eeeeea; border-radius: 9px; background: #fafaf8; }
 .metricBarChart { display: block; height: 300px; }
 .metricGridLine { stroke: #deddd8; stroke-width: 1; }
-.metricAxisLabel, .metricVideoLabel { fill: #77756f; font: 10px Consolas, monospace; }
-.metricVideoTimeLabel { fill: #9a9892; font-size: 9px; }
+.metricAxisLabel { fill: #77756f; font: 10px Consolas, monospace; }
+.metricVideoLabel { fill: #3f3e3a; font: 700 12px Arial, "Microsoft YaHei", sans-serif; text-rendering: optimizeLegibility; }
+.metricVideoTimeLabel { fill: #686660; font-size: 10px; font-weight: 600; }
 .metricBarGroup { cursor: pointer; }
 .metricBarHitArea { fill: transparent; }
 .metricValueBar, .metricZeroMarker { transition: opacity .15s ease, filter .15s ease; }
@@ -257,7 +258,6 @@ h1 { margin-bottom: 8px; font-size: clamp(27px, 2.4vw, 32px); line-height: 1.2; 
 .metricGrid small, .metricGrid b { display: block; }
 .metricGrid small { margin-bottom: 7px; color: #85827b; font-size: 11px; }
 .metricGrid b { overflow: hidden; font: 700 13px/1 Consolas, monospace; text-overflow: ellipsis; }
-.metricDeltaTag { display: block; overflow: hidden; margin-top: 6px; font: normal 700 9px/1.2 Arial, "Microsoft YaHei", sans-serif; text-overflow: ellipsis; white-space: nowrap; }
 .videoTimes { display: grid; gap: 11px; }
 .videoTimes small, .videoTimes b { display: block; }
 .videoTimes small { margin-bottom: 4px; color: #85827b; font-size: 11px; }
