@@ -55,6 +55,13 @@ def _identifier(value: Any, name: str) -> str:
     return result
 
 
+def _connector_capabilities(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    allowed = set(CANONICAL_JOB_TYPES.values()) | {"sync_accounts"}
+    return sorted({str(value) for value in values if str(value) in allowed})
+
+
 def _job_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -68,6 +75,7 @@ def _job_dict(row: sqlite3.Row) -> dict[str, Any]:
         "updatedAt": row["updated_at"],
         "expiresAt": datetime.fromtimestamp(row["expires_at"], timezone.utc).isoformat().replace("+00:00", "Z"),
         "claimedBy": row["claimed_by"],
+        "claimToken": row["claim_token"],
         "attemptCount": row["attempt_count"],
     }
 
@@ -120,7 +128,12 @@ class Database:
                     token_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL,
                     last_seen_at TEXT,
-                    revoked_at TEXT
+                    revoked_at TEXT,
+                    extension_version TEXT,
+                    capabilities_json TEXT NOT NULL DEFAULT '[]',
+                    worker_id TEXT,
+                    worker_status TEXT,
+                    active_job_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS accounts (
                     id TEXT PRIMARY KEY,
@@ -165,6 +178,7 @@ class Database:
                     expires_at INTEGER NOT NULL,
                     claimed_by TEXT REFERENCES connectors(id),
                     claim_until INTEGER,
+                    claim_token TEXT,
                     attempt_count INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_epoch);
@@ -191,6 +205,19 @@ class Database:
                 );
                 """
             )
+            connector_columns = {row["name"] for row in connection.execute("PRAGMA table_info(connectors)")}
+            for column, definition in {
+                "extension_version": "TEXT",
+                "capabilities_json": "TEXT NOT NULL DEFAULT '[]'",
+                "worker_id": "TEXT",
+                "worker_status": "TEXT",
+                "active_job_id": "TEXT",
+            }.items():
+                if column not in connector_columns:
+                    connection.execute(f"ALTER TABLE connectors ADD COLUMN {column} {definition}")
+            job_columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
+            if "claim_token" not in job_columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN claim_token TEXT")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -281,20 +308,50 @@ class Database:
                 connection.execute("DELETE FROM login_attempts WHERE remote_ip=? AND success=0", (remote_ip,))
             connection.execute("DELETE FROM login_attempts WHERE attempted_at<?", (now - 86400,))
 
-    def pair_connector(self, extension_id: str, label: str, connector_id: str, connector_token_hash: str) -> None:
+    def pair_connector(
+        self,
+        extension_id: str,
+        label: str,
+        connector_id: str,
+        connector_token_hash: str,
+        extension_version: str = "",
+        capabilities: list[str] | None = None,
+        worker_id: str = "",
+    ) -> None:
+        normalized_capabilities = _connector_capabilities(capabilities)
         with self.transaction() as connection:
             active = connection.execute(
                 "SELECT id FROM connectors WHERE extension_id=? AND revoked_at IS NULL", (extension_id,)
             ).fetchone()
             if active:
                 connection.execute(
-                    "UPDATE connectors SET label=?,token_hash=?,last_seen_at=?,revoked_at=NULL WHERE id=?",
-                    (label, connector_token_hash, utc_now(), active["id"]),
+                    "UPDATE connectors SET label=?,token_hash=?,last_seen_at=?,revoked_at=NULL,extension_version=?,"
+                    "capabilities_json=?,worker_id=?,worker_status='idle',active_job_id=NULL WHERE id=?",
+                    (
+                        label,
+                        connector_token_hash,
+                        utc_now(),
+                        extension_version[:64] or None,
+                        _compact_json(normalized_capabilities),
+                        worker_id[:256] or None,
+                        active["id"],
+                    ),
                 )
                 return
             connection.execute(
-                "INSERT INTO connectors(id,extension_id,label,token_hash,created_at) VALUES(?,?,?,?,?)",
-                (connector_id, extension_id, label, connector_token_hash, utc_now()),
+                "INSERT INTO connectors(id,extension_id,label,token_hash,created_at,last_seen_at,extension_version,"
+                "capabilities_json,worker_id,worker_status) VALUES(?,?,?,?,?,?,?,?,?,'idle')",
+                (
+                    connector_id,
+                    extension_id,
+                    label,
+                    connector_token_hash,
+                    utc_now(),
+                    utc_now(),
+                    extension_version[:64] or None,
+                    _compact_json(normalized_capabilities),
+                    worker_id[:256] or None,
+                ),
             )
 
     def connector_by_token(self, connector_token_hash: str) -> dict[str, Any] | None:
@@ -308,14 +365,43 @@ class Database:
         with self.transaction() as connection:
             connection.execute("UPDATE connectors SET last_seen_at=? WHERE id=?", (utc_now(), connector_id))
 
+    def update_connector_runtime(
+        self,
+        connector_id: str,
+        *,
+        extension_version: str = "",
+        capabilities: list[str] | None = None,
+        worker_id: str = "",
+        worker_status: str = "",
+        active_job_id: str | None = None,
+    ) -> None:
+        normalized_capabilities = _connector_capabilities(capabilities)
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE connectors SET last_seen_at=?,extension_version=COALESCE(NULLIF(?,''),extension_version),"
+                "capabilities_json=CASE WHEN ? THEN ? ELSE capabilities_json END,"
+                "worker_id=COALESCE(NULLIF(?,''),worker_id),worker_status=COALESCE(NULLIF(?,''),worker_status),"
+                "active_job_id=? WHERE id=?",
+                (
+                    utc_now(),
+                    extension_version[:64],
+                    1 if capabilities is not None else 0,
+                    _compact_json(normalized_capabilities),
+                    worker_id[:256],
+                    worker_status[:64],
+                    active_job_id,
+                    connector_id,
+                ),
+            )
+
     def connector_status(self) -> dict[str, Any]:
         with closing(self.connect()) as connection:
             row = connection.execute(
-                "SELECT label,created_at,last_seen_at FROM connectors "
+                "SELECT label,created_at,last_seen_at,extension_version,capabilities_json,worker_status,active_job_id FROM connectors "
                 "WHERE revoked_at IS NULL ORDER BY COALESCE(last_seen_at,created_at) DESC LIMIT 1"
             ).fetchone()
         if not row:
-            return {"connected": False, "paired": False, "lastSeenAt": None}
+            return {"connected": False, "paired": False, "lastSeenAt": None, "capabilities": []}
         last_seen = row["last_seen_at"]
         connected = False
         if last_seen:
@@ -329,7 +415,18 @@ class Database:
             "paired": True,
             "lastSeenAt": last_seen,
             "label": row["label"],
+            "extensionVersion": row["extension_version"],
+            "capabilities": json.loads(row["capabilities_json"] or "[]"),
+            "workerStatus": row["worker_status"],
+            "activeJobId": row["active_job_id"],
         }
+
+    def connector_supports(self, capability: str) -> bool:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                "SELECT capabilities_json FROM connectors WHERE revoked_at IS NULL"
+            ).fetchall()
+        return any(capability in json.loads(row["capabilities_json"] or "[]") for row in rows)
 
     @staticmethod
     def _upsert_account(connection: sqlite3.Connection, raw: dict[str, Any]) -> dict[str, Any]:
@@ -531,6 +628,7 @@ class Database:
         key = self._idempotency_key(job_type, payload)
         now_epoch = int(time.time())
         now = utc_now()
+        job_ttl = self.config.analysis_job_expiry_seconds if job_type == "analyze_video" else self.config.job_expiry_seconds
         with self.transaction() as connection:
             if job_type == "archive_account" and isinstance(payload.get("account"), dict):
                 self._upsert_account(connection, payload["account"])
@@ -539,12 +637,13 @@ class Database:
                 if bool(payload.get("retry")) and existing["status"] in ("failed", "expired", "cancelled"):
                     connection.execute(
                         "UPDATE jobs SET payload_json=?,status='queued',result_json=NULL,progress_json=NULL,error=NULL,"
-                        "updated_at=?,created_epoch=?,expires_at=?,claimed_by=NULL,claim_until=NULL WHERE id=?",
+                        "updated_at=?,created_epoch=?,expires_at=?,claimed_by=NULL,claim_until=NULL,claim_token=NULL,"
+                        "attempt_count=0 WHERE id=?",
                         (
                             _compact_json(payload),
                             now,
                             now_epoch,
-                            now_epoch + self.config.job_expiry_seconds,
+                            now_epoch + job_ttl,
                             existing["id"],
                         ),
                     )
@@ -564,7 +663,7 @@ class Database:
                     now,
                     now,
                     now_epoch,
-                    now_epoch + self.config.job_expiry_seconds,
+                    now_epoch + job_ttl,
                 ),
             )
             self._mark_job_subject_queued(connection, job_type, payload)
@@ -575,18 +674,18 @@ class Database:
         now_epoch = int(time.time())
         now = utc_now()
         connection.execute(
-            "UPDATE jobs SET status='expired',error='任务在主机接收前已超过 30 分钟',updated_at=? "
-            "WHERE status='queued' AND expires_at<=?",
+            "UPDATE jobs SET status='expired',error='AI 分析任务等待主机 Chrome 超时',updated_at=? "
+            "WHERE status='queued' AND type='analyze_video' AND expires_at<=?",
             (now, now_epoch),
         )
         connection.execute(
-            "UPDATE jobs SET status='queued',claimed_by=NULL,claim_until=NULL,updated_at=? "
-            "WHERE status='claimed' AND claim_until<=? AND expires_at>?",
-            (now, now_epoch, now_epoch),
+            "UPDATE jobs SET status='expired',error='任务等待主机 Chrome 超时',updated_at=? "
+            "WHERE status='queued' AND type!='analyze_video' AND expires_at<=?",
+            (now, now_epoch),
         )
         connection.execute(
-            "UPDATE jobs SET status='expired',error='任务租约已过期且超过 30 分钟',updated_at=? "
-            "WHERE status='claimed' AND expires_at<=?",
+            "UPDATE jobs SET status='queued',claimed_by=NULL,claim_until=NULL,claim_token=NULL,progress_json=NULL,"
+            "error=NULL,updated_at=? WHERE status IN ('claimed','running') AND claimed_by IS NOT NULL AND claim_until<=?",
             (now, now_epoch),
         )
 
@@ -608,28 +707,40 @@ class Database:
         now_epoch = int(time.time())
         with self.transaction() as connection:
             self.expire_and_requeue(connection)
+            if not allowed:
+                connection.execute("UPDATE connectors SET last_seen_at=? WHERE id=?", (utc_now(), connector_id))
+                return None
             placeholders = ""
             parameters: list[Any] = []
             where = "status='queued'"
-            if allowed:
-                placeholders = ",".join("?" for _ in allowed)
-                where += f" AND type IN ({placeholders})"
-                parameters.extend(sorted(allowed))
+            placeholders = ",".join("?" for _ in allowed)
+            where += f" AND type IN ({placeholders})"
+            parameters.extend(sorted(allowed))
             row = connection.execute(
                 f"SELECT * FROM jobs WHERE {where} ORDER BY created_epoch LIMIT 1", parameters
             ).fetchone()
             if not row:
                 connection.execute("UPDATE connectors SET last_seen_at=? WHERE id=?", (utc_now(), connector_id))
                 return None
+            claim_token = str(uuid.uuid4())
+            job_ttl = self.config.analysis_job_expiry_seconds if row["type"] == "analyze_video" else self.config.job_expiry_seconds
             connection.execute(
-                "UPDATE jobs SET status='claimed',claimed_by=?,claim_until=?,attempt_count=attempt_count+1,updated_at=? WHERE id=?",
-                (connector_id, now_epoch + self.config.claim_lease_seconds, utc_now(), row["id"]),
+                "UPDATE jobs SET status='claimed',claimed_by=?,claim_until=?,claim_token=?,expires_at=?,"
+                "attempt_count=attempt_count+1,updated_at=? WHERE id=?",
+                (
+                    connector_id,
+                    now_epoch + self.config.claim_lease_seconds,
+                    claim_token,
+                    max(int(row["expires_at"]), now_epoch + job_ttl),
+                    utc_now(),
+                    row["id"],
+                ),
             )
             connection.execute("UPDATE connectors SET last_seen_at=? WHERE id=?", (utc_now(), connector_id))
             claimed = connection.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
         return _job_dict(claimed)
 
-    def heartbeat_job(self, connector_id: str, job_id: str | None) -> dict[str, Any] | None:
+    def heartbeat_job(self, connector_id: str, job_id: str | None, claim_token: str | None = None) -> dict[str, Any] | None:
         now_epoch = int(time.time())
         with self.transaction() as connection:
             self.expire_and_requeue(connection)
@@ -639,36 +750,57 @@ class Database:
             row = connection.execute("SELECT * FROM jobs WHERE id=? AND claimed_by=?", (job_id, connector_id)).fetchone()
             if not row or row["status"] not in ("claimed", "running"):
                 return None
+            if not claim_token or row["claim_token"] != claim_token:
+                raise ValueError("任务领取凭据已失效，旧执行已被隔离")
+            job_ttl = self.config.analysis_job_expiry_seconds if row["type"] == "analyze_video" else self.config.job_expiry_seconds
             connection.execute(
-                "UPDATE jobs SET claim_until=?,updated_at=? WHERE id=?",
-                (now_epoch + self.config.claim_lease_seconds, utc_now(), job_id),
+                "UPDATE jobs SET claim_until=?,expires_at=?,updated_at=? WHERE id=?",
+                (
+                    now_epoch + self.config.claim_lease_seconds,
+                    max(int(row["expires_at"]), now_epoch + job_ttl),
+                    utc_now(),
+                    job_id,
+                ),
             )
             current = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return _job_dict(current)
 
     def process_connector_event(
-        self, connector_id: str, job_id: str | None, event_id: str, event_type: str, payload: dict[str, Any]
+        self,
+        connector_id: str,
+        job_id: str | None,
+        claim_token: str | None,
+        event_id: str,
+        event_type: str,
+        payload: dict[str, Any],
     ) -> tuple[bool, dict[str, Any]]:
         event_id = _identifier(event_id, "eventId")
         if job_id is not None:
             job_id = _identifier(job_id, "jobId")
         payload = dict(_object(payload, "payload"))
         with self.transaction() as connection:
+            processed = connection.execute(
+                "SELECT 1 FROM processed_events WHERE connector_id=? AND event_id=?",
+                (connector_id, event_id),
+            ).fetchone()
+            if processed:
+                current = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone() if job_id else None
+                return True, _job_dict(current) if current else {"id": None, "status": "accepted"}
             job = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone() if job_id else None
             if job_id and not job:
                 raise ValueError("任务不存在")
             if job and job["claimed_by"] != connector_id:
                 raise ValueError("任务不属于当前 connector")
+            if job and (not claim_token or job["claim_token"] != claim_token):
+                raise ValueError("任务领取凭据已失效，旧执行结果已拒绝")
+            if job and job["status"] not in ("claimed", "running"):
+                raise ValueError("任务已结束，拒绝迟到的执行结果")
             if not job and event_type not in ("collection_result", "job_completed", "job_failed"):
                 raise ValueError("此事件必须关联任务")
-            try:
-                connection.execute(
-                    "INSERT INTO processed_events(connector_id,event_id,job_id,processed_at) VALUES(?,?,?,?)",
-                    (connector_id, event_id, job_id, utc_now()),
-                )
-            except sqlite3.IntegrityError:
-                current = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone() if job_id else None
-                return True, _job_dict(current) if current else {"id": None, "status": "accepted"}
+            connection.execute(
+                "INSERT INTO processed_events(connector_id,event_id,job_id,processed_at) VALUES(?,?,?,?)",
+                (connector_id, event_id, job_id, utc_now()),
+            )
 
             status = job["status"] if job else "running"
             if event_type in ("started", "progress"):
@@ -725,7 +857,8 @@ class Database:
             elif event_type in ("job_completed", "completed"):
                 if job_id:
                     connection.execute(
-                        "UPDATE jobs SET status='succeeded',result_json=?,progress_json=NULL,error=NULL,updated_at=? WHERE id=?",
+                        "UPDATE jobs SET status='succeeded',result_json=?,progress_json=NULL,error=NULL,claimed_by=NULL,"
+                        "claim_until=NULL,claim_token=NULL,updated_at=? WHERE id=?",
                         (_compact_json(payload), utc_now(), job_id),
                     )
             elif event_type in ("job_failed", "failed"):
@@ -757,7 +890,8 @@ class Database:
                         )
                 if job_id:
                     connection.execute(
-                        "UPDATE jobs SET status='failed',error=?,progress_json=NULL,updated_at=? WHERE id=?",
+                        "UPDATE jobs SET status='failed',error=?,progress_json=NULL,claimed_by=NULL,claim_until=NULL,"
+                        "claim_token=NULL,updated_at=? WHERE id=?",
                         (message, utc_now(), job_id),
                     )
             elif event_type == "analysis_media":
@@ -782,7 +916,7 @@ class Database:
                     ),
                 )
                 connection.execute(
-                    "UPDATE jobs SET status='running',progress_json=?,updated_at=? WHERE id=?",
+                    "UPDATE jobs SET status='running',progress_json=?,claimed_by=NULL,claim_until=NULL,claim_token=NULL,updated_at=? WHERE id=?",
                     (_compact_json({"stage": "media_received"}), utc_now(), job_id),
                 )
                 video_row = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()

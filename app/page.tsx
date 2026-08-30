@@ -87,6 +87,7 @@ type HostJob = {
   error: string | null;
   createdAt: string | null;
   updatedAt: string | null;
+  attemptCount: number;
 };
 
 type AuthPhase = 'loading' | 'setup' | 'login' | 'ready' | 'error';
@@ -194,6 +195,7 @@ const activePlatformStoreKey = 'douyin-monitor.active-platform.v1';
 const selectedAccountStoreKey = 'douyin-monitor.selected-account.v1';
 const migrationMarkerStoreKey = 'douyin-monitor.sqlite-migration.v1';
 const requiredExtensionVersion = '0.7.0';
+const requiredExtensionCapability = 'analyze_video';
 
 function isLoopbackHostname(hostname: string) {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
@@ -448,6 +450,8 @@ export default function Home() {
   const [qwenSaving, setQwenSaving] = useState(false);
   const [hostJobs, setHostJobs] = useState<HostJob[]>([]);
   const [hostConnected, setHostConnected] = useState(false);
+  const [hostConnectorCapabilities, setHostConnectorCapabilities] = useState<string[]>([]);
+  const [hostWorkerStatus, setHostWorkerStatus] = useState('');
   const [activeNav, setActiveNav] = useState('主页仪表盘');
   const [analyticsView, setAnalyticsView] = useState<AnalyticsView>('details');
   const [activePlatform, setActivePlatform] = useState<Platform>(() => {
@@ -468,6 +472,8 @@ export default function Home() {
   const [notice, setNotice] = useState('');
   const [bridgeReady, setBridgeReady] = useState(false);
   const [bridgeVersion, setBridgeVersion] = useState<string | null>(null);
+  const [bridgeCapabilities, setBridgeCapabilities] = useState<string[]>([]);
+  const [bridgeBusy, setBridgeBusy] = useState(false);
   const [bridgeNeedsReload, setBridgeNeedsReload] = useState(false);
   const [schedulerState, setSchedulerState] = useState<SchedulerState | null>(null);
   const [collectionTask, setCollectionTask] = useState<CollectionTaskState>(emptyCollectionTask);
@@ -520,6 +526,10 @@ export default function Home() {
       ?? connectorState.chromeConnected
       ?? false
     ));
+    setHostConnectorCapabilities(Array.isArray(connectorState.capabilities)
+      ? connectorState.capabilities.filter((value): value is string => typeof value === 'string')
+      : []);
+    setHostWorkerStatus(textValue(connectorState.workerStatus ?? connectorState.status));
   }, []);
 
   const loadHostState = useCallback(async () => {
@@ -546,6 +556,7 @@ export default function Home() {
         error: textValue(job.error ?? job.lastError) || null,
         createdAt: textValue(job.createdAt ?? job.created_at) || null,
         updatedAt: textValue(job.updatedAt ?? job.updated_at) || null,
+        attemptCount: Number(job.attemptCount ?? job.attempt_count) || 0,
       } satisfies HostJob;
     });
     setHostJobs(jobs);
@@ -842,21 +853,33 @@ export default function Home() {
       }));
     };
 
-    const handshakeTimer = window.setTimeout(() => setBridgeNeedsReload(true), 1800);
+    const pingBridge = () => window.postMessage({ source: 'douyin-monitor', type: 'PING' }, window.location.origin);
+    const handshakeTimer = window.setTimeout(() => setBridgeReady(false), 1800);
     const receive = (event: MessageEvent) => {
       if (event.source !== window || event.data?.source !== 'douyin-monitor-extension') return;
       if (event.data.type === 'BRIDGE_READY') {
-        setBridgeReady(true);
         if (event.data.schedulerState) {
           const nextSchedulerState = event.data.schedulerState as SchedulerState;
           setSchedulerState(nextSchedulerState);
           if (nextSchedulerState.lastRunStatus === 'running') setIsCollecting(true);
         }
         if (event.data.extensionVersion) {
+          const capabilities = Array.isArray(event.data.capabilities)
+            ? event.data.capabilities.filter((value: unknown): value is string => typeof value === 'string')
+            : [];
+          const compatible = capabilities.includes(requiredExtensionCapability)
+            || (capabilities.length === 0 && event.data.extensionVersion === requiredExtensionVersion);
+          setBridgeReady(true);
           setBridgeVersion(event.data.extensionVersion);
-          setBridgeNeedsReload(event.data.extensionVersion !== requiredExtensionVersion);
+          setBridgeCapabilities(capabilities);
+          setBridgeBusy(Boolean(event.data.collectionInProgress || event.data.activeJobId));
+          setBridgeNeedsReload(!compatible);
           window.clearTimeout(handshakeTimer);
         }
+      }
+      if (event.data.type === 'BRIDGE_STALE') {
+        setBridgeReady(false);
+        setBridgeBusy(false);
       }
       if (event.data.type === 'SCHEDULER_STATE' && event.data.schedulerState) {
         const nextSchedulerState = event.data.schedulerState as SchedulerState;
@@ -958,21 +981,30 @@ export default function Home() {
       }
     };
     window.addEventListener('message', receive);
-    window.postMessage({ source: 'douyin-monitor', type: 'PING' }, window.location.origin);
+    const pingTimer = window.setInterval(pingBridge, 15_000);
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') pingBridge();
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    pingBridge();
     return () => {
       window.clearTimeout(handshakeTimer);
+      window.clearInterval(pingTimer);
+      document.removeEventListener('visibilitychange', handleVisibility);
       window.removeEventListener('message', receive);
     };
   }, [loaded]);
 
   useEffect(() => {
-    if (!loaded || !bridgeReady || bridgeNeedsReload || bridgeVersion !== requiredExtensionVersion) return;
+    const capabilityReady = bridgeCapabilities.includes(requiredExtensionCapability)
+      || (bridgeCapabilities.length === 0 && bridgeVersion === requiredExtensionVersion);
+    if (!loaded || !bridgeReady || bridgeNeedsReload || !capabilityReady) return;
     window.postMessage({
       source: 'douyin-monitor',
       type: 'SYNC_ACCOUNTS',
       accounts,
     }, window.location.origin);
-  }, [accounts, bridgeNeedsReload, bridgeReady, bridgeVersion, loaded]);
+  }, [accounts, bridgeCapabilities, bridgeNeedsReload, bridgeReady, bridgeVersion, loaded]);
 
   useEffect(() => {
     if (!notice) return;
@@ -1030,6 +1062,7 @@ export default function Home() {
         error: textValue(rawJob.error) || null,
         createdAt: textValue(rawJob.createdAt ?? rawJob.created_at) || new Date().toISOString(),
         updatedAt: textValue(rawJob.updatedAt ?? rawJob.updated_at) || null,
+        attemptCount: Number(rawJob.attemptCount ?? rawJob.attempt_count) || 0,
       }, ...current.filter((job) => job.id !== String(rawJob.id || rawJob.jobId))]);
     }
     return rawJob;
@@ -1168,11 +1201,27 @@ export default function Home() {
     }
     if (video.analysisStatus === 'queued' || video.analysisStatus === 'processing') {
       setExpandedAnalyses((current) => new Set(current).add(video.id));
+      if (video.analysisStatus === 'queued') {
+        window.postMessage({ source: 'douyin-monitor', type: 'WAKE_CONNECTOR' }, window.location.origin);
+        setNotice(hostConnected
+          ? bridgeBusy || hostWorkerStatus === 'busy' || hostWorkerStatus === 'running'
+            ? 'Chrome 正在处理上一项任务，完成后会自动继续本条分析'
+            : '正在唤醒 Chrome 继续分析，无需刷新组件'
+          : '任务已保留，等待主机 Chrome 自动连接后继续');
+      }
       return;
     }
     if (!qwenConfigured) {
       if (isHostLocal) setShowQwenConfig(true);
       else setNotice('主机尚未配置 Qwen API Key，请先在主机 localhost 页面完成配置');
+      return;
+    }
+    const hostAnalysisCapable = hostConnectorCapabilities.includes(requiredExtensionCapability);
+    if (!hostAnalysisCapable) {
+      setNotice(isHostLocal && bridgeNeedsReload
+        ? '当前 Chrome 组件缺少完整视频分析能力，需要更新一次；之后连接会自动恢复'
+        : '主机 Chrome 尚未报告完整视频分析能力，正在等待组件自动连接');
+      window.postMessage({ source: 'douyin-monitor', type: 'PING' }, window.location.origin);
       return;
     }
     setVideos((current) => current.map((item) => item.id === video.id ? {
@@ -1192,6 +1241,9 @@ export default function Home() {
       ...(video.analysisStatus === 'error' ? { retry: true } : {}),
     }).then(() => {
       setNotice('AI 分析已进入主机队列，将用完整原视频同步生成口播稿与内容分析');
+      if (isHostLocal && bridgeReady && !bridgeNeedsReload) {
+        window.postMessage({ source: 'douyin-monitor', type: 'WAKE_CONNECTOR' }, window.location.origin);
+      }
       return loadHostJobs();
     }).catch((error: Error) => {
       setVideos((current) => current.map((item) => item.id === video.id ? {
@@ -1387,7 +1439,7 @@ export default function Home() {
           ))}
         </nav>
         <div className="sidebarFoot">
-          <div className={hostConnected ? 'localStatus connected' : 'localStatus'}><i /><span><b>主机采集服务</b><small>{!hostConnected ? '服务已连接 · 等待主机 Chrome' : isHostLocal ? bridgeNeedsReload ? `Chrome 组件需刷新到 v${requiredExtensionVersion}` : bridgeReady ? `Chrome 已连接${bridgeVersion ? ` · v${bridgeVersion}` : ''}` : 'Chrome 队列已连接' : '已连接 · 任务由主机 Chrome 执行'}</small></span></div>
+          <div className={hostConnected ? 'localStatus connected' : 'localStatus'}><i /><span><b>主机采集服务</b><small>{!hostConnected ? '服务已连接 · 等待主机 Chrome 自动连接' : isHostLocal ? bridgeNeedsReload ? `Chrome 组件缺少视频分析能力 · 需更新一次到 v${requiredExtensionVersion}` : bridgeReady ? `Chrome 已连接${bridgeVersion ? ` · v${bridgeVersion}` : ''}` : 'Chrome 后台已连接 · 网页桥接自动恢复中' : '已连接 · 任务由主机 Chrome 执行'}</small></span></div>
           <div className="scheduleSummary">自动检查：每 6 小时</div>
           <button className="logoutButton" type="button" onClick={logout}>退出当前设备</button>
         </div>
@@ -1424,7 +1476,7 @@ export default function Home() {
                 </div>
                 <article className="collectionPanel">
                   <div className="collectionHeader">
-                    <div><h2>采集任务</h2><span>{isHostLocal && bridgeNeedsReload ? `Chrome 采集组件需刷新到 v${requiredExtensionVersion}` : schedulerState?.alarmRegistered ? 'Chrome 后台调度已注册，关闭工作台网页后仍会继续计时' : accounts.some((account) => account.initialSyncStatus !== 'complete') ? '待完成首次建档：每个账号近 30 条非置顶视频' : hostConnected ? '主机正在核验 6 小时后台调度' : '等待主机采集服务连接'}</span></div>
+                    <div><h2>采集任务</h2><span>{isHostLocal && bridgeNeedsReload ? `当前 Chrome 组件缺少完整视频分析能力，更新一次后会自动连接` : schedulerState?.alarmRegistered ? 'Chrome 后台调度已注册，关闭工作台网页后仍会继续计时' : accounts.some((account) => account.initialSyncStatus !== 'complete') ? '待完成首次建档：每个账号近 30 条非置顶视频' : hostConnected ? '主机正在核验 6 小时后台调度' : '等待主机采集服务连接'}</span></div>
                   </div>
                   <div className="schedulerStatusGrid">
                     <span><small>后台调度</small><b className={schedulerState?.alarmRegistered ? 'schedulerHealthy' : ''}>{schedulerState?.alarmRegistered ? '已启用 · 每 6 小时' : '等待 Chrome 核验'}</b></span>
@@ -1447,7 +1499,14 @@ export default function Home() {
               <>
                 <AccountSelector accounts={accounts} videos={videos} selectedAccountId={selectedAccount?.id || ''} onSelect={setSelectedAccountId} />
                 <SectionHeading title={selectedAccount ? `${selectedAccount.name} · 最新视频分析` : '最新视频分析'} count={`${latestVideos.length} 条 · 仅当前账号`} />
-                <VideoTable videos={latestVideos} jobs={hostJobs} expandedAnalyses={expandedAnalyses} onAnalysis={requestAnalysis} />
+                <VideoTable
+                  videos={latestVideos}
+                  jobs={hostJobs}
+                  expandedAnalyses={expandedAnalyses}
+                  onAnalysis={requestAnalysis}
+                  connectorConnected={hostConnected}
+                  connectorBusy={bridgeBusy || hostWorkerStatus === 'busy' || hostWorkerStatus === 'running'}
+                />
               </>
             )}
 
@@ -1464,6 +1523,8 @@ export default function Home() {
                       jobs={hostJobs}
                       expandedAnalyses={expandedAnalyses}
                       onAnalysis={requestAnalysis}
+                      connectorConnected={hostConnected}
+                      connectorBusy={bridgeBusy || hostWorkerStatus === 'busy' || hostWorkerStatus === 'running'}
                     />
                   </>
                   : <AnalyticsBoard
@@ -1827,11 +1888,13 @@ function AccountBoard({ accounts, onAdd, onRemove, onInitialSync, isCollecting }
   })}</section>;
 }
 
-function VideoTable({ videos, jobs, expandedAnalyses, onAnalysis }: {
+function VideoTable({ videos, jobs, expandedAnalyses, onAnalysis, connectorConnected, connectorBusy }: {
   videos: Video[];
   jobs: HostJob[];
   expandedAnalyses: Set<string>;
   onAnalysis: (video: Video) => void;
+  connectorConnected: boolean;
+  connectorBusy: boolean;
 }) {
   if (!videos.length) return <EmptyData title="还没有视频数据" detail="检查成功后，这里会显示封面、视频文案、点赞、评论、收藏、分享和原视频链接。空结果不会再被当作成功。" />;
   return <div className="videoTableScroll"><div className="videoTable">
@@ -1853,8 +1916,22 @@ function VideoTable({ videos, jobs, expandedAnalyses, onAnalysis }: {
               ? 'error'
               : video.analysisStatus;
       const analysisError = video.analysisError || latestJob?.error || latestJob?.message;
+      const queuedLabel = !connectorConnected
+        ? '等待 Chrome'
+        : connectorBusy
+          ? '等待当前任务'
+          : (latestJob?.attemptCount || 0) > 0
+            ? '自动重试中'
+            : '准备分析';
+      const queuedDetail = !connectorConnected
+        ? '任务已保留，主机 Chrome 恢复后会自动继续。'
+        : connectorBusy
+          ? 'Chrome 正在处理上一项采集或分析，完成后会自动继续。'
+          : (latestJob?.attemptCount || 0) > 0
+            ? '上一次执行已中断，系统正在自动重新领取，无需刷新组件。'
+            : '任务已创建，正在唤醒主机 Chrome。';
       const buttonLabel = analysisStatus === 'queued'
-        ? '排队中'
+        ? queuedLabel
         : analysisStatus === 'processing'
           ? '分析中…'
           : analysisStatus === 'ready'
@@ -1894,7 +1971,7 @@ function VideoTable({ videos, jobs, expandedAnalyses, onAnalysis }: {
           </section>
           <section className="analysisPane aiPane">
             <div className="analysisPaneHeader"><b>AI视频分析</b>{video.analysisUpdatedAt && <small>更新于 {formatTime(video.analysisUpdatedAt)}</small>}</div>
-            {(analysisStatus === 'queued' || analysisStatus === 'processing') && <p className="analysisPending">{analysisStatus === 'queued' ? '任务正在等待主机 Chrome 执行。' : '正在读取完整原视频并分析画面、人物行为、文字与内容结构；不会用关键帧或口播稿代替原视频。'}</p>}
+            {(analysisStatus === 'queued' || analysisStatus === 'processing') && <p className="analysisPending">{analysisStatus === 'queued' ? queuedDetail : '正在读取完整原视频并分析画面、人物行为、文字与内容结构；不会用关键帧或口播稿代替原视频。'}</p>}
             {analysisStatus === 'error' && <p className="analysisError">{analysisError || '视频分析失败，请点击“重新分析”。'}</p>}
             {video.analysis && <div className="analysisFields">
               <section className="wide"><small>内容摘要</small><p>{video.analysis.summary || '未生成摘要'}</p></section>

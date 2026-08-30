@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -163,7 +164,12 @@ def run() -> None:
             status, pair, _ = client.request(
                 "POST",
                 "/connector/pair",
-                {"extensionId": EXTENSION_ID, "extensionVersion": "0.7.0"},
+                {
+                    "extensionId": EXTENSION_ID,
+                    "extensionVersion": "0.7.0",
+                    "workerId": "worker-test",
+                    "capabilities": ["collect_latest", "archive_account", "analyze_video"],
+                },
                 origin=EXTENSION_ORIGIN,
                 use_cookie=False,
                 csrf="",
@@ -179,6 +185,17 @@ def run() -> None:
             require(status == 201 and archive_created.get("created") is True, "archive job was not created")
             archive_job_id = archive_created["job"]["id"]
 
+            status, empty_capability_claim, _ = client.request(
+                "POST",
+                "/connector/jobs/claim",
+                {"capabilities": []},
+                origin=EXTENSION_ORIGIN,
+                bearer=connector_token,
+                use_cookie=False,
+                csrf="",
+            )
+            require(status == 200 and empty_capability_claim.get("job") is None, "empty capabilities must claim nothing")
+
             status, claimed, _ = client.request(
                 "POST",
                 "/connector/jobs/claim",
@@ -189,6 +206,27 @@ def run() -> None:
                 csrf="",
             )
             require(status == 200 and claimed.get("job", {}).get("id") == archive_job_id, "archive claim failed")
+            archive_claim_token = claimed["job"].get("claimToken")
+            require(isinstance(archive_claim_token, str) and archive_claim_token, "archive claim token missing")
+            with server.database.transaction() as connection:
+                connection.execute("UPDATE jobs SET expires_at=0 WHERE id=?", (archive_job_id,))
+            status, heartbeat, _ = client.request(
+                "POST",
+                "/connector/heartbeat",
+                {
+                    "jobId": archive_job_id,
+                    "claimToken": archive_claim_token,
+                    "status": "running",
+                    "workerId": "worker-test",
+                    "extensionVersion": "0.7.0",
+                    "capabilities": ["archive_account", "analyze_video"],
+                },
+                origin=EXTENSION_ORIGIN,
+                bearer=connector_token,
+                use_cookie=False,
+                csrf="",
+            )
+            require(status == 200 and heartbeat.get("job", {}).get("status") == "claimed", "active claim expired despite heartbeat")
 
             captured_at = "2026-08-30T00:00:00.000Z"
             video = {
@@ -209,6 +247,7 @@ def run() -> None:
             }
             collection_event = {
                 "jobId": archive_job_id,
+                "claimToken": archive_claim_token,
                 "eventId": f"{archive_job_id}:account-a",
                 "type": "collection_result",
                 "payload": {
@@ -261,6 +300,7 @@ def run() -> None:
                 "/connector/events",
                 {
                     "jobId": archive_job_id,
+                    "claimToken": archive_claim_token,
                     "eventId": f"{archive_job_id}:completed",
                     "type": "job_completed",
                     "payload": {"succeeded": 1, "failed": 0},
@@ -271,6 +311,22 @@ def run() -> None:
                 csrf="",
             )
             require(status == 200, "archive completion event failed")
+            status, _, _ = client.request(
+                "POST",
+                "/connector/events",
+                {
+                    "jobId": archive_job_id,
+                    "claimToken": archive_claim_token,
+                    "eventId": f"{archive_job_id}:late-old-attempt",
+                    "type": "job_failed",
+                    "payload": {"message": "late result"},
+                },
+                origin=EXTENSION_ORIGIN,
+                bearer=connector_token,
+                use_cookie=False,
+                csrf="",
+            )
+            require(status == 400, "late result from a finished attempt was not fenced")
 
             status, state, _ = client.request("GET", "/api/state")
             require(status == 200 and len(state.get("videos", [])) == 1, "shared video state is incomplete")
@@ -280,6 +336,7 @@ def run() -> None:
             require(saved_account.get("initialSyncStatus") == "complete", "initial archive status was not persisted")
             require(saved_account.get("avatarUrl"), "account avatar was not persisted")
             require(len(state.get("snapshots", [])) == 1, "snapshot deduplication failed")
+            require("analyze_video" in state.get("connector", {}).get("capabilities", []), "connector capabilities missing")
 
             status, _, _ = client.request(
                 "POST",
@@ -312,6 +369,11 @@ def run() -> None:
             analyze_job = analyze_created["job"]
             require(analyze_job["payload"].get("videoUrl") == video["url"], "analysis job did not bind the saved video URL")
             require(analyze_job["payload"].get("title") == video["title"], "analysis job did not bind saved metadata")
+            analysis_expiry = datetime.fromisoformat(analyze_job["expiresAt"].replace("Z", "+00:00"))
+            require(
+                (analysis_expiry - datetime.now(timezone.utc)).total_seconds() > 6 * 86400,
+                "analysis queue should survive a temporary Chrome disconnect for several days",
+            )
 
             status, duplicate_job, _ = client.request(
                 "POST",
@@ -334,6 +396,8 @@ def run() -> None:
                 status == 200 and claimed_analysis.get("job", {}).get("id") == analyze_job["id"],
                 "analysis claim failed",
             )
+            analysis_claim_token = claimed_analysis["job"].get("claimToken")
+            require(isinstance(analysis_claim_token, str) and analysis_claim_token, "analysis claim token missing")
 
             submitted: list[tuple[str, dict[str, Any]]] = []
             server.analysis.submit = lambda job_id, payload: submitted.append((job_id, dict(payload))) or True  # type: ignore[method-assign]
@@ -352,6 +416,7 @@ def run() -> None:
                 "/connector/events",
                 {
                     "jobId": analyze_job["id"],
+                    "claimToken": analysis_claim_token,
                     "eventId": f"{analyze_job['id']}:analysis_media",
                     "type": "analysis_media",
                     "payload": media_payload,

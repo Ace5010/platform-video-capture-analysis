@@ -52,6 +52,7 @@ class HostConfig:
     dashboard_port: int
     session_seconds: int
     job_expiry_seconds: int
+    analysis_job_expiry_seconds: int
     claim_lease_seconds: int
     max_request_bytes: int
     max_video_bytes: int
@@ -79,6 +80,7 @@ class HostConfig:
             dashboard_port=_env_int("DOUYIN_DASHBOARD_PORT", 3000, 1, 65535),
             session_seconds=_env_int("DOUYIN_SESSION_SECONDS", 7 * 86400, 900, 30 * 86400),
             job_expiry_seconds=_env_int("DOUYIN_JOB_EXPIRY_SECONDS", 1800, 60, 86400),
+            analysis_job_expiry_seconds=_env_int("DOUYIN_ANALYSIS_JOB_EXPIRY_SECONDS", 7 * 86400, 3600, 30 * 86400),
             claim_lease_seconds=_env_int("DOUYIN_CLAIM_LEASE_SECONDS", 120, 30, 900),
             max_request_bytes=_env_int("DOUYIN_MAX_REQUEST_BYTES", 16 * 1024 * 1024, 4096, 64 * 1024 * 1024),
             # The visual model accepts public videos up to 2GB.  Bailian's

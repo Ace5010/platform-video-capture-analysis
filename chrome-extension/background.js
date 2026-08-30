@@ -4,14 +4,20 @@ const WATCHDOG_ALARM_NAME = 'douyin-monitor-collection-watchdog';
 const CONNECTOR_ALARM_NAME = 'douyin-monitor-connector-poll';
 const WATCHDOG_DELAY_MINUTES = 1;
 const CONNECTOR_POLL_MINUTES = 1;
+const CONNECTOR_CAPABILITIES = ['collect_latest', 'archive_account', 'analyze_video'];
 const SCHEDULER_STATE_KEY = 'schedulerState';
 const COLLECTION_LOCK_KEY = 'collectionLock';
 const SCHEDULED_CATCH_UP_KEY = 'scheduledCatchUp';
 const CONNECTOR_TOKEN_KEY = 'connectorToken';
 const CONNECTOR_STATE_KEY = 'connectorState';
 const CONNECTOR_OUTBOX_KEY = 'connectorEventOutbox';
+// A healthy initial archive can legitimately take longer than 20 minutes.
+// Heartbeat freshness is the crash detector; this larger bound is only a
+// final guard against a lock whose timestamps can no longer be updated.
 const COLLECTION_LOCK_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+const COLLECTION_LOCK_STALE_MS = 90_000;
 const SERVICE_WORKER_KEEPALIVE_MS = 20_000;
+const SCRIPT_EXECUTION_TIMEOUT_MS = 60_000;
 const ACCOUNT_DOM_WAIT_MS = 25_000;
 const DETAIL_DOM_WAIT_MS = 15_000;
 const MEDIA_CAPTURE_WAIT_MS = 22_000;
@@ -36,14 +42,17 @@ let collectionLockMutation = Promise.resolve();
 let connectorOutboxMutation = Promise.resolve();
 let collectionInProgress = false;
 let connectorPollInProgress = false;
+let connectorPairPromise = null;
+let activeConnectorJob = null;
 let schedulerInitializationPromise = null;
 const WORKER_INSTANCE_ID = createMessageId();
 
 chrome.runtime.onInstalled.addListener(async () => {
-  await Promise.all([
-    initializeScheduler({ allowCatchUp: true }),
-    initializeConnector(),
-  ]);
+  try {
+    await initializeScheduler({ allowCatchUp: true });
+  } finally {
+    await initializeConnector();
+  }
   const stored = await chrome.storage.local.get('pendingResults');
   if (!Array.isArray(stored.pendingResults)) {
     await chrome.storage.local.set({ pendingResults: [] });
@@ -51,12 +60,10 @@ chrome.runtime.onInstalled.addListener(async () => {
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  void initializeScheduler({ allowCatchUp: true });
-  void initializeConnector();
+  void initializeScheduler({ allowCatchUp: true }).catch(() => undefined).then(() => initializeConnector());
 });
 
-void initializeScheduler({ allowCatchUp: true });
-void initializeConnector();
+void initializeScheduler({ allowCatchUp: true }).catch(() => undefined).then(() => initializeConnector());
 
 async function ensureSixHourAlarm() {
   let existing = await chrome.alarms.get(ALARM_NAME);
@@ -88,7 +95,35 @@ async function initializeConnector() {
   if (!Array.isArray(stored[CONNECTOR_OUTBOX_KEY])) {
     await chrome.storage.local.set({ [CONNECTOR_OUTBOX_KEY]: [] });
   }
+  // A service-worker restart loses the in-memory execution flag. Reconcile
+  // any persisted collection lock before polling so a crashed execution can
+  // never block the queue until a manual refresh.
+  await handleCollectionWatchdog();
+  await injectDashboardBridgeIntoOpenTabs();
   void pollConnectorQueue();
+}
+
+async function injectDashboardBridgeIntoOpenTabs() {
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: DASHBOARD_URL_PATTERNS });
+  } catch {
+    return 0;
+  }
+  let injected = 0;
+  await Promise.all(tabs.map(async (tab) => {
+    if (!tab.id) return;
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ['dashboard-bridge.js'],
+      });
+      injected += 1;
+    } catch {
+      // Declarative injection still covers the next page load.
+    }
+  }));
+  return injected;
 }
 
 async function saveConnectorState(patch) {
@@ -141,22 +176,58 @@ async function ensureConnectorToken() {
   if (typeof stored[CONNECTOR_TOKEN_KEY] === 'string' && stored[CONNECTOR_TOKEN_KEY]) {
     return stored[CONNECTOR_TOKEN_KEY];
   }
-  const response = await connectorRequest('/connector/pair', {
-    body: {
-      extensionId: chrome.runtime.id || null,
-      extensionVersion: chrome.runtime.getManifest().version,
-      workerId: WORKER_INSTANCE_ID,
-      capabilities: ['collect_latest', 'archive_account', 'analyze_video'],
-    },
+  if (connectorPairPromise) return connectorPairPromise;
+  connectorPairPromise = (async () => {
+    const response = await connectorRequest('/connector/pair', {
+      body: {
+        extensionId: chrome.runtime.id || null,
+        extensionVersion: chrome.runtime.getManifest().version,
+        workerId: WORKER_INSTANCE_ID,
+        capabilities: CONNECTOR_CAPABILITIES,
+      },
+    });
+    const token = response?.token || response?.connectorToken;
+    if (typeof token !== 'string' || !token) {
+      await saveConnectorState({ connected: false, paired: false, lastError: '等待主机完成扩展配对' });
+      return null;
+    }
+    await chrome.storage.local.set({ [CONNECTOR_TOKEN_KEY]: token });
+    await saveConnectorState({ connected: true, paired: true, lastError: null });
+    return token;
+  })().finally(() => {
+    connectorPairPromise = null;
   });
-  const token = response?.token || response?.connectorToken;
-  if (typeof token !== 'string' || !token) {
-    await saveConnectorState({ connected: false, paired: false, lastError: '等待主机完成扩展配对' });
-    return null;
+  return connectorPairPromise;
+}
+
+function isConnectorAuthError(error) {
+  return error?.status === 401 || error?.status === 403;
+}
+
+async function invalidateConnectorToken(staleToken) {
+  const stored = await chrome.storage.local.get(CONNECTOR_TOKEN_KEY);
+  if (!staleToken || stored[CONNECTOR_TOKEN_KEY] === staleToken) {
+    await chrome.storage.local.remove(CONNECTOR_TOKEN_KEY);
+    await saveConnectorState({ connected: false, paired: false, lastError: '连接已失效，正在自动重新配对' });
   }
-  await chrome.storage.local.set({ [CONNECTOR_TOKEN_KEY]: token });
-  await saveConnectorState({ connected: true, paired: true, lastError: null });
-  return token;
+}
+
+async function authorizedConnectorRequest(path, { body, timeoutMs = CONNECTOR_REQUEST_TIMEOUT_MS } = {}) {
+  let token = await ensureConnectorToken();
+  if (!token) throw new Error('主机任务服务尚未完成扩展配对');
+  try {
+    const response = await connectorRequest(path, { token, body, timeoutMs });
+    await saveConnectorState({ connected: true, paired: true, lastError: null });
+    return response;
+  } catch (error) {
+    if (!isConnectorAuthError(error)) throw error;
+    await invalidateConnectorToken(token);
+    token = await ensureConnectorToken();
+    if (!token) throw error;
+    const response = await connectorRequest(path, { token, body, timeoutMs });
+    await saveConnectorState({ connected: true, paired: true, lastError: null });
+    return response;
+  }
 }
 
 function mutateConnectorOutbox(mutator) {
@@ -187,36 +258,37 @@ async function readConnectorOutbox() {
   return Array.isArray(stored[CONNECTOR_OUTBOX_KEY]) ? stored[CONNECTOR_OUTBOX_KEY] : [];
 }
 
-async function flushConnectorOutbox(token) {
+async function flushConnectorOutbox() {
   const events = await readConnectorOutbox();
   for (const record of events) {
     const event = record?.event || record;
     try {
-      await connectorRequest('/connector/events', { token, body: event });
+      await authorizedConnectorRequest('/connector/events', { body: event });
       await mutateConnectorOutbox((current) => current.filter((item) => (item?.event || item)?.eventId !== event.eventId));
       if (record?.pendingMessageId) {
         await acknowledgePendingResults([record.pendingMessageId]);
       }
     } catch (error) {
-      if (error?.status === 401 || error?.status === 403) {
-        await chrome.storage.local.remove(CONNECTOR_TOKEN_KEY);
-        await saveConnectorState({ connected: false, paired: false, lastError: '扩展配对已失效，正在重新配对' });
-      } else {
-        await saveConnectorState({ connected: false, lastError: errorMessage(error) });
+      if ([400, 404, 409].includes(error?.status)) {
+        await mutateConnectorOutbox((current) => current.filter((item) => (item?.event || item)?.eventId !== event.eventId));
+        if (record?.pendingMessageId) await acknowledgePendingResults([record.pendingMessageId]);
+        continue;
       }
+      await saveConnectorState({ connected: false, lastError: errorMessage(error) });
       return false;
     }
   }
   return true;
 }
 
-async function sendConnectorHeartbeat(token, jobId = null, status = 'idle') {
-  const response = await connectorRequest('/connector/heartbeat', {
-    token,
+async function sendConnectorHeartbeat(jobId = null, status = 'idle', claimToken = null) {
+  const response = await authorizedConnectorRequest('/connector/heartbeat', {
     body: {
       workerId: WORKER_INSTANCE_ID,
       extensionVersion: chrome.runtime.getManifest().version,
+      capabilities: CONNECTOR_CAPABILITIES,
       jobId,
+      claimToken,
       status,
       sentAt: new Date().toISOString(),
     },
@@ -225,24 +297,43 @@ async function sendConnectorHeartbeat(token, jobId = null, status = 'idle') {
     const accounts = response.accounts.map(normalizeConnectorAccount).filter(Boolean);
     await syncAccountsAndScheduler(accounts);
   }
+  if (jobId && !response?.job) {
+    const error = new Error('主机已回收本次任务租约，正在自动重新领取');
+    error.code = 'CONNECTOR_LEASE_LOST';
+    throw error;
+  }
   return response;
+}
+
+async function abandonActiveConnectorJob(jobId, message) {
+  if (activeConnectorJob?.id === jobId) activeConnectorJob = null;
+  const stored = await chrome.storage.local.get(COLLECTION_LOCK_KEY);
+  if (stored[COLLECTION_LOCK_KEY]?.runId === jobId) {
+    await chrome.storage.local.remove(COLLECTION_LOCK_KEY);
+    collectionInProgress = false;
+  }
+  await saveConnectorState({ activeJobId: null, lastError: message });
+  setTimeout(() => void pollConnectorQueue(), 0);
 }
 
 async function pollConnectorQueue() {
   if (connectorPollInProgress) return;
   connectorPollInProgress = true;
+  let claimedJob = null;
   try {
-    const token = await ensureConnectorToken();
-    if (!token) return;
-    if (!await flushConnectorOutbox(token)) return;
-    await sendConnectorHeartbeat(token, null, collectionInProgress ? 'busy' : 'idle');
-    if (collectionInProgress) return;
-    const response = await connectorRequest('/connector/jobs/claim', {
-      token,
+    if (!await flushConnectorOutbox()) return;
+    const activeJobId = activeConnectorJob?.id || null;
+    await sendConnectorHeartbeat(
+      activeJobId,
+      activeJobId || collectionInProgress ? 'busy' : 'idle',
+      activeConnectorJob?.claimToken || null,
+    );
+    if (activeConnectorJob || collectionInProgress) return;
+    const response = await authorizedConnectorRequest('/connector/jobs/claim', {
       body: {
         workerId: WORKER_INSTANCE_ID,
         extensionVersion: chrome.runtime.getManifest().version,
-        capabilities: ['collect_latest', 'archive_account', 'analyze_video'],
+        capabilities: CONNECTOR_CAPABILITIES,
       },
     });
     const job = response?.job;
@@ -254,18 +345,26 @@ async function pollConnectorQueue() {
       throw new Error('主机任务服务返回了无效任务');
     }
     await saveConnectorState({ connected: true, paired: true, activeJobId: job.id, lastError: null });
-    await executeConnectorJob(job, token);
-    await saveConnectorState({ connected: true, activeJobId: null, lastCompletedJobId: job.id, lastError: null });
+    activeConnectorJob = { id: job.id, claimToken: job.claimToken || null };
+    claimedJob = job;
   } catch (error) {
-    if (error?.status === 401 || error?.status === 403) {
-      await chrome.storage.local.remove(CONNECTOR_TOKEN_KEY);
-      await saveConnectorState({ connected: false, paired: false, activeJobId: null, lastError: '扩展配对已失效，正在重新配对' });
+    if (error?.code === 'CONNECTOR_LEASE_LOST' && activeConnectorJob?.id) {
+      await abandonActiveConnectorJob(activeConnectorJob.id, errorMessage(error));
     } else {
-      await saveConnectorState({ connected: false, activeJobId: null, lastError: errorMessage(error) });
+      await saveConnectorState({ connected: false, activeJobId: activeConnectorJob?.id || null, lastError: errorMessage(error) });
     }
   } finally {
     connectorPollInProgress = false;
   }
+  if (!claimedJob) return;
+  const jobId = claimedJob.id;
+  void executeConnectorJob(claimedJob)
+    .then(() => saveConnectorState({ connected: true, activeJobId: null, lastCompletedJobId: jobId, lastError: null }))
+    .catch((error) => saveConnectorState({ connected: false, activeJobId: null, lastError: errorMessage(error) }))
+    .finally(() => {
+      if (activeConnectorJob?.id === jobId) activeConnectorJob = null;
+      void pollConnectorQueue();
+    });
 }
 
 function emptySchedulerState() {
@@ -419,9 +518,17 @@ async function acquireCollectionLock(trigger, runId = createMessageId()) {
     const stored = await chrome.storage.local.get(COLLECTION_LOCK_KEY);
     const existing = stored[COLLECTION_LOCK_KEY];
     const existingStartedAt = existing?.startedAt ? Date.parse(existing.startedAt) : Number.NaN;
-    if (existing?.token && Number.isFinite(existingStartedAt) && Date.now() - existingStartedAt < COLLECTION_LOCK_MAX_AGE_MS) {
+    const existingHeartbeatAt = existing?.heartbeatAt ? Date.parse(existing.heartbeatAt) : existingStartedAt;
+    const existingHeartbeatFresh = Number.isFinite(existingHeartbeatAt)
+      && Date.now() - existingHeartbeatAt <= COLLECTION_LOCK_STALE_MS;
+    const existingWithinMaxAge = Number.isFinite(existingStartedAt)
+      && Date.now() - existingStartedAt < COLLECTION_LOCK_MAX_AGE_MS;
+    if (existing?.token && existingHeartbeatFresh && existingWithinMaxAge) {
       collectionInProgress = false;
       return null;
+    }
+    if (existing?.token) {
+      await chrome.storage.local.remove(COLLECTION_LOCK_KEY);
     }
     const token = createMessageId();
     await chrome.storage.local.set({
@@ -446,14 +553,16 @@ async function acquireCollectionLock(trigger, runId = createMessageId()) {
 
 async function releaseCollectionLock(token) {
   if (!token) return;
+  let released = false;
   try {
     const stored = await chrome.storage.local.get(COLLECTION_LOCK_KEY);
     if (stored[COLLECTION_LOCK_KEY]?.token === token) {
       await chrome.storage.local.remove(COLLECTION_LOCK_KEY);
+      await chrome.alarms.clear(WATCHDOG_ALARM_NAME);
+      released = true;
     }
-    await chrome.alarms.clear(WATCHDOG_ALARM_NAME);
   } finally {
-    collectionInProgress = false;
+    if (released) collectionInProgress = false;
   }
   void runPendingScheduledCatchUp();
 }
@@ -535,13 +644,26 @@ async function handleCollectionWatchdog() {
     await chrome.alarms.clear(WATCHDOG_ALARM_NAME);
     return;
   }
-  if (lock.ownerId === WORKER_INSTANCE_ID && collectionInProgress) {
+  const heartbeatAt = Date.parse(lock.heartbeatAt || lock.startedAt || '');
+  const startedAt = Date.parse(lock.startedAt || '');
+  const heartbeatFresh = Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt <= COLLECTION_LOCK_STALE_MS;
+  const withinMaxAge = Number.isFinite(startedAt) && Date.now() - startedAt <= COLLECTION_LOCK_MAX_AGE_MS;
+  if (lock.ownerId === WORKER_INSTANCE_ID && collectionInProgress && heartbeatFresh && withinMaxAge) {
     await scheduleCollectionWatchdog();
     return;
   }
 
   await chrome.storage.local.remove(COLLECTION_LOCK_KEY);
   collectionInProgress = false;
+  if (activeConnectorJob?.id === lock.runId) activeConnectorJob = null;
+  if (String(lock.trigger || '').startsWith('connector:')) {
+    await saveConnectorState({
+      activeJobId: null,
+      lastError: withinMaxAge ? '任务失去心跳，已自动释放并等待重试' : '任务运行超时，已自动释放并等待重试',
+    });
+    void pollConnectorQueue();
+    return;
+  }
   if (lock.trigger === 'manual') {
     await persistAndDeliver({
       type: 'COLLECTION_ERROR',
@@ -583,13 +705,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'PING') {
-    void Promise.all([readPendingResults(), getSchedulerSnapshot()])
-      .then(([pendingResults, schedulerState]) => {
+    void pollConnectorQueue();
+    void Promise.all([
+      readPendingResults(),
+      getSchedulerSnapshot(),
+      chrome.storage.local.get(CONNECTOR_STATE_KEY),
+    ])
+      .then(([pendingResults, schedulerState, connectorStored]) => {
         sendResponse({
           ok: true,
           extensionVersion: chrome.runtime.getManifest().version,
+          capabilities: CONNECTOR_CAPABILITIES,
           pendingResults,
           schedulerState,
+          connectorState: connectorStored[CONNECTOR_STATE_KEY] || null,
+          activeJobId: activeConnectorJob?.id || null,
+          collectionInProgress,
         });
       })
       .catch((error) => sendResponse({ ok: false, error: errorMessage(error) }));
@@ -601,9 +732,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       ? message.accounts.filter(isValidAccount)
       : [];
     void syncAccountsAndScheduler(accounts, sender.tab?.id)
-      .then((schedulerState) => sendResponse({ ok: true, schedulerState }))
+      .then((schedulerState) => {
+        void pollConnectorQueue();
+        sendResponse({ ok: true, schedulerState });
+      })
       .catch((error) => sendResponse({ ok: false, error: errorMessage(error) }));
     return true;
+  }
+
+  if (message.type === 'WAKE_CONNECTOR') {
+    sendResponse({ accepted: true, ok: true });
+    void pollConnectorQueue();
+    return;
   }
 
   if (message.type === 'CHECK_ALL') {
@@ -849,19 +989,21 @@ async function resolveConnectorAccounts(payload, mode) {
   return accounts;
 }
 
-async function executeConnectorJob(job, token) {
+async function executeConnectorJob(job) {
   const type = canonicalConnectorJobType(job.type);
   const payload = job.payload && typeof job.payload === 'object' ? job.payload : {};
+  const claimToken = typeof job.claimToken === 'string' ? job.claimToken : null;
   if (!type) {
     const event = {
       jobId: job.id,
-      eventId: `${job.id}:unsupported`,
+      claimToken,
+      eventId: `${job.id}:${claimToken || 'unfenced'}:unsupported`,
       type: 'job_failed',
       occurredAt: new Date().toISOString(),
       payload: { message: `不支持的主机任务类型：${job.type}` },
     };
     await enqueueConnectorEvent(event);
-    await flushConnectorOutbox(token);
+    await flushConnectorOutbox();
     return;
   }
   if (type === 'sync_accounts') {
@@ -871,23 +1013,27 @@ async function executeConnectorJob(job, token) {
     await syncAccountsAndScheduler(accounts);
     await enqueueConnectorEvent({
       jobId: job.id,
-      eventId: `${job.id}:completed`,
+      claimToken,
+      eventId: `${job.id}:${claimToken || 'unfenced'}:completed`,
       type: 'job_completed',
       occurredAt: new Date().toISOString(),
       payload: { syncedAccountCount: accounts.length },
     });
-    await flushConnectorOutbox(token);
+    await flushConnectorOutbox();
     return;
   }
 
   let lockToken = null;
   const heartbeat = setInterval(() => {
-    void sendConnectorHeartbeat(token, job.id, 'running').catch(() => {});
+    void sendConnectorHeartbeat(job.id, 'running', claimToken)
+      .catch((error) => error?.code === 'CONNECTOR_LEASE_LOST'
+        ? abandonActiveConnectorJob(job.id, errorMessage(error))
+        : saveConnectorState({ connected: false, activeJobId: job.id, lastError: errorMessage(error) }));
   }, SERVICE_WORKER_KEEPALIVE_MS);
   try {
     lockToken = await acquireCollectionLock(`connector:${type}`, job.id);
     if (!lockToken) throw new Error('Chrome 正在执行另一项采集任务，本任务将等待主机重新派发');
-    await sendConnectorHeartbeat(token, job.id, 'running');
+    await sendConnectorHeartbeat(job.id, 'running', claimToken);
 
     if (type === 'collect_latest' || type === 'archive_account') {
       const mode = type === 'archive_account' ? 'initial' : 'latest';
@@ -898,12 +1044,14 @@ async function executeConnectorJob(job, token) {
           runId: job.id,
           lockToken,
           connectorJobId: job.id,
+          connectorClaimToken: claimToken,
         }),
         lockToken,
       );
       await enqueueConnectorEvent({
         jobId: job.id,
-        eventId: `${job.id}:${summary.failed ? 'failed' : 'completed'}`,
+        claimToken,
+        eventId: `${job.id}:${claimToken || 'unfenced'}:${summary.failed ? 'failed' : 'completed'}`,
         type: summary.failed ? 'job_failed' : 'job_completed',
         occurredAt: new Date().toISOString(),
         payload: {
@@ -913,22 +1061,25 @@ async function executeConnectorJob(job, token) {
           errors: summary.errors,
         },
       });
-      await flushConnectorOutbox(token);
+      await flushConnectorOutbox();
       return;
     }
 
     const videoId = normalizeVideoId(payload.videoId, payload.videoUrl || payload.url);
     if (!videoId) throw new Error('视频分析任务缺少有效的视频 ID');
-    const media = await captureFullVideoForAnalysis({
-      videoId,
-      accountId: typeof payload.accountId === 'string' ? payload.accountId : null,
-      videoUrl: normalizeVideoUrl(payload.videoUrl || payload.url, videoId),
-    });
-    await connectorRequest('/connector/events', {
-      token,
+    const media = await keepServiceWorkerAliveUntil(
+      () => captureFullVideoForAnalysis({
+        videoId,
+        accountId: typeof payload.accountId === 'string' ? payload.accountId : null,
+        videoUrl: normalizeVideoUrl(payload.videoUrl || payload.url, videoId),
+      }),
+      lockToken,
+    );
+    await authorizedConnectorRequest('/connector/events', {
       body: {
         jobId: job.id,
-        eventId: `${job.id}:analysis_media`,
+        claimToken,
+        eventId: `${job.id}:${claimToken || 'unfenced'}:analysis_media`,
         type: 'analysis_media',
         occurredAt: new Date().toISOString(),
         payload: {
@@ -951,12 +1102,13 @@ async function executeConnectorJob(job, token) {
   } catch (error) {
     await enqueueConnectorEvent({
       jobId: job.id,
-      eventId: `${job.id}:failed`,
+      claimToken,
+      eventId: `${job.id}:${claimToken || 'unfenced'}:failed`,
       type: 'job_failed',
       occurredAt: new Date().toISOString(),
       payload: { message: errorMessage(error) },
     });
-    await flushConnectorOutbox(token);
+    await flushConnectorOutbox();
     throw error;
   } finally {
     clearInterval(heartbeat);
@@ -995,6 +1147,7 @@ async function collectAll(accounts, dashboardTabId, {
   runId = createMessageId(),
   lockToken = null,
   connectorJobId = null,
+  connectorClaimToken = null,
 } = {}) {
   const totalAccounts = accounts.length;
   let succeeded = 0;
@@ -1048,7 +1201,8 @@ async function collectAll(accounts, dashboardTabId, {
         type: 'COLLECTION_RESULT',
         runId,
         connectorJobId,
-        messageId: `${runId}:${account.id}:${mode}:result`,
+        connectorClaimToken,
+        messageId: `${runId}:${connectorClaimToken || 'manual'}:${account.id}:${mode}:result`,
         accountId: account.id,
         accountName: result.accountName,
         accountAvatarUrl: result.accountAvatarUrl,
@@ -1069,7 +1223,8 @@ async function collectAll(accounts, dashboardTabId, {
           type: 'COLLECTION_ERROR',
           runId,
           connectorJobId,
-          messageId: `${runId}:${account.id}:${collectionModeForAccount(account)}:error`,
+          connectorClaimToken,
+          messageId: `${runId}:${connectorClaimToken || 'manual'}:${account.id}:${collectionModeForAccount(account)}:error`,
           accountId: account.id,
           accountName: account.name || null,
           accountUrl: account.url,
@@ -1475,8 +1630,9 @@ function extractVerifiedVideoMediaSources(expectedVideoId) {
     const queue = [{ value: root, path: '', metadata: {} }];
     const seen = new WeakSet();
     let visited = 0;
-    while (queue.length && visited < 60_000) {
-      const current = queue.shift();
+    let cursor = 0;
+    while (cursor < queue.length && visited < 60_000) {
+      const current = queue[cursor++];
       const value = current.value;
       if (!value || typeof value !== 'object') continue;
       if (seen.has(value)) continue;
@@ -1524,8 +1680,9 @@ function extractVerifiedVideoMediaSources(expectedVideoId) {
     const seen = new WeakSet();
     let visited = 0;
     let matches = 0;
-    while (queue.length && visited < 150_000 && matches < 32) {
-      const { value, key } = queue.shift();
+    let cursor = 0;
+    while (cursor < queue.length && visited < 150_000 && matches < 32) {
+      const { value, key } = queue[cursor++];
       if (!value || typeof value !== 'object' || seen.has(value)) continue;
       seen.add(value);
       visited += 1;
@@ -1925,6 +2082,7 @@ function connectorEventFromCollectionEnvelope(envelope) {
     const videos = Array.isArray(envelope.videos) ? envelope.videos : [];
     return {
       jobId: envelope.connectorJobId || null,
+      claimToken: envelope.connectorClaimToken || null,
       eventId: envelope.messageId,
       type: 'collection_result',
       occurredAt: envelope.capturedAt || new Date().toISOString(),
@@ -1953,6 +2111,7 @@ function connectorEventFromCollectionEnvelope(envelope) {
   if (envelope?.type === 'COLLECTION_ERROR') {
     return {
       jobId: envelope.connectorJobId || null,
+      claimToken: envelope.connectorClaimToken || null,
       eventId: envelope.messageId,
       type: 'job_failed',
       occurredAt: envelope.capturedAt || new Date().toISOString(),
@@ -2107,14 +2266,24 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function executeInTab(tabId, func, args = [], world = 'ISOLATED') {
-  const [execution] = await chrome.scripting.executeScript({
-    target: { tabId },
-    world,
-    func,
-    args,
-  });
-  return execution?.result;
+async function executeInTab(tabId, func, args = [], world = 'ISOLATED', timeoutMs = SCRIPT_EXECUTION_TIMEOUT_MS) {
+  let timeout;
+  try {
+    const [execution] = await Promise.race([
+      chrome.scripting.executeScript({
+        target: { tabId },
+        world,
+        func,
+        args,
+      }),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error('页面数据读取超时，任务将自动释放后重试')), timeoutMs);
+      }),
+    ]);
+    return execution?.result;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function waitForTab(tabId, timeoutMs = 45_000) {

@@ -16,6 +16,7 @@ const storageData = {
 const alarms = new Map();
 const postedEvents = [];
 const requestRecords = [];
+let rejectedConnectorToken = null;
 
 function eventSlot() {
   return {
@@ -74,9 +75,17 @@ async function fetchMock(url, options = {}) {
   const pathname = new URL(url).pathname;
   const body = options.body ? JSON.parse(options.body) : {};
   requestRecords.push({ pathname, authorization: options.headers?.Authorization || null, body });
+  if (rejectedConnectorToken && options.headers?.Authorization === `Bearer ${rejectedConnectorToken}`) {
+    return {
+      ok: false,
+      status: 401,
+      text: async () => JSON.stringify({ error: 'stale connector token' }),
+    };
+  }
   if (pathname === '/connector/events') postedEvents.push(structuredClone(body));
   const payload = pathname === '/connector/jobs/claim' ? { job: null }
     : pathname === '/connector/pair' ? { token: 'paired-test-token' }
+      : pathname === '/connector/heartbeat' ? { job: body.jobId ? { id: body.jobId, status: 'claimed' } : null, accounts: storageData.accounts }
       : {};
   return {
     ok: true,
@@ -126,6 +135,19 @@ assert.equal(
     .every((record) => record.authorization === 'Bearer connector-test-token'),
   true,
 );
+
+rejectedConnectorToken = 'stale-connector-token';
+storageData.connectorToken = rejectedConnectorToken;
+requestRecords.length = 0;
+await vm.runInContext('pollConnectorQueue()', context);
+assert.equal(storageData.connectorToken, 'paired-test-token', 'stale connector token was not replaced immediately');
+assert.equal(requestRecords.some((record) => record.pathname === '/connector/pair'), true);
+assert.equal(
+  requestRecords.some((record) => record.pathname === '/connector/heartbeat' && record.authorization === 'Bearer paired-test-token'),
+  true,
+  'heartbeat was not retried with the repaired connector token',
+);
+rejectedConnectorToken = null;
 
 vm.runInContext(`
   collectAccount = async (account) => ({
@@ -197,6 +219,21 @@ assert.equal(mediaEvent.payload.videoId, '1234567890');
 assert.equal(mediaEvent.payload.videoUrl.includes('full-video'), true);
 assert.equal(mediaEvent.payload.audioUrl.includes('full-audio'), true);
 assert.equal(JSON.stringify(storageData).includes('token=secret'), false, '签名媒体 URL 不得写入扩展持久存储');
+
+const workerInstanceId = vm.runInContext('WORKER_INSTANCE_ID', context);
+storageData.collectionLock = {
+  token: 'stale-lock-token',
+  ownerId: workerInstanceId,
+  runId: 'stale-analysis-job',
+  trigger: 'connector:analyze_video',
+  startedAt: new Date(Date.now() - 21 * 60_000).toISOString(),
+  heartbeatAt: new Date(Date.now() - 2 * 60_000).toISOString(),
+};
+vm.runInContext("collectionInProgress = true; activeConnectorJob = { id: 'stale-analysis-job', claimToken: 'old-claim' }", context);
+await vm.runInContext('handleCollectionWatchdog()', context);
+assert.equal(storageData.collectionLock, undefined, 'stale connector lock was not released');
+assert.equal(vm.runInContext('collectionInProgress', context), false);
+assert.equal(vm.runInContext('activeConnectorJob', context), null);
 
 context.capture = vm.runInContext('createFullVideoCapture(77, 60000)', context);
 onHeadersReceived.listener({
@@ -274,4 +311,4 @@ assert.equal(vm.runInContext("allowedMediaUrl('http://v.douyinvod.com/insecure')
 const ackIds = vm.runInContext("normalizeAckIds({ eventIds: ['a', 'b'], eventId: 'c', messageIds: ['a'] })", context);
 assert.deepEqual([...ackIds], ['a', 'b', 'c']);
 
-console.log('Connector validation passed: one-minute polling, authenticated claim, all-account collection, idempotent events, target-bound structured media, full-video handoff, URL hygiene, and quality-first stream selection.');
+console.log('Connector validation passed: automatic auth repair, stale-lock recovery, authenticated queueing, full-video handoff, URL hygiene, and quality-first stream selection.');

@@ -440,6 +440,11 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                 if canonical_type == "analyze_video":
                     if not QwenClient(self.config, self.server.secrets.load()).configured:
                         raise ApiError(HTTPStatus.PRECONDITION_REQUIRED, "请先在主机 localhost 页面配置 Qwen API Key")
+                    if not self.database.connector_supports("analyze_video"):
+                        raise ApiError(
+                            HTTPStatus.PRECONDITION_REQUIRED,
+                            "主机 Chrome 组件尚未加载 AI 视频分析能力，请更新一次组件；之后会自动连接",
+                        )
                     video = self.database.get_video(str(job_payload.get("videoId") or ""))
                     if not video:
                         raise ApiError(HTTPStatus.NOT_FOUND, "分析目标视频不存在")
@@ -498,6 +503,9 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                 str(payload.get("label") or "主机 Chrome")[:128],
                 connector_id,
                 token_hash(connector_token),
+                str(payload.get("extensionVersion") or ""),
+                payload.get("capabilities") if isinstance(payload.get("capabilities"), list) else [],
+                str(payload.get("workerId") or ""),
             )
             self._send_json(
                 HTTPStatus.CREATED,
@@ -510,11 +518,35 @@ class HostRequestHandler(BaseHTTPRequestHandler):
             capabilities = payload.get("capabilities")
             if capabilities is not None and not isinstance(capabilities, list):
                 raise ApiError(HTTPStatus.BAD_REQUEST, "capabilities 必须是数组")
+            self.database.update_connector_runtime(
+                connector["id"],
+                extension_version=str(payload.get("extensionVersion") or ""),
+                capabilities=capabilities if isinstance(capabilities, list) else [],
+                worker_id=str(payload.get("workerId") or ""),
+                worker_status="polling",
+            )
             job = self.database.claim_job(connector["id"], capabilities)
+            self.database.update_connector_runtime(
+                connector["id"],
+                worker_status="running" if job else "idle",
+                active_job_id=str(job["id"]) if job else None,
+            )
             self._send_json(HTTPStatus.OK, {"ok": True, "job": job})
         elif path == "/connector/heartbeat":
             job_id = payload.get("jobId")
-            job = self.database.heartbeat_job(connector["id"], str(job_id) if job_id else None)
+            self.database.update_connector_runtime(
+                connector["id"],
+                extension_version=str(payload.get("extensionVersion") or ""),
+                capabilities=payload.get("capabilities") if isinstance(payload.get("capabilities"), list) else None,
+                worker_id=str(payload.get("workerId") or ""),
+                worker_status=str(payload.get("status") or "idle"),
+                active_job_id=str(job_id) if job_id else None,
+            )
+            job = self.database.heartbeat_job(
+                connector["id"],
+                str(job_id) if job_id else None,
+                str(payload.get("claimToken") or "") or None,
+            )
             accounts = [
                 {
                     "id": account.get("id"),
@@ -541,6 +573,7 @@ class HostRequestHandler(BaseHTTPRequestHandler):
             event_type = payload.get("type")
             event_payload = payload.get("payload") or {}
             job_id_value = payload.get("jobId")
+            claim_token_value = payload.get("claimToken")
             if not isinstance(event_id, str) or not isinstance(event_type, str) or not isinstance(event_payload, dict):
                 raise ApiError(HTTPStatus.BAD_REQUEST, "connector 事件格式无效")
             aliases = {
@@ -554,6 +587,7 @@ class HostRequestHandler(BaseHTTPRequestHandler):
             duplicate, job = self.database.process_connector_event(
                 connector["id"],
                 str(job_id_value) if job_id_value else None,
+                str(claim_token_value) if claim_token_value else None,
                 event_id,
                 normalized_type,
                 event_payload,
