@@ -614,6 +614,7 @@ def create_server(config: HostConfig | None = None) -> HostHTTPServer:
     cleanup_stale_temp(active_config.temp_dir)
     database = Database(active_config)
     database.initialize()
+    database.normalize_saved_transcripts()
     database.mark_stale_analysis_failed()
     secrets = SecretStore(active_config.secret_path, testing=active_config.testing)
     analysis = AnalysisManager(active_config, database, secrets)

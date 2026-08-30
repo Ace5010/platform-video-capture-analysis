@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
+from .punctuation import restore_punctuation
+
 
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 43128
@@ -317,7 +319,7 @@ def _transcribe_file(path: Path) -> dict[str, Any]:
             vad_filter=True,
             beam_size=5,
         )
-        text = "".join(segment.text for segment in segments).strip()
+        text = restore_punctuation(segments)
     except Exception as error:
         raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "本地语音识别失败") from error
 

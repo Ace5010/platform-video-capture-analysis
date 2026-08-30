@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from local_asr.punctuation import restore_transcript_text
+
 from .config import HostConfig
 
 
@@ -38,6 +40,13 @@ def utc_now() -> str:
 
 def _compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _normalize_video_transcript(video: dict[str, Any]) -> dict[str, Any]:
+    transcript = video.get("transcript")
+    if isinstance(transcript, str) and transcript.strip():
+        video["transcript"] = restore_transcript_text(transcript)
+    return video
 
 
 def _object(value: Any, name: str = "value") -> dict[str, Any]:
@@ -494,6 +503,7 @@ class Database:
                         merged[key] = json.loads(current["data_json"])[key]
             video = merged
         video.update({"id": video_id, "accountId": account_id})
+        _normalize_video_transcript(video)
         source_hash = video.get("sourceHash")
         now = utc_now()
         connection.execute(
@@ -542,7 +552,7 @@ class Database:
     def state(self) -> dict[str, Any]:
         with closing(self.connect()) as connection:
             accounts = [json.loads(row["data_json"]) for row in connection.execute("SELECT data_json FROM accounts ORDER BY created_at")]
-            videos = [json.loads(row["data_json"]) for row in connection.execute("SELECT data_json FROM videos ORDER BY created_at")]
+            videos = [_normalize_video_transcript(json.loads(row["data_json"])) for row in connection.execute("SELECT data_json FROM videos ORDER BY created_at")]
             snapshots = [json.loads(row["data_json"]) for row in connection.execute("SELECT data_json FROM snapshots ORDER BY captured_at")]
         return {
             "accounts": accounts,
@@ -555,7 +565,36 @@ class Database:
         video_id = _identifier(video_id, "videoId")
         with closing(self.connect()) as connection:
             row = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
-        return json.loads(row["data_json"]) if row else None
+        return _normalize_video_transcript(json.loads(row["data_json"])) if row else None
+
+    def normalize_saved_transcripts(self) -> int:
+        """Persist punctuation on transcripts created before restoration was enabled."""
+
+        changed = 0
+        with self.transaction() as connection:
+            rows = connection.execute("SELECT id,data_json FROM videos").fetchall()
+            for row in rows:
+                video = json.loads(row["data_json"])
+                before = video.get("transcript")
+                _normalize_video_transcript(video)
+                if video.get("transcript") == before:
+                    continue
+                connection.execute(
+                    "UPDATE videos SET data_json=?,updated_at=? WHERE id=?",
+                    (_compact_json(video), utc_now(), row["id"]),
+                )
+                changed += 1
+
+            runs = connection.execute("SELECT id,transcript FROM analysis_runs WHERE transcript IS NOT NULL").fetchall()
+            for row in runs:
+                normalized = restore_transcript_text(row["transcript"])
+                if normalized == row["transcript"]:
+                    continue
+                connection.execute(
+                    "UPDATE analysis_runs SET transcript=?,updated_at=? WHERE id=?",
+                    (normalized, utc_now(), row["id"]),
+                )
+        return changed
 
     @staticmethod
     def _mark_job_subject_queued(connection: sqlite3.Connection, job_type: str, payload: dict[str, Any]) -> None:
@@ -941,6 +980,7 @@ class Database:
         analysis: dict[str, Any],
         source_hash: str,
     ) -> None:
+        transcript = restore_transcript_text(transcript)
         with self.transaction() as connection:
             job = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if not job:
@@ -981,6 +1021,8 @@ class Database:
 
     def save_analysis_failure(self, job_id: str, message: str, transcript: str | None = None) -> None:
         safe_message = message[:2000]
+        if transcript is not None:
+            transcript = restore_transcript_text(transcript)
         with self.transaction() as connection:
             job = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if not job:

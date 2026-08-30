@@ -506,6 +506,7 @@ def run() -> None:
             require(status == 200, "LAN state read failed")
             final_video = final_state["videos"][0]
             require(final_video.get("transcriptStatus") == "ready", "transcript was not persisted")
+            require(final_video.get("transcript", "").endswith("。"), "transcript punctuation was not persisted")
             require(final_video.get("analysisStatus") == "ready", "analysis was not permanently persisted")
             require(final_video.get("analysis", {}).get("summary") == "完整原视频测试摘要", "analysis result is incomplete")
             require(not any(config.temp_dir.iterdir()), "analysis temporary media was not deleted")

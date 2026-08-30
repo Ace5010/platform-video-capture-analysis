@@ -11,6 +11,7 @@
     "setup:asr": "powershell -ExecutionPolicy Bypass -File scripts/setup-asr.ps1",
     "test:bridge": "node scripts/test-dashboard-bridge.mjs",
     "test:connector": "node scripts/test-extension-connector.mjs",
+    "test:asr": ".venv\\Scripts\\python.exe scripts/test-local-asr.py",
     "test:host": ".venv\\Scripts\\python.exe scripts/test-host-service.py",
     "test:scheduler": "node scripts/test-extension-scheduler.mjs",
     "test:video-analytics": "node --experimental-strip-types scripts/test-video-analytics.ts",
