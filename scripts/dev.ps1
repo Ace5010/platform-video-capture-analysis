@@ -6,13 +6,13 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $virtualPython = Join-Path $projectRoot '.venv\Scripts\python.exe'
-$asrServer = Join-Path $projectRoot 'local_asr\server.py'
+$hostService = Join-Path $projectRoot 'host_service\server.py'
 
 if (-not (Test-Path -LiteralPath $virtualPython -PathType Leaf)) {
     throw 'ASR virtual environment is missing; run .\scripts\setup-asr.ps1 first'
 }
-if (-not (Test-Path -LiteralPath $asrServer -PathType Leaf)) {
-    throw "ASR service not found: $asrServer"
+if (-not (Test-Path -LiteralPath $hostService -PathType Leaf)) {
+    throw "host service not found: $hostService"
 }
 
 $nodeCommand = Get-Command 'node.exe' -ErrorAction Stop
@@ -103,38 +103,44 @@ function Stop-ManagedProcess {
     }
 }
 
-$asrProcess = $null
+$hostProcess = $null
 $webProcess = $null
 $scriptExitCode = 0
 
 try {
-    $asrProcess = Start-ManagedProcess `
-        -Name 'local ASR' `
+    $hostProcess = Start-ManagedProcess `
+        -Name 'host API, queue, and local ASR' `
         -FilePath $virtualPython `
-        -ArgumentList @($asrServer)
+        -ArgumentList @('-m', 'host_service.server')
 
     Start-Sleep -Milliseconds 600
-    $asrProcess.Refresh()
-    if ($asrProcess.HasExited) {
-        throw "local ASR failed to start, exit code: $($asrProcess.ExitCode)"
+    $hostProcess.Refresh()
+    if ($hostProcess.HasExited) {
+        throw "host service failed to start, exit code: $($hostProcess.ExitCode)"
     }
 
     $webProcess = Start-ManagedProcess `
         -Name 'Vinext dev server' `
         -FilePath $nodeCommand.Source `
-        -ArgumentList @($vinextCli, 'dev')
+        -ArgumentList @($vinextCli, 'dev', '--hostname', '0.0.0.0', '--port', '3000')
 
-    Write-Host '[dev] ASR: http://127.0.0.1:43128/health'
+    Write-Host '[dev] Dashboard: http://localhost:3000'
+    Write-Host '[dev] Host API: http://127.0.0.1:43129/health'
+    $lanAddresses = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' }
+    foreach ($lanAddress in $lanAddresses) {
+        Write-Host "[dev] LAN dashboard: http://$($lanAddress.IPAddress):3000"
+    }
     Write-Host '[dev] both services are running; Ctrl+C stops both.'
 
     while ($true) {
         Start-Sleep -Milliseconds 500
-        $asrProcess.Refresh()
+        $hostProcess.Refresh()
         $webProcess.Refresh()
 
-        if ($asrProcess.HasExited) {
-            $scriptExitCode = if ($asrProcess.ExitCode -eq 0) { 1 } else { $asrProcess.ExitCode }
-            Write-Warning "local ASR exited, code: $($asrProcess.ExitCode)"
+        if ($hostProcess.HasExited) {
+            $scriptExitCode = if ($hostProcess.ExitCode -eq 0) { 1 } else { $hostProcess.ExitCode }
+            Write-Warning "host service exited, code: $($hostProcess.ExitCode)"
             break
         }
         if ($webProcess.HasExited) {
@@ -146,7 +152,7 @@ try {
 }
 finally {
     Stop-ManagedProcess -ChildProcess $webProcess -Name 'Vinext dev server'
-    Stop-ManagedProcess -ChildProcess $asrProcess -Name 'local ASR'
+    Stop-ManagedProcess -ChildProcess $hostProcess -Name 'host API, queue, and local ASR'
 }
 
 exit $scriptExitCode

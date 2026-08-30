@@ -13,6 +13,8 @@ const storageData = {
   pendingResults: [],
 };
 const alarms = new Map();
+const deliveredMessages = [];
+let keepAliveCalls = 0;
 
 function eventSlot() {
   return {
@@ -20,7 +22,12 @@ function eventSlot() {
     addListener(listener) {
       this.listener = listener;
     },
-    removeListener() {},
+    removeListener(listener) {
+      if (this.listener === listener) this.listener = null;
+    },
+    hasListener(listener) {
+      return this.listener === listener;
+    },
   };
 }
 
@@ -36,10 +43,15 @@ function storageGet(keys) {
 const runtimeOnMessage = eventSlot();
 const chrome = {
   runtime: {
+    id: 'scheduler-test-extension',
     onInstalled: eventSlot(),
     onStartup: eventSlot(),
     onMessage: runtimeOnMessage,
-    getManifest: () => ({ version: '0.5.0' }),
+    getManifest: () => ({ version: '0.7.0' }),
+    getPlatformInfo: async () => {
+      keepAliveCalls += 1;
+      return { os: 'win' };
+    },
   },
   alarms: {
     onAlarm: eventSlot(),
@@ -51,6 +63,7 @@ const chrome = {
         scheduledTime: Date.now() + info.delayInMinutes * 60 * 1000,
       });
     },
+    clear: async (name) => alarms.delete(name),
   },
   storage: {
     local: {
@@ -61,13 +74,32 @@ const chrome = {
   },
   tabs: {
     query: async () => [],
-    sendMessage: async () => undefined,
+    sendMessage: async (_tabId, message) => {
+      deliveredMessages.push(structuredClone(message));
+    },
     create: async () => { throw new Error('测试不应启动真实采集'); },
     remove: async () => undefined,
   },
   scripting: { executeScript: async () => [] },
-  webRequest: { onBeforeRequest: eventSlot() },
+  webRequest: {
+    onBeforeRequest: eventSlot(),
+    onHeadersReceived: eventSlot(),
+  },
 };
+
+async function fetchMock(url) {
+  const pathname = new URL(url).pathname;
+  const payload = pathname === '/connector/pair'
+    ? { token: 'scheduler-test-token' }
+    : pathname === '/connector/jobs/claim'
+      ? { job: null }
+      : {};
+  return {
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify(payload),
+  };
+}
 
 const context = vm.createContext({
   chrome,
@@ -93,7 +125,7 @@ const context = vm.createContext({
   setInterval,
   clearInterval,
   structuredClone,
-  fetch,
+  fetch: fetchMock,
   FormData,
   Blob,
   AbortController,
@@ -116,13 +148,16 @@ function sendMessage(message) {
       clearTimeout(timeout);
       resolve(response);
     };
-    runtimeOnMessage.listener(message, { tab: { id: 7 } }, sendResponse);
+    runtimeOnMessage.listener(message, {
+      id: chrome.runtime.id,
+      tab: { id: 7, url: 'http://localhost:3000/' },
+    }, sendResponse);
   });
 }
 
 const ping = await sendMessage({ source: 'douyin-monitor', type: 'PING' });
 assert.equal(ping.ok, true);
-assert.equal(ping.extensionVersion, '0.5.0');
+assert.equal(ping.extensionVersion, '0.7.0');
 assert.equal(ping.schedulerState.monitoredAccountCount, 2);
 
 const synced = await sendMessage({
@@ -138,4 +173,56 @@ assert.deepEqual(storageData.accounts.map((account) => account.id), ['account-a'
 assert.equal(storageData.accounts[0].initialSyncStatus, 'complete');
 assert.equal(storageData.schedulerState.monitoredAccountCount, 2);
 
-console.log('Scheduler validation passed: alarm, status snapshot, account sync, removal, and completed-state preservation.');
+storageData.pendingResults.push({ messageId: 'ack-by-event-id', type: 'COLLECTION_RESULT' });
+const acknowledged = await sendMessage({
+  source: 'douyin-monitor',
+  type: 'ACK_RESULTS',
+  eventIds: ['ack-by-event-id'],
+});
+assert.equal(acknowledged.ok, true);
+assert.equal(storageData.pendingResults.some((item) => item.messageId === 'ack-by-event-id'), false);
+
+const manualLock = await vm.runInContext("acquireCollectionLock('manual', 'manual-test-run')", context);
+await vm.runInContext("runScheduledCollection('alarm')", context);
+assert.equal(storageData.schedulerState.lastRunStatus, 'queued');
+assert.ok(storageData.scheduledCatchUp?.queuedAt);
+delete storageData.scheduledCatchUp;
+context.manualLock = manualLock;
+await vm.runInContext('releaseCollectionLock(manualLock)', context);
+
+context.batchAccounts = [
+  { id: 'batch-a', name: '账号A', url: 'https://www.douyin.com/user/batch-a', initialSyncStatus: 'complete', syncMode: 'latest' },
+  { id: 'batch-b', name: '账号B', url: 'https://www.douyin.com/user/batch-b', initialSyncStatus: 'complete', syncMode: 'latest' },
+  { id: 'batch-c', name: '账号C', url: 'https://www.douyin.com/user/batch-c', initialSyncStatus: 'complete', syncMode: 'latest' },
+];
+vm.runInContext(`
+  collectAccount = async (account, mode, onProgress) => {
+    await onProgress({ stage: 'video-detail', completed: 1, total: 1 });
+    if (account.id === 'batch-b') throw new Error('模拟单账号失败');
+    return {
+      accountName: account.name,
+      accountAvatarUrl: null,
+      videos: [{ id: account.id + '-video', accountId: account.id, url: 'https://www.douyin.com/video/123' }],
+      warning: null,
+    };
+  };
+`, context);
+
+const batchSummary = await vm.runInContext(`
+  keepServiceWorkerAliveUntil(
+    () => collectAll(batchAccounts, 7, { runId: 'test-run' }),
+    null,
+  )
+`, context);
+assert.equal(batchSummary.total, 3);
+assert.equal(batchSummary.succeeded, 2);
+assert.equal(batchSummary.failed, 1);
+assert.deepEqual(
+  deliveredMessages.filter((message) => message.type === 'COLLECTION_STARTED').map((message) => message.accountId),
+  ['batch-a', 'batch-b', 'batch-c'],
+);
+assert.equal(deliveredMessages.filter((message) => message.type === 'COLLECTION_BATCH_COMPLETED').length, 1);
+assert.equal(deliveredMessages.some((message) => message.type?.startsWith('COLLECTION_') && 'progress' in message), false);
+assert.ok(keepAliveCalls >= 1);
+
+console.log('Scheduler validation passed: alarm, status snapshot, account sync, multi-account continuation, and semantic batch completion.');

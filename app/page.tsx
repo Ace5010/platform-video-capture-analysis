@@ -2,10 +2,11 @@
 
 /* eslint-disable @next/next/no-img-element -- 抖音封面是运行时采集的外部地址，不能预先配置图片域名。 */
 
-import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 type AccountStatus = 'waiting' | 'checking' | 'ready' | 'error';
 type TranscriptStatus = 'idle' | 'processing' | 'ready' | 'error';
+type AnalysisStatus = 'idle' | 'queued' | 'processing' | 'ready' | 'error';
 type SyncMode = 'initial' | 'latest';
 type InitialSyncStatus = 'pending' | 'complete' | 'error';
 type Platform = 'douyin' | 'xiaohongshu' | 'bilibili' | 'youtube';
@@ -19,6 +20,7 @@ type Account = {
   avatarUrl: string | null;
   addedAt: string;
   lastCheckedAt: string | null;
+  lastSuccessAt: string | null;
   status: AccountStatus;
   initialSyncStatus: InitialSyncStatus;
   initialSyncCompletedAt: string | null;
@@ -46,7 +48,34 @@ type Video = {
   transcriptStatus: TranscriptStatus;
   transcriptUpdatedAt: string | null;
   transcriptError: string | null;
+  analysis: VideoAnalysis | null;
+  analysisStatus: AnalysisStatus;
+  analysisUpdatedAt: string | null;
+  analysisError: string | null;
 };
+
+type VideoAnalysis = {
+  summary: string;
+  topic: string;
+  corePoint: string;
+  visualContent: string;
+  personActions: string;
+  onScreenText: string;
+  structureNarrative: string;
+};
+
+type HostJob = {
+  id: string;
+  type: 'collect_latest' | 'archive_account' | 'analyze_video' | string;
+  status: string;
+  payload: Record<string, unknown>;
+  message: string | null;
+  error: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+};
+
+type AuthPhase = 'loading' | 'setup' | 'login' | 'ready' | 'error';
 
 type Snapshot = {
   accountId?: string;
@@ -59,6 +88,7 @@ type Snapshot = {
 };
 
 type CollectionMessage = {
+  runId?: string;
   eventId?: string;
   messageId?: string;
   accountId?: string;
@@ -68,7 +98,29 @@ type CollectionMessage = {
   capturedAt?: string;
   videos?: Array<Partial<Video> & Pick<Video, 'id' | 'accountId' | 'url'>>;
   warning?: string;
+  message?: string;
   mode?: SyncMode;
+  accountIndex?: number;
+  totalAccounts?: number;
+  completedVideos?: number;
+  totalVideos?: number;
+  succeeded?: number;
+  failed?: number;
+  startedAt?: string;
+  completedAt?: string;
+};
+
+type CollectionTaskState = {
+  runId: string | null;
+  phase: 'idle' | 'running' | 'completed';
+  accountName: string | null;
+  accountIndex: number;
+  totalAccounts: number;
+  completedVideos: number;
+  totalVideos: number;
+  succeeded: number;
+  failed: number;
+  completedAt: string | null;
 };
 
 type SchedulerState = {
@@ -83,15 +135,15 @@ type SchedulerState = {
   lastCompletedAt: string | null;
   lastSuccessAt: string | null;
   lastRunStatus: SchedulerRunStatus;
-  lastTrigger: 'alarm' | 'catch-up' | null;
+  lastTrigger: 'alarm' | 'catch-up' | 'recovery' | null;
   lastError: string | null;
   missedRunRecoveredAt: string | null;
 };
 
 const navItems = [
   ['⌂', '主页仪表盘'],
-  ['◎', '对标账号'],
-  ['▣', '最新视频'],
+  ['◎', '监控账号'],
+  ['▣', '最新视频分析'],
   ['⌁', '总数据分析'],
 ];
 
@@ -107,10 +159,10 @@ function PlatformIcon({ platform, alt }: { platform: Platform; alt: string }) {
 }
 
 const PLATFORMS: Record<Platform, PlatformMeta> = {
-  douyin: { name: '抖音', tagline: '对标账号的监控与分析', enabled: true, icon: <PlatformIcon platform="douyin" alt="抖音" /> },
-  xiaohongshu: { name: '小红书', tagline: '对标账号的监控与分析', enabled: false, icon: <PlatformIcon platform="xiaohongshu" alt="小红书" /> },
-  bilibili: { name: '哔哩哔哩', tagline: '对标账号的监控与分析', enabled: false, icon: <PlatformIcon platform="bilibili" alt="哔哩哔哩" /> },
-  youtube: { name: 'YouTube', tagline: '对标账号的监控与分析', enabled: false, icon: <PlatformIcon platform="youtube" alt="YouTube" /> },
+  douyin: { name: '抖音', tagline: '监控账号的视频采集与分析', enabled: true, icon: <PlatformIcon platform="douyin" alt="抖音" /> },
+  xiaohongshu: { name: '小红书', tagline: '监控账号的视频采集与分析', enabled: false, icon: <PlatformIcon platform="xiaohongshu" alt="小红书" /> },
+  bilibili: { name: '哔哩哔哩', tagline: '监控账号的视频采集与分析', enabled: false, icon: <PlatformIcon platform="bilibili" alt="哔哩哔哩" /> },
+  youtube: { name: 'YouTube', tagline: '监控账号的视频采集与分析', enabled: false, icon: <PlatformIcon platform="youtube" alt="YouTube" /> },
 };
 
 const accountStoreKey = 'douyin-monitor.accounts.v1';
@@ -119,7 +171,52 @@ const snapshotStoreKey = 'douyin-monitor.snapshots.v2';
 const processedResultStoreKey = 'douyin-monitor.processed-results.v1';
 const activePlatformStoreKey = 'douyin-monitor.active-platform.v1';
 const selectedAccountStoreKey = 'douyin-monitor.selected-account.v1';
-const requiredExtensionVersion = '0.5.0';
+const migrationMarkerStoreKey = 'douyin-monitor.sqlite-migration.v1';
+const requiredExtensionVersion = '0.7.0';
+
+function isLoopbackHostname(hostname: string) {
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
+}
+
+function getHostApiBase() {
+  if (typeof window === 'undefined') return 'http://127.0.0.1:43129';
+  return `http://${window.location.hostname || '127.0.0.1'}:43129`;
+}
+
+async function hostApi<T>(base: string, path: string, options: RequestInit = {}, csrfToken = ''): Promise<T> {
+  const headers = new Headers(options.headers);
+  if (options.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  if (csrfToken && options.method && options.method !== 'GET') headers.set('X-CSRF-Token', csrfToken);
+  const response = await fetch(`${base}${path}`, {
+    ...options,
+    headers,
+    credentials: 'include',
+    cache: 'no-store',
+  });
+  const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+  if (!response.ok) {
+    const message = typeof payload.message === 'string'
+      ? payload.message
+      : typeof payload.error === 'string'
+        ? payload.error
+        : `本机服务返回错误（${response.status}）`;
+    throw new Error(message);
+  }
+  return payload as T;
+}
+
+const emptyCollectionTask: CollectionTaskState = {
+  runId: null,
+  phase: 'idle',
+  accountName: null,
+  accountIndex: 0,
+  totalAccounts: 0,
+  completedVideos: 0,
+  totalVideos: 0,
+  succeeded: 0,
+  failed: 0,
+  completedAt: null,
+};
 
 function readStored<T>(key: string, fallback: T): T {
   if (typeof window === 'undefined') return fallback;
@@ -137,6 +234,33 @@ function nullableNumber(value: unknown): number | null {
   return Number.isFinite(number) ? number : null;
 }
 
+function textValue(value: unknown) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function normalizeAnalysis(raw: unknown): VideoAnalysis | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const source = raw as Record<string, unknown>;
+  const analysis = {
+    summary: textValue(source.summary),
+    topic: textValue(source.topic),
+    corePoint: textValue(source.corePoint ?? source.core_point),
+    visualContent: textValue(source.visualContent ?? source.visual_content),
+    personActions: textValue(source.personActions ?? source.person_actions),
+    onScreenText: textValue(source.onScreenText ?? source.on_screen_text),
+    structureNarrative: textValue(source.structureNarrative ?? source.structure_narrative),
+  };
+  return Object.values(analysis).some(Boolean) ? analysis : null;
+}
+
+function normalizeAnalysisStatus(value: unknown, analysis: VideoAnalysis | null): AnalysisStatus {
+  if (analysis) return 'ready';
+  if (value === 'queued' || value === 'pending' || value === 'waiting') return 'queued';
+  if (value === 'processing' || value === 'running' || value === 'claimed') return 'processing';
+  if (value === 'error' || value === 'failed' || value === 'expired') return 'error';
+  return 'idle';
+}
+
 function normalizeAccount(raw: Partial<Account>, index: number): Account {
   const initialSyncStatus = raw.initialSyncStatus === 'complete' || raw.initialSyncStatus === 'error'
     ? raw.initialSyncStatus
@@ -149,6 +273,7 @@ function normalizeAccount(raw: Partial<Account>, index: number): Account {
     avatarUrl: typeof raw.avatarUrl === 'string' && raw.avatarUrl ? raw.avatarUrl : null,
     addedAt: raw.addedAt || new Date().toISOString(),
     lastCheckedAt: raw.lastCheckedAt || null,
+    lastSuccessAt: raw.lastSuccessAt || raw.lastCheckedAt || null,
     status: initialSyncStatus === 'complete' ? (raw.status || 'ready') : 'waiting',
     initialSyncStatus,
     initialSyncCompletedAt: raw.initialSyncCompletedAt || null,
@@ -159,6 +284,15 @@ function normalizeAccount(raw: Partial<Account>, index: number): Account {
 
 function normalizeVideo(raw: Partial<Video>, capturedAt = new Date().toISOString()): Video {
   const previousTranscript = typeof raw.transcript === 'string' && raw.transcript.trim() ? raw.transcript : null;
+  const analysis = normalizeAnalysis(raw.analysis || {
+    summary: (raw as Partial<VideoAnalysis>).summary,
+    topic: (raw as Partial<VideoAnalysis>).topic,
+    corePoint: (raw as Partial<VideoAnalysis>).corePoint,
+    visualContent: (raw as Partial<VideoAnalysis>).visualContent,
+    personActions: (raw as Partial<VideoAnalysis>).personActions,
+    onScreenText: (raw as Partial<VideoAnalysis>).onScreenText,
+    structureNarrative: (raw as Partial<VideoAnalysis>).structureNarrative,
+  });
   const seenAt = raw.capturedAt || raw.lastSeenAt || capturedAt;
   return {
     id: String(raw.id || ''),
@@ -180,6 +314,10 @@ function normalizeVideo(raw: Partial<Video>, capturedAt = new Date().toISOString
     transcriptStatus: previousTranscript ? 'ready' : (raw.transcriptStatus === 'processing' ? 'idle' : (raw.transcriptStatus || 'idle')),
     transcriptUpdatedAt: raw.transcriptUpdatedAt || null,
     transcriptError: raw.transcriptError || null,
+    analysis,
+    analysisStatus: normalizeAnalysisStatus(raw.analysisStatus, analysis),
+    analysisUpdatedAt: raw.analysisUpdatedAt || null,
+    analysisError: raw.analysisError || null,
   };
 }
 
@@ -204,6 +342,12 @@ function formatDuration(value: number | null) {
   return `${minutes}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
+function startOfTodayTimestamp() {
+  const date = new Date();
+  date.setHours(0, 0, 0, 0);
+  return date.getTime();
+}
+
 function schedulerRunLabel(status: SchedulerRunStatus | undefined) {
   if (status === 'running') return '正在自动采集';
   if (status === 'success') return '运行成功';
@@ -215,6 +359,21 @@ function schedulerRunLabel(status: SchedulerRunStatus | undefined) {
 }
 
 export default function Home() {
+  const [apiBase, setApiBase] = useState('http://127.0.0.1:43129');
+  const [isHostLocal, setIsHostLocal] = useState(true);
+  const [browserReady, setBrowserReady] = useState(false);
+  const [authPhase, setAuthPhase] = useState<AuthPhase>('loading');
+  const [authMessage, setAuthMessage] = useState('正在连接主机服务…');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authPasswordConfirm, setAuthPasswordConfirm] = useState('');
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [csrfToken, setCsrfToken] = useState('');
+  const [qwenConfigured, setQwenConfigured] = useState(false);
+  const [showQwenConfig, setShowQwenConfig] = useState(false);
+  const [qwenApiKey, setQwenApiKey] = useState('');
+  const [qwenSaving, setQwenSaving] = useState(false);
+  const [hostJobs, setHostJobs] = useState<HostJob[]>([]);
+  const [hostConnected, setHostConnected] = useState(false);
   const [activeNav, setActiveNav] = useState('主页仪表盘');
   const [activePlatform, setActivePlatform] = useState<Platform>(() => {
     const stored = readStored<string>(activePlatformStoreKey, '');
@@ -236,42 +395,205 @@ export default function Home() {
   const [bridgeVersion, setBridgeVersion] = useState<string | null>(null);
   const [bridgeNeedsReload, setBridgeNeedsReload] = useState(false);
   const [schedulerState, setSchedulerState] = useState<SchedulerState | null>(null);
-  const [progress, setProgress] = useState(0);
+  const [collectionTask, setCollectionTask] = useState<CollectionTaskState>(emptyCollectionTask);
   const [isCollecting, setIsCollecting] = useState(false);
-  const [expandedTranscripts, setExpandedTranscripts] = useState<Set<string>>(new Set());
+  const [todayStart, setTodayStart] = useState(startOfTodayTimestamp);
+  const [expandedAnalyses, setExpandedAnalyses] = useState<Set<string>>(new Set());
   const processedResultIds = useRef<Set<string>>(new Set());
-  const autoStartedInitialAccounts = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    // Keep the server snapshot stable for hydration, then resolve the actual
+    // LAN/loopback host once the browser has mounted.
+    const timer = window.setTimeout(() => {
+      setApiBase(getHostApiBase());
+      setIsHostLocal(isLoopbackHostname(window.location.hostname));
+      setBrowserReady(true);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  const applyHostState = useCallback((payload: Record<string, unknown>) => {
+    const envelope = payload.state && typeof payload.state === 'object'
+      ? payload.state as Record<string, unknown>
+      : payload.data && typeof payload.data === 'object'
+        ? payload.data as Record<string, unknown>
+        : payload;
+    const nextAccounts = Array.isArray(envelope.accounts)
+      ? envelope.accounts.map((account, index) => normalizeAccount(account as Partial<Account>, index))
+      : [];
+    const nextVideos = Array.isArray(envelope.videos)
+      ? envelope.videos.map((video) => normalizeVideo(video as Partial<Video>))
+      : [];
+    const nextSnapshots = Array.isArray(envelope.snapshots) ? envelope.snapshots as Snapshot[] : [];
+    setAccounts(nextAccounts);
+    setVideos(nextVideos);
+    setSnapshots(nextSnapshots);
+    setSelectedAccountId((current) => nextAccounts.some((account) => account.id === current)
+      ? current
+      : nextAccounts.some((account) => account.id === readStored<string>(selectedAccountStoreKey, ''))
+        ? readStored<string>(selectedAccountStoreKey, '')
+        : nextAccounts[0]?.id || '');
+    if (envelope.schedulerState && typeof envelope.schedulerState === 'object') {
+      setSchedulerState(envelope.schedulerState as SchedulerState);
+    }
+    const connectorState = envelope.connector && typeof envelope.connector === 'object'
+      ? envelope.connector as Record<string, unknown>
+      : envelope;
+    setHostConnected(Boolean(
+      connectorState.connected
+      ?? connectorState.connectorConnected
+      ?? connectorState.chromeConnected
+      ?? false
+    ));
+  }, []);
+
+  const loadHostState = useCallback(async () => {
+    const payload = await hostApi<Record<string, unknown>>(apiBase, '/api/state');
+    applyHostState(payload);
+    return payload;
+  }, [apiBase, applyHostState]);
+
+  const loadHostJobs = useCallback(async () => {
+    const payload = await hostApi<Record<string, unknown>>(apiBase, '/api/jobs');
+    const rawJobs = Array.isArray(payload.jobs)
+      ? payload.jobs
+      : payload.data && typeof payload.data === 'object' && Array.isArray((payload.data as Record<string, unknown>).jobs)
+        ? (payload.data as Record<string, unknown>).jobs as unknown[]
+        : [];
+    const jobs = rawJobs.map((item, index) => {
+      const job = item && typeof item === 'object' ? item as Record<string, unknown> : {};
+      return {
+        id: String(job.id || job.jobId || `job-${index}`),
+        type: String(job.type || ''),
+        status: String(job.status || 'pending').toLowerCase(),
+        payload: job.payload && typeof job.payload === 'object' ? job.payload as Record<string, unknown> : {},
+        message: textValue(job.message) || null,
+        error: textValue(job.error ?? job.lastError) || null,
+        createdAt: textValue(job.createdAt ?? job.created_at) || null,
+        updatedAt: textValue(job.updatedAt ?? job.updated_at) || null,
+      } satisfies HostJob;
+    });
+    setHostJobs(jobs);
+    const activeStatuses = new Set(['pending', 'queued', 'waiting', 'claimed', 'running', 'processing']);
+    const activeCollectionJobs = jobs.filter((job) => (job.type === 'collect_latest' || job.type === 'archive_account') && activeStatuses.has(job.status));
+    setIsCollecting(activeCollectionJobs.length > 0);
+    if (activeCollectionJobs.length) {
+      const job = activeCollectionJobs[0];
+      setCollectionTask((current) => ({
+        ...current,
+        runId: job.id,
+        phase: 'running',
+        accountName: textValue(job.payload.accountName) || null,
+        totalAccounts: Number(job.payload.totalAccounts) || (Array.isArray(job.payload.accountIds) ? job.payload.accountIds.length : 1),
+      }));
+    }
+    return jobs;
+  }, [apiBase]);
+
+  const loadQwenStatus = useCallback(async () => {
+    const payload = await hostApi<Record<string, unknown>>(apiBase, '/api/qwen/status');
+    const status = payload.qwen && typeof payload.qwen === 'object'
+      ? payload.qwen as Record<string, unknown>
+      : payload;
+    setQwenConfigured(Boolean(status.configured ?? status.apiKeyConfigured ?? status.ready));
+  }, [apiBase]);
+
+  const migrateLegacyLocalData = useCallback(async () => {
+    if (!isHostLocal || window.localStorage.getItem(migrationMarkerStoreKey)) return;
+    const rawAccounts = window.localStorage.getItem(accountStoreKey);
+    const rawVideos = window.localStorage.getItem(videoStoreKey);
+    const rawSnapshots = window.localStorage.getItem(snapshotStoreKey)
+      ?? window.localStorage.getItem('douyin-monitor.snapshots.v1');
+    const legacyAccounts = rawAccounts ? readStored<Partial<Account>[]>(accountStoreKey, []) : [];
+    const legacyVideos = rawVideos ? readStored<Partial<Video>[]>(videoStoreKey, []) : [];
+    const legacySnapshots = rawSnapshots
+      ? readStored<Snapshot[]>(window.localStorage.getItem(snapshotStoreKey) ? snapshotStoreKey : 'douyin-monitor.snapshots.v1', [])
+      : [];
+    const createdAt = new Date().toISOString();
+    const migrationId = crypto.randomUUID();
+    const backupKey = `douyin-monitor.migration-backup.${createdAt.replace(/[:.]/g, '-')}`;
+    try {
+      window.localStorage.setItem(backupKey, JSON.stringify({
+        createdAt,
+        migrationId,
+        accounts: legacyAccounts,
+        videos: legacyVideos,
+        snapshots: legacySnapshots,
+      }));
+    } catch {
+      // 原始 localStorage 键始终保留；空间不足时不因额外副本阻断迁移。
+    }
+    await hostApi<Record<string, unknown>>(apiBase, '/api/migrate', {
+      method: 'POST',
+      body: JSON.stringify({ migrationId, source: 'legacy-localStorage', accounts: legacyAccounts, videos: legacyVideos, snapshots: legacySnapshots }),
+    }, csrfToken);
+    window.localStorage.setItem(migrationMarkerStoreKey, JSON.stringify({ migrationId, createdAt, backupKey }));
+  }, [apiBase, csrfToken, isHostLocal]);
 
   useEffect(() => {
     processedResultIds.current = new Set(readStored<string[]>(processedResultStoreKey, []));
-    const frame = window.requestAnimationFrame(() => {
-      const storedAccounts = readStored<Partial<Account>[]>(accountStoreKey, []);
-      const normalizedAccounts = Array.isArray(storedAccounts) ? storedAccounts.map(normalizeAccount) : [];
-      const storedSelectedAccountId = readStored<string>(selectedAccountStoreKey, '');
-      setAccounts(normalizedAccounts);
-      setSelectedAccountId(normalizedAccounts.some((account) => account.id === storedSelectedAccountId)
-        ? storedSelectedAccountId
-        : normalizedAccounts[0]?.id || '');
-      const storedVideos = readStored<Partial<Video>[]>(videoStoreKey, []);
-      setVideos(Array.isArray(storedVideos) ? storedVideos.map((video) => normalizeVideo(video)) : []);
-      const legacySnapshots = readStored<Snapshot[]>('douyin-monitor.snapshots.v1', []);
-      setSnapshots(readStored<Snapshot[]>(snapshotStoreKey, legacySnapshots));
-      setLoaded(true);
-    });
-    return () => window.cancelAnimationFrame(frame);
   }, []);
 
   useEffect(() => {
-    if (loaded) window.localStorage.setItem(accountStoreKey, JSON.stringify(accounts));
-  }, [accounts, loaded]);
+    if (!browserReady) return;
+    let active = true;
+    hostApi<Record<string, unknown>>(apiBase, '/api/auth/status')
+      .then((payload) => {
+        if (!active) return;
+        const auth = payload.auth && typeof payload.auth === 'object' ? payload.auth as Record<string, unknown> : payload;
+        const setupRequired = Boolean(
+          auth.setupRequired
+          ?? auth.requiresSetup
+          ?? auth.firstRun
+          ?? (auth.configured === false),
+        );
+        const authenticated = Boolean(auth.authenticated ?? auth.loggedIn);
+        setCsrfToken(textValue(auth.csrfToken ?? auth.csrf_token));
+        if (setupRequired) {
+          setAuthPhase('setup');
+          setAuthMessage(isHostLocal ? '请先为局域网访问设置密码' : '请先在主机的 localhost 页面完成首次设置');
+        } else if (authenticated) {
+          setAuthPhase('ready');
+          setAuthMessage('');
+        } else {
+          setAuthPhase('login');
+          setAuthMessage('请输入访问密码');
+        }
+      })
+      .catch((error: Error) => {
+        if (!active) return;
+        setAuthPhase('error');
+        setAuthMessage(`无法连接主机服务：${error.message}`);
+      });
+    return () => { active = false; };
+  }, [apiBase, browserReady, isHostLocal]);
 
   useEffect(() => {
-    if (loaded) window.localStorage.setItem(videoStoreKey, JSON.stringify(videos));
-  }, [videos, loaded]);
-
-  useEffect(() => {
-    if (loaded) window.localStorage.setItem(snapshotStoreKey, JSON.stringify(snapshots));
-  }, [snapshots, loaded]);
+    if (authPhase !== 'ready') return;
+    let active = true;
+    const bootstrap = async () => {
+      try {
+        await migrateLegacyLocalData();
+        await Promise.all([loadHostState(), loadHostJobs(), loadQwenStatus()]);
+        if (active) setLoaded(true);
+      } catch (error) {
+        if (!active) return;
+        setLoaded(false);
+        setAuthPhase('error');
+        setAuthMessage(error instanceof Error ? `加载主机数据失败：${error.message}` : '加载主机数据失败');
+      }
+    };
+    void bootstrap();
+    const timer = window.setInterval(() => {
+      void Promise.all([loadHostState(), loadHostJobs(), loadQwenStatus()]).catch(() => {
+        setHostConnected(false);
+      });
+    }, 4_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [authPhase, loadHostJobs, loadHostState, loadQwenStatus, migrateLegacyLocalData]);
 
   useEffect(() => {
     window.localStorage.setItem(activePlatformStoreKey, JSON.stringify(activePlatform));
@@ -280,6 +602,11 @@ export default function Home() {
   useEffect(() => {
     if (loaded) window.localStorage.setItem(selectedAccountStoreKey, JSON.stringify(selectedAccountId));
   }, [loaded, selectedAccountId]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setTodayStart(startOfTodayTimestamp()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     if (!platformMenuOpen) return;
@@ -343,6 +670,10 @@ export default function Home() {
             transcriptStatus: previous?.transcriptStatus === 'ready' ? 'ready' : incoming.transcriptStatus,
             transcriptUpdatedAt: previous?.transcriptUpdatedAt || incoming.transcriptUpdatedAt,
             transcriptError: previous?.transcriptError || incoming.transcriptError,
+            analysis: previous?.analysis || incoming.analysis,
+            analysisStatus: previous?.analysisStatus === 'ready' ? 'ready' : incoming.analysisStatus,
+            analysisUpdatedAt: previous?.analysisUpdatedAt || incoming.analysisUpdatedAt,
+            analysisError: previous?.analysisError || incoming.analysisError,
           });
         }
         return [...byId.values()].sort((a, b) => (b.publishedAt || b.lastSeenAt).localeCompare(a.publishedAt || a.lastSeenAt));
@@ -366,21 +697,33 @@ export default function Home() {
         name: payload.accountName || account.name,
         avatarUrl: payload.accountAvatarUrl || account.avatarUrl,
         lastCheckedAt: capturedAt,
+        lastSuccessAt: capturedAt,
         status: 'ready',
         initialSyncStatus: payload.mode === 'initial' ? 'complete' : account.initialSyncStatus,
         initialSyncCompletedAt: payload.mode === 'initial' ? capturedAt : account.initialSyncCompletedAt,
         latestVideoIds: collected.slice(0, 3).map((video) => video.id),
         currentSyncMode: null,
       } : account));
-      setProgress(100);
-      setActiveNav(payload.mode === 'initial' ? '总数据分析' : '最新视频');
-      setNotice(payload.warning || `采集完成，已更新 ${collected.length} 条视频数据`);
+      setNotice(payload.warning || `${payload.accountName || '当前账号'}：已更新 ${collected.length} 条视频数据`);
 
       if (eventId) {
         processedResultIds.current.add(eventId);
         window.localStorage.setItem(processedResultStoreKey, JSON.stringify([...processedResultIds.current]));
         window.postMessage({ source: 'douyin-monitor', type: 'ACK_RESULTS', eventIds: [eventId] }, window.location.origin);
       }
+    };
+
+    const applyCollectionError = (payload: CollectionMessage) => {
+      const capturedAt = payload.capturedAt || new Date().toISOString();
+      setAccounts((current) => current.map((account) => account.id === payload.accountId ? {
+        ...account,
+        lastCheckedAt: capturedAt,
+        status: 'error',
+        initialSyncStatus: payload.mode === 'initial' ? 'error' : account.initialSyncStatus,
+        currentSyncMode: null,
+      } : account));
+      setNotice(payload.message || '采集失败，请稍后重试');
+      if (payload.messageId) window.postMessage({ source: 'douyin-monitor', type: 'ACK_RESULTS', messageIds: [payload.messageId] }, window.location.origin);
     };
 
     const applyTranscriptResult = (payload: CollectionMessage & { videoId?: string; transcript?: string; completedAt?: string; updatedAt?: string }) => {
@@ -392,7 +735,7 @@ export default function Home() {
         transcriptUpdatedAt: payload.updatedAt || payload.completedAt || new Date().toISOString(),
         transcriptError: null,
       } : video));
-      setExpandedTranscripts((current) => new Set(current).add(payload.videoId as string));
+      setExpandedAnalyses((current) => new Set(current).add(payload.videoId as string));
       setNotice('口播稿已完成本地识别');
       if (payload.messageId) window.postMessage({ source: 'douyin-monitor', type: 'ACK_RESULTS', messageIds: [payload.messageId] }, window.location.origin);
     };
@@ -404,7 +747,7 @@ export default function Home() {
         transcriptStatus: 'error',
         transcriptError: payload.message || '本地识别失败',
       } : video));
-      setExpandedTranscripts((current) => new Set(current).add(payload.videoId as string));
+      setExpandedAnalyses((current) => new Set(current).add(payload.videoId as string));
       setNotice(payload.message || '口播稿提取失败');
       if (payload.messageId) window.postMessage({ source: 'douyin-monitor', type: 'ACK_RESULTS', messageIds: [payload.messageId] }, window.location.origin);
     };
@@ -429,7 +772,11 @@ export default function Home() {
       if (event.source !== window || event.data?.source !== 'douyin-monitor-extension') return;
       if (event.data.type === 'BRIDGE_READY') {
         setBridgeReady(true);
-        if (event.data.schedulerState) setSchedulerState(event.data.schedulerState as SchedulerState);
+        if (event.data.schedulerState) {
+          const nextSchedulerState = event.data.schedulerState as SchedulerState;
+          setSchedulerState(nextSchedulerState);
+          if (nextSchedulerState.lastRunStatus === 'running') setIsCollecting(true);
+        }
         if (event.data.extensionVersion) {
           setBridgeVersion(event.data.extensionVersion);
           setBridgeNeedsReload(event.data.extensionVersion !== requiredExtensionVersion);
@@ -437,19 +784,41 @@ export default function Home() {
         }
       }
       if (event.data.type === 'SCHEDULER_STATE' && event.data.schedulerState) {
-        setSchedulerState(event.data.schedulerState as SchedulerState);
+        const nextSchedulerState = event.data.schedulerState as SchedulerState;
+        setSchedulerState(nextSchedulerState);
+        if (nextSchedulerState.lastRunStatus === 'running') setIsCollecting(true);
       }
       if (event.data.type === 'SYNC_STATE') {
         const pending = Array.isArray(event.data.pendingResults) ? event.data.pendingResults : [];
         pending.forEach((result: CollectionMessage & { type?: string }) => {
           if (result.type === 'COLLECTION_RESULT') applyCollectionResult(result);
+          else if (result.type === 'COLLECTION_ERROR') applyCollectionError(result);
           else if (result.type === 'TRANSCRIPT_RESULT') applyTranscriptResult(result);
           else if (result.type === 'TRANSCRIPT_ERROR') applyTranscriptError(result);
           else if (result.messageId) window.postMessage({ source: 'douyin-monitor', type: 'ACK_RESULTS', messageIds: [result.messageId] }, window.location.origin);
         });
       }
+      if (event.data.type === 'COLLECTION_BATCH_STARTED') {
+        setIsCollecting(true);
+        setCollectionTask({
+          ...emptyCollectionTask,
+          runId: event.data.runId || null,
+          phase: 'running',
+          totalAccounts: Number(event.data.totalAccounts) || 0,
+        });
+      }
       if (event.data.type === 'COLLECTION_STARTED') {
         setIsCollecting(true);
+        setCollectionTask((current) => ({
+          ...current,
+          runId: event.data.runId || current.runId,
+          phase: 'running',
+          accountName: event.data.accountName || null,
+          accountIndex: Number(event.data.accountIndex) || current.accountIndex,
+          totalAccounts: Number(event.data.totalAccounts) || current.totalAccounts,
+          completedVideos: 0,
+          totalVideos: 0,
+        }));
         setAccounts((current) => current.map((account) => account.id === event.data.accountId ? {
           ...account,
           status: 'checking',
@@ -461,20 +830,45 @@ export default function Home() {
             : `正在检查 ${event.data.accountName} 最新 3 条视频`);
         }
       }
-      if (event.data.type === 'COLLECTION_PROGRESS') {
-        setProgress(event.data.progress ?? 0);
-        if (event.data.stage === 'complete' && event.data.progress === 100) setIsCollecting(false);
+      if (event.data.type === 'COLLECTION_ACCOUNT_PROGRESS') {
+        setCollectionTask((current) => ({
+          ...current,
+          runId: event.data.runId || current.runId,
+          phase: 'running',
+          accountName: event.data.accountName || current.accountName,
+          accountIndex: Number(event.data.accountIndex) || current.accountIndex,
+          totalAccounts: Number(event.data.totalAccounts) || current.totalAccounts,
+          completedVideos: Number(event.data.completedVideos) || 0,
+          totalVideos: Number(event.data.totalVideos) || 0,
+        }));
+      }
+      if (event.data.type === 'COLLECTION_BATCH_COMPLETED') {
+        const succeeded = Number(event.data.succeeded) || 0;
+        const failed = Number(event.data.failed) || 0;
+        const completedAt = event.data.completedAt || new Date().toISOString();
+        setIsCollecting(false);
+        setCollectionTask({
+          ...emptyCollectionTask,
+          runId: event.data.runId || null,
+          phase: 'completed',
+          totalAccounts: Number(event.data.totalAccounts) || succeeded + failed,
+          succeeded,
+          failed,
+          completedAt,
+        });
+        setNotice(`本轮检查完成：${succeeded} 个账号成功，${failed} 个账号失败`);
       }
       if (event.data.type === 'COLLECTION_ERROR') {
-        if (!event.data.accountId) setIsCollecting(false);
-        setAccounts((current) => current.map((account) => account.id === event.data.accountId ? {
-          ...account,
-          status: 'error',
-          initialSyncStatus: event.data.mode === 'initial' ? 'error' : account.initialSyncStatus,
-          currentSyncMode: null,
-        } : account));
-        setNotice(event.data.message ?? '采集失败，请稍后重试');
-        if (event.data.messageId) window.postMessage({ source: 'douyin-monitor', type: 'ACK_RESULTS', messageIds: [event.data.messageId] }, window.location.origin);
+        if (!event.data.accountId) {
+          setIsCollecting(false);
+          setCollectionTask((current) => ({
+            ...current,
+            phase: 'completed',
+            failed: Math.max(1, current.failed),
+            completedAt: event.data.capturedAt || new Date().toISOString(),
+          }));
+        }
+        applyCollectionError(event.data);
       }
       if (event.data.type === 'COLLECTION_RESULT') applyCollectionResult(event.data);
       if (event.data.type === 'ACCOUNT_PROFILE_RESULT') applyAccountProfileResult(event.data);
@@ -506,42 +900,14 @@ export default function Home() {
   }, [accounts, bridgeNeedsReload, bridgeReady, bridgeVersion, loaded]);
 
   useEffect(() => {
-    if (!loaded || !bridgeReady || bridgeNeedsReload || bridgeVersion !== requiredExtensionVersion || isCollecting) return;
-    const pending = accounts.filter((account) => account.initialSyncStatus === 'pending'
-      && !autoStartedInitialAccounts.current.has(account.id));
-    if (!pending.length) return;
-    pending.forEach((account) => autoStartedInitialAccounts.current.add(account.id));
-    setIsCollecting(true);
-    setProgress(2);
-    setAccounts((current) => current.map((account) => pending.some((item) => item.id === account.id) ? {
-      ...account,
-      status: 'checking',
-      currentSyncMode: 'initial',
-    } : account));
-    window.postMessage({
-      source: 'douyin-monitor',
-      type: 'CHECK_ALL',
-      accounts: pending.map((account) => ({ ...account, syncMode: 'initial' })),
-      allAccounts: accounts,
-    }, window.location.origin);
-    setNotice(`首次建档已启动：将抓取 ${pending.length} 个账号各近 30 条非置顶视频`);
-  }, [accounts, bridgeNeedsReload, bridgeReady, bridgeVersion, isCollecting, loaded]);
-
-  useEffect(() => {
     if (!notice) return;
     const timer = window.setTimeout(() => setNotice(''), 4200);
     return () => window.clearTimeout(timer);
   }, [notice]);
 
-  const todayStart = useMemo(() => {
-    const date = new Date();
-    date.setHours(0, 0, 0, 0);
-    return date.getTime();
-  }, []);
-
   const todayVideos = videos.filter((video) => new Date(video.firstSeenAt).getTime() >= todayStart).length;
-  const lastChecked = accounts
-    .map((account) => account.lastCheckedAt)
+  const lastSnapshotAt = snapshots
+    .map((snapshot) => snapshot.capturedAt)
     .filter((value): value is string => Boolean(value))
     .sort()
     .at(-1) ?? null;
@@ -567,50 +933,78 @@ export default function Home() {
       .filter((video): video is Video => Boolean(video))
       .sort((a, b) => (b.publishedAt || b.lastSeenAt).localeCompare(a.publishedAt || a.lastSeenAt));
   }, [selectedAccount, selectedAccountVideos]);
-  const extensionReady = bridgeReady && !bridgeNeedsReload && bridgeVersion === requiredExtensionVersion;
+  const createHostJob = async (type: 'collect_latest' | 'archive_account' | 'analyze_video', payload: Record<string, unknown>) => {
+    const response = await hostApi<Record<string, unknown>>(apiBase, '/api/jobs', {
+      method: 'POST',
+      body: JSON.stringify({ type, payload }),
+    }, csrfToken);
+    const rawJob = response.job && typeof response.job === 'object' ? response.job as Record<string, unknown> : response;
+    if (rawJob.id || rawJob.jobId) {
+      setHostJobs((current) => [{
+        id: String(rawJob.id || rawJob.jobId),
+        type,
+        status: String(rawJob.status || 'queued').toLowerCase(),
+        payload,
+        message: textValue(rawJob.message) || null,
+        error: textValue(rawJob.error) || null,
+        createdAt: textValue(rawJob.createdAt ?? rawJob.created_at) || new Date().toISOString(),
+        updatedAt: textValue(rawJob.updatedAt ?? rawJob.updated_at) || null,
+      }, ...current.filter((job) => job.id !== String(rawJob.id || rawJob.jobId))]);
+    }
+    return rawJob;
+  };
 
-  const startInitialSync = (account: Account, allAccounts = accounts) => {
-    if (!bridgeReady) {
-      setNotice('账号已保存；Chrome 采集组件尚未连接，连接后请点击“首次抓取近 30 条”');
-      return false;
-    }
-    if (!extensionReady) {
-      setNotice(`账号已保存；Chrome 采集组件需要刷新到 v${requiredExtensionVersion}，刷新后请点击“首次抓取近 30 条”`);
-      return false;
-    }
+  const startInitialSync = (account: Account) => {
     if (isCollecting) {
       setNotice('当前采集仍在进行，请等待完成');
       return false;
     }
-    autoStartedInitialAccounts.current.add(account.id);
     setIsCollecting(true);
-    setProgress(2);
+    setCollectionTask({ ...emptyCollectionTask, phase: 'running', totalAccounts: 1 });
     setAccounts((current) => current.map((item) => item.id === account.id ? {
       ...item,
       status: 'checking',
       initialSyncStatus: 'pending',
       currentSyncMode: 'initial',
     } : item));
-    window.postMessage({
-      source: 'douyin-monitor',
-      type: 'CHECK_ALL',
-      accounts: [{ ...account, initialSyncStatus: 'pending', syncMode: 'initial' }],
-      allAccounts,
-    }, window.location.origin);
-    setNotice(`正在为 ${account.name} 首次抓取近 30 条非置顶视频`);
+    setNotice(`${account.name} 的近 30 条建档任务已进入主机队列`);
+    void createHostJob('archive_account', {
+      accountId: account.id,
+      accountUrl: account.url,
+      account,
+      ...(account.initialSyncStatus === 'error' ? { retry: true } : {}),
+    }).then(() => loadHostJobs()).catch((error: Error) => {
+      setIsCollecting(false);
+      setAccounts((current) => current.map((item) => item.id === account.id ? {
+        ...item,
+        status: 'error',
+        initialSyncStatus: 'error',
+        currentSyncMode: null,
+      } : item));
+      setNotice(`建档任务创建失败：${error.message}`);
+    });
     return true;
   };
 
-  const submitAccount = (event: FormEvent) => {
+  const submitAccount = async (event: FormEvent) => {
     event.preventDefault();
     const value = accountUrl.trim();
+    let parsed: URL;
     try {
-      const parsed = new URL(value);
-      if (!parsed.hostname.endsWith('douyin.com') || !parsed.pathname.includes('/user/')) throw new Error('invalid');
-      if (accounts.some((account) => account.url === value)) {
-        setNotice('这个账号已经在监控列表中');
-        return;
-      }
+      parsed = new URL(value);
+    } catch {
+      setNotice('请输入正确的抖音账号主页链接');
+      return;
+    }
+    if (!parsed.hostname.endsWith('douyin.com') || !parsed.pathname.includes('/user/')) {
+      setNotice('请输入正确的抖音账号主页链接');
+      return;
+    }
+    if (accounts.some((account) => account.url === value)) {
+      setNotice('这个账号已经在监控列表中');
+      return;
+    }
+    try {
       const account: Account = {
         id: crypto.randomUUID(),
         platform: 'douyin',
@@ -619,6 +1013,7 @@ export default function Home() {
         avatarUrl: null,
         addedAt: new Date().toISOString(),
         lastCheckedAt: null,
+        lastSuccessAt: null,
         status: 'waiting',
         initialSyncStatus: 'pending',
         initialSyncCompletedAt: null,
@@ -630,13 +1025,14 @@ export default function Home() {
       setSelectedAccountId(account.id);
       setAccountUrl('');
       setShowAddAccount(false);
-      if (!startInitialSync(account, nextAccounts)) {
-        setNotice(extensionReady
-          ? '账号已添加，可在账号卡片点击“首次抓取近 30 条”'
-          : `账号已添加，但采集尚未启动；请先连接或刷新 Chrome 组件到 v${requiredExtensionVersion}`);
-      }
-    } catch {
-      setNotice('请输入正确的抖音账号主页链接');
+      await hostApi<Record<string, unknown>>(apiBase, '/api/accounts/upsert', {
+        method: 'POST',
+        body: JSON.stringify({ account }),
+      }, csrfToken);
+      if (!startInitialSync(account)) setNotice('账号已添加，可稍后在账号卡片点击“首次抓取近 30 条”');
+    } catch (error) {
+      setNotice(`添加账号失败：${error instanceof Error ? error.message : '主机服务没有响应'}`);
+      void loadHostState().catch(() => undefined);
     }
   };
 
@@ -645,81 +1041,215 @@ export default function Home() {
       setShowAddAccount(true);
       return;
     }
-    if (!bridgeReady) {
-      setNotice('Chrome 采集组件尚未连接，请重新加载浏览器组件');
-      return;
-    }
-    if (bridgeNeedsReload || bridgeVersion !== requiredExtensionVersion) {
-      setNotice(`Chrome 采集组件需要刷新到 v${requiredExtensionVersion}，请在 chrome://extensions 点击扩展卡片的“刷新”`);
-      return;
-    }
     if (isCollecting) {
       setNotice('当前采集仍在进行，请等待完成');
       return;
     }
-    const initializedAccounts = accounts.filter((account) => account.initialSyncStatus === 'complete');
+    const accountScopedView = activeNav === '最新视频分析' || activeNav === '总数据分析';
+    const initializedAccounts = accountScopedView
+      ? selectedAccount?.initialSyncStatus === 'complete' ? [selectedAccount] : []
+      : accounts.filter((account) => account.initialSyncStatus === 'complete');
     if (!initializedAccounts.length) {
       setNotice('请先在账号卡片点击“首次抓取近 30 条”，完成建档后才能检查最新 3 条');
       return;
     }
-    const requestedAccounts = initializedAccounts.map((account) => ({
-      ...account,
-      syncMode: 'latest' as const,
-    }));
     setIsCollecting(true);
     setAccounts((current) => current.map((account) => initializedAccounts.some((item) => item.id === account.id) ? {
       ...account,
       status: 'checking',
       currentSyncMode: 'latest',
     } : account));
-    setProgress(2);
-    window.postMessage({ source: 'douyin-monitor', type: 'CHECK_ALL', accounts: requestedAccounts, allAccounts: accounts }, window.location.origin);
-    setNotice('已开始检查，每个已建档账号只读取最新 3 条非置顶视频');
+    setCollectionTask({ ...emptyCollectionTask, phase: 'running', totalAccounts: initializedAccounts.length });
+    void createHostJob('collect_latest', {
+      accountIds: initializedAccounts.map((account) => account.id),
+      scope: accountScopedView ? 'selected_account' : 'all_accounts',
+      totalAccounts: initializedAccounts.length,
+    }).then(() => {
+      setNotice(accountScopedView
+        ? `${initializedAccounts[0].name} 的最新 3 条检查已进入主机队列`
+        : `全部 ${initializedAccounts.length} 个已建档账号已进入主机检查队列`);
+      return loadHostJobs();
+    }).catch((error: Error) => {
+      setIsCollecting(false);
+      setNotice(`检查任务创建失败：${error.message}`);
+      void loadHostState().catch(() => undefined);
+    });
   };
 
-  const requestTranscript = (video: Video, force = false) => {
-    if (video.transcriptStatus === 'processing') return;
-    if (video.transcript && !force) {
-      setExpandedTranscripts((current) => {
+  const requestAnalysis = (video: Video) => {
+    if (video.analysisStatus === 'ready' || video.analysis) {
+      setExpandedAnalyses((current) => {
         const next = new Set(current);
         if (next.has(video.id)) next.delete(video.id); else next.add(video.id);
         return next;
       });
       return;
     }
-    if (!bridgeReady) {
-      setNotice('Chrome 采集组件尚未连接，无法提取音频');
+    if (video.analysisStatus === 'queued' || video.analysisStatus === 'processing') {
+      setExpandedAnalyses((current) => new Set(current).add(video.id));
       return;
     }
-    if (bridgeNeedsReload || bridgeVersion !== requiredExtensionVersion) {
-      setNotice(`Chrome 采集组件需要刷新到 v${requiredExtensionVersion}，请在 chrome://extensions 点击扩展卡片的“刷新”`);
+    if (!qwenConfigured) {
+      if (isHostLocal) setShowQwenConfig(true);
+      else setNotice('主机尚未配置 Qwen API Key，请先在主机 localhost 页面完成配置');
       return;
     }
-    setVideos((current) => current.map((item) => item.id === video.id ? { ...item, transcriptStatus: 'processing', transcriptError: null } : item));
-    setExpandedTranscripts((current) => new Set(current).add(video.id));
-    window.postMessage({
-      source: 'douyin-monitor',
-      type: 'EXTRACT_TRANSCRIPT',
-      video: { id: video.id, url: video.url, title: video.title },
-    }, window.location.origin);
-    setNotice('正在提取临时音频并进行本地识别，首次使用会下载识别模型');
+    setVideos((current) => current.map((item) => item.id === video.id ? {
+      ...item,
+      transcriptStatus: item.transcript ? item.transcriptStatus : 'processing',
+      transcriptError: null,
+      analysisStatus: 'queued',
+      analysisError: null,
+    } : item));
+    setExpandedAnalyses((current) => new Set(current).add(video.id));
+    void createHostJob('analyze_video', {
+      accountId: video.accountId,
+      videoId: video.id,
+      videoUrl: video.url,
+      title: video.title,
+      description: video.description,
+      ...(video.analysisStatus === 'error' ? { retry: true } : {}),
+    }).then(() => {
+      setNotice('AI 分析已进入主机队列，将用完整原视频同步生成口播稿与内容分析');
+      return loadHostJobs();
+    }).catch((error: Error) => {
+      setVideos((current) => current.map((item) => item.id === video.id ? {
+        ...item,
+        transcriptStatus: item.transcript ? item.transcriptStatus : 'idle',
+        analysisStatus: 'error',
+        analysisError: error.message,
+      } : item));
+      setNotice(`AI 分析任务创建失败：${error.message}`);
+    });
   };
 
   const removeAccount = (id: string) => {
     const removedVideoIds = new Set(videos.filter((video) => video.accountId === id).map((video) => video.id));
     const nextAccounts = accounts.filter((account) => account.id !== id);
-    setAccounts(nextAccounts);
-    if (selectedAccount?.id === id) setSelectedAccountId(nextAccounts[0]?.id || '');
-    setVideos((current) => current.filter((video) => video.accountId !== id));
-    setSnapshots((current) => current.filter((snapshot) => snapshot.accountId !== id && !removedVideoIds.has(snapshot.videoId)));
-    setNotice('账号及其本地记录已移除');
+    void hostApi<Record<string, unknown>>(apiBase, '/api/accounts/remove', {
+      method: 'POST',
+      body: JSON.stringify({ accountId: id }),
+    }, csrfToken).then(() => {
+      setAccounts(nextAccounts);
+      if (selectedAccount?.id === id) setSelectedAccountId(nextAccounts[0]?.id || '');
+      setVideos((current) => current.filter((video) => video.accountId !== id));
+      setSnapshots((current) => current.filter((snapshot) => snapshot.accountId !== id && !removedVideoIds.has(snapshot.videoId)));
+      setNotice('账号及其主机记录已移除');
+    }).catch((error: Error) => setNotice(`移除失败：${error.message}`));
   };
 
+  const initializedAccountCount = accounts.filter((account) => account.initialSyncStatus === 'complete').length;
+  const pendingAccountCount = accounts.length - initializedAccountCount;
+  const currentTaskLabel = isCollecting
+    ? collectionTask.accountName
+      ? `正在处理 ${collectionTask.accountName} · 账号 ${collectionTask.accountIndex || 1}/${collectionTask.totalAccounts || accounts.length}${collectionTask.totalVideos ? ` · 视频 ${collectionTask.completedVideos}/${collectionTask.totalVideos}` : ''}`
+      : schedulerState?.lastRunStatus === 'running'
+        ? '后台自动检查正在运行'
+        : `任务已启动 · 共 ${collectionTask.totalAccounts || accounts.length} 个账号`
+    : collectionTask.phase === 'completed' && collectionTask.completedAt
+      ? `${formatTime(collectionTask.completedAt)} · 成功 ${collectionTask.succeeded} / 失败 ${collectionTask.failed}`
+      : '当前空闲';
+
   const statCards = [
-    ['监控账号', accounts.length, accounts.length ? '账号数量不设上限' : null],
-    ['已采集视频总数', videos.length, lastChecked ? `${snapshots.filter((snapshot) => snapshot.accountId).length} 份有效快照 · ${formatTime(lastChecked)}` : null],
-    ['今日新增', todayVideos, null],
+    ['监控账号', accounts.length, accounts.length ? `${initializedAccountCount} 个已建档${pendingAccountCount ? ` · ${pendingAccountCount} 个待建档` : ''}` : null],
+    ['已采集视频总数', videos.length, lastSnapshotAt ? `${snapshots.filter((snapshot) => snapshot.accountId).length} 次互动数据快照 · 最近快照 ${formatTime(lastSnapshotAt)}` : null],
+    ['今日新收录', todayVideos, '按首次发现时间统计'],
   ];
+
+  const submitAuth = async (event: FormEvent) => {
+    event.preventDefault();
+    if (authPhase === 'setup' && !isHostLocal) return;
+    if (authPassword.length < 10) {
+      setAuthMessage('访问密码至少需要 10 位');
+      return;
+    }
+    if (authPhase === 'setup' && authPassword !== authPasswordConfirm) {
+      setAuthMessage('两次输入的密码不一致');
+      return;
+    }
+    setAuthSubmitting(true);
+    try {
+      const path = authPhase === 'setup' ? '/api/auth/setup' : '/api/auth/login';
+      const payload = await hostApi<Record<string, unknown>>(apiBase, path, {
+        method: 'POST',
+        body: JSON.stringify({ password: authPassword }),
+      });
+      const auth = payload.auth && typeof payload.auth === 'object' ? payload.auth as Record<string, unknown> : payload;
+      let nextCsrfToken = textValue(auth.csrfToken ?? auth.csrf_token);
+      if (!nextCsrfToken) {
+        const status = await hostApi<Record<string, unknown>>(apiBase, '/api/auth/status');
+        const statusAuth = status.auth && typeof status.auth === 'object' ? status.auth as Record<string, unknown> : status;
+        nextCsrfToken = textValue(statusAuth.csrfToken ?? statusAuth.csrf_token);
+      }
+      setCsrfToken(nextCsrfToken);
+      setAuthPassword('');
+      setAuthPasswordConfirm('');
+      setAuthMessage('');
+      setAuthPhase('ready');
+    } catch (error) {
+      setAuthMessage(error instanceof Error ? error.message : '验证失败，请重试');
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const logout = () => {
+    void hostApi<Record<string, unknown>>(apiBase, '/api/auth/logout', { method: 'POST', body: '{}' }, csrfToken)
+      .finally(() => {
+        setAuthPhase('login');
+        setCsrfToken('');
+        setLoaded(false);
+        setAccounts([]);
+        setVideos([]);
+        setSnapshots([]);
+      });
+  };
+
+  const saveQwenKey = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!isHostLocal) return;
+    if (!qwenApiKey.trim()) {
+      setNotice('请输入 Qwen API Key');
+      return;
+    }
+    setQwenSaving(true);
+    try {
+      await hostApi<Record<string, unknown>>(apiBase, '/api/qwen/config', {
+        method: 'POST',
+        body: JSON.stringify({ apiKey: qwenApiKey.trim() }),
+      }, csrfToken);
+      setQwenApiKey('');
+      setQwenConfigured(true);
+      setShowQwenConfig(false);
+      setNotice('Qwen API Key 已由主机安全保存');
+    } catch (error) {
+      setNotice(`保存失败：${error instanceof Error ? error.message : '主机服务没有响应'}`);
+    } finally {
+      setQwenApiKey('');
+      setQwenSaving(false);
+    }
+  };
+
+  if (authPhase !== 'ready' || !loaded) {
+    const setupBlocked = authPhase === 'setup' && !isHostLocal;
+    return <main className="accessGate">
+      <section className="accessCard" aria-live="polite">
+        <div className="accessMark"><PlatformIcon platform="douyin" alt="抖音" /></div>
+        <p className="accessEyebrow">监控数据主机</p>
+        <h1>{authPhase === 'setup' ? '设置局域网访问密码' : authPhase === 'login' ? '登录监控工作台' : authPhase === 'error' ? '主机服务未连接' : '正在载入共享数据'}</h1>
+        <p>{authMessage || '正在从主机 SQLite 读取账号、视频和分析结果。'}</p>
+        {(authPhase === 'setup' || authPhase === 'login') && !setupBlocked && <form onSubmit={submitAuth}>
+          <label htmlFor="access-password">访问密码</label>
+          <input id="access-password" type="password" autoComplete={authPhase === 'login' ? 'current-password' : 'new-password'} minLength={10} value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} autoFocus />
+          {authPhase === 'setup' && <><small className="accessPasswordHint">至少 10 位，仅用于你的局域网设备访问。</small><label htmlFor="access-password-confirm">再次输入密码</label><input id="access-password-confirm" type="password" autoComplete="new-password" minLength={10} value={authPasswordConfirm} onChange={(event) => setAuthPasswordConfirm(event.target.value)} /></>}
+          <button className="primaryButton" type="submit" disabled={authSubmitting}>{authSubmitting ? '请稍候…' : authPhase === 'setup' ? '保存并进入工作台' : '登录'}</button>
+        </form>}
+        {setupBlocked && <div className="accessNotice">首次密码只能在主机打开 <b>http://localhost:3000</b> 设置。设置完成后，本设备即可使用同一密码登录。</div>}
+        {authPhase === 'error' && <button className="secondaryButton" type="button" onClick={() => window.location.reload()}>重新连接</button>}
+        <small>主机地址：{apiBase.replace(/^https?:\/\//, '')}</small>
+      </section>
+    </main>;
+  }
 
   return (
     <main className="appShell">
@@ -773,8 +1303,9 @@ export default function Home() {
           ))}
         </nav>
         <div className="sidebarFoot">
-          <div className={bridgeReady && !bridgeNeedsReload ? 'localStatus connected' : 'localStatus'}><i /><span><b>数据仅存本机</b><small>{bridgeNeedsReload ? `Chrome 组件需刷新到 v${requiredExtensionVersion}` : bridgeReady ? `Chrome 已连接${bridgeVersion ? ` · v${bridgeVersion}` : ''}` : 'Chrome 等待连接'}</small></span></div>
-          <button className="settingsButton">⚙ 每 6 小时检查</button>
+          <div className={hostConnected ? 'localStatus connected' : 'localStatus'}><i /><span><b>主机采集服务</b><small>{!hostConnected ? '服务已连接 · 等待主机 Chrome' : isHostLocal ? bridgeNeedsReload ? `Chrome 组件需刷新到 v${requiredExtensionVersion}` : bridgeReady ? `Chrome 已连接${bridgeVersion ? ` · v${bridgeVersion}` : ''}` : 'Chrome 队列已连接' : '已连接 · 任务由主机 Chrome 执行'}</small></span></div>
+          <div className="scheduleSummary">自动检查：每 6 小时</div>
+          <button className="logoutButton" type="button" onClick={logout}>退出当前设备</button>
         </div>
       </aside>
 
@@ -783,12 +1314,14 @@ export default function Home() {
           <>
             <header className="topbar">
               <div>
-                <p className="eyebrow">CONTENT INTELLIGENCE</p>
                 <h1>{activeNav}</h1>
-                <p className="subtitle">首次建档近 30 条 · 日常只查最新 3 条 · 每 6 小时运行</p>
+                <p className="subtitle">首次建档近 30 条 · 日常只查最新 3 条 · Chrome 运行时每 6 小时检查</p>
               </div>
               <div className="topActions">
                 <div className="nextRun"><span>下次后台检查</span><b>{schedulerState?.nextRunAt ? formatTime(schedulerState.nextRunAt) : '等待组件'}</b></div>
+                {isHostLocal
+                  ? <button className={`qwenControl ${qwenConfigured ? 'ready' : ''}`} type="button" onClick={() => setShowQwenConfig(true)}><span>AI 分析</span><b>{qwenConfigured ? 'Qwen 已配置' : '配置 Qwen'}</b></button>
+                  : <div className={`qwenControl remote ${qwenConfigured ? 'ready' : ''}`} title="API Key 只能在主机 localhost 页面配置"><span>AI 分析</span><b>{qwenConfigured ? 'Qwen 已配置' : 'Qwen 未配置'}</b></div>}
                 <button className="secondaryButton" onClick={requestCheck} disabled={isCollecting}>{isCollecting ? '检查中…' : '检查最新 3 条'}</button>
                 <button className="primaryButton" onClick={() => setShowAddAccount(true)}>＋ 添加新监控账号</button>
               </div>
@@ -807,33 +1340,30 @@ export default function Home() {
                 </div>
                 <article className="collectionPanel">
                   <div className="collectionHeader">
-                    <div><p className="liveLabel"><i /> LOCAL COLLECTION</p><h2>采集任务</h2><span>{bridgeNeedsReload ? '' : bridgeReady ? schedulerState?.alarmRegistered ? 'Chrome 后台调度已注册，关闭工作台网页后仍会继续计时' : accounts.some((account) => account.initialSyncStatus !== 'complete') ? '待完成首次建档：每个账号近 30 条非置顶视频' : '正在核验 6 小时后台调度' : accounts.length ? '等待 Chrome 采集组件连接' : '添加账号后自动完成首次建档'}</span></div>
-                    <div className="progressValue"><span>PROGRESS</span><b>{progress}%</b></div>
+                    <div><h2>采集任务</h2><span>{isHostLocal && bridgeNeedsReload ? `Chrome 采集组件需刷新到 v${requiredExtensionVersion}` : schedulerState?.alarmRegistered ? 'Chrome 后台调度已注册，关闭工作台网页后仍会继续计时' : accounts.some((account) => account.initialSyncStatus !== 'complete') ? '待完成首次建档：每个账号近 30 条非置顶视频' : hostConnected ? '主机正在核验 6 小时后台调度' : '等待主机采集服务连接'}</span></div>
                   </div>
-                  <div className="progressTrack"><span style={{ width: `${Math.max(progress, 2)}%` }} /></div>
-                  <div className="progressMarks"><span>等待开始</span><span>定位账号</span><span>读取公开数据</span><span>去重完成</span></div>
                   <div className="schedulerStatusGrid">
                     <span><small>后台调度</small><b className={schedulerState?.alarmRegistered ? 'schedulerHealthy' : ''}>{schedulerState?.alarmRegistered ? '已启用 · 每 6 小时' : '等待 Chrome 核验'}</b></span>
-                    <span><small>后台监控账号</small><b>{schedulerState ? `${schedulerState.monitoredAccountCount} 个已建档账号` : '—'}</b></span>
+                    <span><small>自动检查范围</small><b>{schedulerState ? `${schedulerState.monitoredAccountCount} 个已建档账号` : '—'}</b></span>
                     <span><small>上次自动运行</small><b>{schedulerState?.lastAttemptAt ? `${formatTime(schedulerState.lastAttemptAt)} · ${schedulerRunLabel(schedulerState.lastRunStatus)}` : schedulerRunLabel(schedulerState?.lastRunStatus)}</b></span>
-                    <span><small>下次计划时间</small><b>{schedulerState?.nextRunAt ? formatTime(schedulerState.nextRunAt) : '—'}</b></span>
+                    <span><small>当前采集任务</small><b title={currentTaskLabel}>{currentTaskLabel}</b></span>
                   </div>
                   <p className="schedulerNote">状态由 Chrome 组件直接核验{schedulerState?.checkedAt ? `（${formatTime(schedulerState.checkedAt)}）` : ''}。网页可以关闭；Chrome 完全退出或电脑睡眠时不会被唤醒，恢复后会执行错过周期的单次补跑。</p>
                 </article>
-                <SectionHeading label="MONITOR BOARD" title="账号监控" count={`${accounts.length} 个账号`} />
+                <SectionHeading title="账号监控" count={`${accounts.length} 个账号`} />
                 <AccountBoard accounts={accounts} onAdd={() => setShowAddAccount(true)} onRemove={removeAccount} onInitialSync={startInitialSync} isCollecting={isCollecting} />
               </>
             )}
 
-            {activeNav === '对标账号' && (
-              <><SectionHeading label="ACCOUNT LIST" title="全部对标账号" count={`${accounts.length} 个账号`} /><AccountBoard accounts={accounts} onAdd={() => setShowAddAccount(true)} onRemove={removeAccount} onInitialSync={startInitialSync} isCollecting={isCollecting} /></>
+            {activeNav === '监控账号' && (
+              <><SectionHeading title="全部监控账号" count={`${accounts.length} 个账号`} /><AccountBoard accounts={accounts} onAdd={() => setShowAddAccount(true)} onRemove={removeAccount} onInitialSync={startInitialSync} isCollecting={isCollecting} /></>
             )}
 
-            {activeNav === '最新视频' && (
+            {activeNav === '最新视频分析' && (
               <>
                 <AccountSelector accounts={accounts} videos={videos} selectedAccountId={selectedAccount?.id || ''} onSelect={setSelectedAccountId} />
-                <SectionHeading label="LATEST CHECK" title={selectedAccount ? `${selectedAccount.name} · 最新视频` : '最新视频数据'} count={`${latestVideos.length} 条 · 仅当前账号`} />
-                <VideoTable videos={latestVideos} expandedTranscripts={expandedTranscripts} onTranscript={requestTranscript} />
+                <SectionHeading title={selectedAccount ? `${selectedAccount.name} · 最新视频分析` : '最新视频分析'} count={`${latestVideos.length} 条 · 仅当前账号`} />
+                <VideoTable videos={latestVideos} jobs={hostJobs} expandedAnalyses={expandedAnalyses} onAnalysis={requestAnalysis} />
               </>
             )}
 
@@ -844,8 +1374,8 @@ export default function Home() {
                   videos={selectedAccountVideos}
                   accountName={selectedAccount?.name || null}
                 />
-                <SectionHeading label="ALL VIDEO DATA" title={selectedAccount ? `${selectedAccount.name} · 全部视频数据` : '全部视频数据'} count={`${selectedAccountVideos.length} 条 · 当前账号内去重`} />
-                <VideoTable videos={selectedAccountVideos} expandedTranscripts={expandedTranscripts} onTranscript={requestTranscript} />
+                <SectionHeading title={selectedAccount ? `${selectedAccount.name} · 全部视频数据` : '全部视频数据'} count={`${selectedAccountVideos.length} 条 · 当前账号内去重`} />
+                <VideoTable videos={selectedAccountVideos} jobs={hostJobs} expandedAnalyses={expandedAnalyses} onAnalysis={requestAnalysis} />
               </>
             )}
           </>
@@ -855,7 +1385,6 @@ export default function Home() {
           <>
             <header className="topbar">
               <div>
-                <p className="eyebrow">CONTENT INTELLIGENCE</p>
                 <h1>{PLATFORMS[activePlatform].name}</h1>
                 <p className="subtitle">{PLATFORMS[activePlatform].tagline}</p>
               </div>
@@ -872,7 +1401,7 @@ export default function Home() {
         <div className="modalBackdrop" role="presentation" onMouseDown={() => setShowAddAccount(false)}>
           <form className="modal" role="dialog" aria-modal="true" aria-labelledby="add-account-title" onSubmit={submitAccount} onMouseDown={(event) => event.stopPropagation()}>
             <button className="modalClose" type="button" aria-label="关闭" onClick={() => setShowAddAccount(false)}>×</button>
-            <p className="eyebrow">NEW MONITOR</p><h2 id="add-account-title">添加新监控账号</h2>
+            <h2 id="add-account-title">添加新监控账号</h2>
             <p>目前只启用抖音采集，其他平台入口已预留，后续可直接接入。</p>
             <div className="platformGrid" aria-label="平台选择">
               {(Object.keys(PLATFORMS) as Platform[]).map((platform) => {
@@ -892,8 +1421,22 @@ export default function Home() {
             </div>
             <label htmlFor="account-url">{PLATFORMS[activePlatform].name}作者主页链接</label>
             <input id="account-url" type="url" value={accountUrl} onChange={(event) => setAccountUrl(event.target.value)} placeholder="https://www.douyin.com/user/..." autoFocus />
-            <div className="modalNote"><i /> 添加后自动抓取近 30 条非置顶视频；以后每次只检查最新 3 条。</div>
+            <div className="modalNote">添加后自动抓取近 30 条非置顶视频；以后每次只检查最新 3 条。</div>
             <div className="modalActions"><button className="secondaryButton" type="button" onClick={() => setShowAddAccount(false)}>取消</button><button className="primaryButton" type="submit">添加并抓取近 30 条</button></div>
+          </form>
+        </div>
+      )}
+
+      {showQwenConfig && isHostLocal && (
+        <div className="modalBackdrop" role="presentation" onMouseDown={() => { setQwenApiKey(''); setShowQwenConfig(false); }}>
+          <form className="modal" role="dialog" aria-modal="true" aria-labelledby="qwen-config-title" onSubmit={saveQwenKey} onMouseDown={(event) => event.stopPropagation()}>
+            <button className="modalClose" type="button" aria-label="关闭" onClick={() => { setQwenApiKey(''); setShowQwenConfig(false); }}>×</button>
+            <h2 id="qwen-config-title">配置 Qwen 视频分析</h2>
+            <p>API Key 只会交给主机服务，并使用当前 Windows 用户加密保存；不会写入浏览器、SQLite、Git 或日志。其他设备只能看到是否已配置。</p>
+            <label htmlFor="qwen-api-key">Qwen API Key</label>
+            <input id="qwen-api-key" type="password" autoComplete="off" value={qwenApiKey} onChange={(event) => setQwenApiKey(event.target.value)} placeholder={qwenConfigured ? '输入新 Key 可替换现有配置' : '请输入 API Key'} autoFocus />
+            <div className="modalNote">模型固定使用 qwen3.8-flash。开始 AI 分析后，完整原视频会作为主要输入，同一任务还会在本机生成口播稿。</div>
+            <div className="modalActions"><button className="secondaryButton" type="button" onClick={() => { setQwenApiKey(''); setShowQwenConfig(false); }}>取消</button><button className="primaryButton" type="submit" disabled={qwenSaving}>{qwenSaving ? '保存中…' : qwenConfigured ? '替换配置' : '安全保存'}</button></div>
           </form>
         </div>
       )}
@@ -913,15 +1456,15 @@ function AnalyticsBoard({ videos, accountName }: { videos: Video[]; accountName:
   ];
 
   if (!videos.length) {
-    return <EmptyData title={accountName ? `${accountName} 尚无建档数据` : '等待首次建档'} detail="完成当前账号的首次建档后，这里会根据近 30 条非置顶视频生成独立统计和走势，不会混入其他账号。" />;
+    return <EmptyData title={accountName ? `${accountName} 尚无建档数据` : '等待首次建档'} detail="完成当前账号的首次建档后，这里会根据首次近 30 条非置顶视频及后续发现的新视频生成独立统计和走势，不会混入其他账号。" />;
   }
 
   return <>
-    <SectionHeading label="TOTAL DATA ANALYSIS" title={accountName ? `${accountName} · 总数据分析` : '总数据分析'} count={`${videos.length} 条去重视频 · 仅当前账号`} />
+    <SectionHeading title={accountName ? `${accountName} · 总数据分析` : '总数据分析'} count={`${videos.length} 条去重视频 · 仅当前账号`} />
     <section className="analysisStats">{dimensions.map((dimension) => {
       const total = videos.reduce((sum, video) => sum + (video[dimension.key] || 0), 0);
       return <article key={dimension.key} style={{ '--metric-color': dimension.color } as React.CSSProperties}>
-        <small>{dimension.label}总量</small><strong>{formatMetric(total)}</strong><p>{videos.length} 条视频的{dimension.label}数据之和</p>
+        <small>当前{dimension.label}合计</small><strong>{formatMetric(total)}</strong><p>{videos.length} 条视频最新快照的{dimension.label}数据之和</p>
       </article>;
     })}</section>
     <section className="metricTrendGrid">{dimensions.map((dimension) => <MetricTrendChart
@@ -952,7 +1495,7 @@ function MetricTrendChart({ videos, metricKey, label, color }: {
   const points = values.map((value, index) => `${xAt(index)},${yAt(value)}`).join(' ');
 
   return <article className="metricTrendCard">
-    <div className="analysisHeader"><div><p className="eyebrow">VIDEO TREND</p><h3>{label}走势</h3></div><span>{videos.length} 个视频节点</span></div>
+    <div className="analysisHeader"><h3>{label}表现走势</h3><span>{videos.length} 个视频节点</span></div>
     <div className="metricChartScroll">
       <svg className="metricLineChart" viewBox={`0 0 ${width} ${height}`} style={{ width }} role="img" aria-label={`${label}数据按视频发布时间走势`}>
         <line className="metricAxis" x1={paddingX} y1={height - paddingBottom} x2={width - paddingX} y2={height - paddingBottom} />
@@ -971,12 +1514,12 @@ function MetricTrendChart({ videos, metricKey, label, color }: {
         })}
       </svg>
     </div>
-    <p className="metricChartNote">按发布时间从左到右排列；每个圆点代表一条视频，悬停查看数值，点击打开原视频。</p>
+    <p className="metricChartNote">优先按发布时间从左到右排列，缺少发布时间时按首次发现时间；每个圆点代表一条视频，悬停查看数值，点击打开原视频。</p>
   </article>;
 }
 
-function SectionHeading({ label, title, count }: { label: string; title: string; count: string }) {
-  return <div className="sectionHeading"><div><p className="eyebrow">{label}</p><h2>{title}</h2></div><span>{count}</span></div>;
+function SectionHeading({ title, count }: { title: string; count: string }) {
+  return <div className="sectionHeading"><h2>{title}</h2><span>{count}</span></div>;
 }
 
 function AccountSelector({ accounts, videos, selectedAccountId, onSelect }: {
@@ -991,7 +1534,6 @@ function AccountSelector({ accounts, videos, selectedAccountId, onSelect }: {
 
   return <section className="accountSelector" aria-label="按账号筛选数据">
     <div className="accountSelectorIntro">
-      <p className="eyebrow">ACCOUNT VIEW</p>
       <strong>选择查看账号</strong>
       <span>以下数据只属于所选账号，不会与其他账号汇总。</span>
     </div>
@@ -1018,7 +1560,7 @@ function AccountSelector({ accounts, videos, selectedAccountId, onSelect }: {
 const accountStatusLabels: Record<AccountStatus, string> = {
   waiting: '等待检查',
   checking: '正在采集',
-  ready: '采集正常',
+  ready: '最近检查成功',
   error: '采集失败',
 };
 
@@ -1038,7 +1580,7 @@ function AccountBoard({ accounts, onAdd, onRemove, onInitialSync, isCollecting }
       : account.initialSyncStatus === 'error' ? '建档失败' : accountStatusLabels[account.status];
     return <article className="accountCard" key={account.id}>
       <div className="accountTop"><div className="accountAvatar">{account.avatarUrl ? <img src={account.avatarUrl} alt={`${account.name}头像`} referrerPolicy="no-referrer" /> : <span>{index + 1}</span>}</div><span className={`statusPill ${account.status}`}>{statusLabel}</span></div>
-      <div className="platformBadge">抖音 · 已启用</div>
+      <div className="platformBadge">抖音</div>
       <h3>{account.name}</h3><a href={account.url} target="_blank" rel="noreferrer">打开原账号主页 ↗</a>
       <div className="accountMeta"><span><small>首次建档</small><b>{account.initialSyncStatus === 'complete' ? formatTime(account.initialSyncCompletedAt) : '待抓取近 30 条'}</b></span><span><small>最近检查</small><b>{account.lastCheckedAt ? formatTime(account.lastCheckedAt) : '尚未检查'}</b></span></div>
       {account.initialSyncStatus !== 'complete' && <button className="initialSyncButton" disabled={isCollecting} onClick={() => onInitialSync(account)}>{account.status === 'checking' ? '正在抓取近 30 条…' : account.initialSyncStatus === 'error' ? '重新抓取近 30 条' : '首次抓取近 30 条'}</button>}
@@ -1047,17 +1589,41 @@ function AccountBoard({ accounts, onAdd, onRemove, onInitialSync, isCollecting }
   })}</section>;
 }
 
-function VideoTable({ videos, expandedTranscripts, onTranscript }: {
+function VideoTable({ videos, jobs, expandedAnalyses, onAnalysis }: {
   videos: Video[];
-  expandedTranscripts: Set<string>;
-  onTranscript: (video: Video, force?: boolean) => void;
+  jobs: HostJob[];
+  expandedAnalyses: Set<string>;
+  onAnalysis: (video: Video) => void;
 }) {
   if (!videos.length) return <EmptyData title="还没有视频数据" detail="检查成功后，这里会显示封面、视频文案、点赞、评论、收藏、分享和原视频链接。空结果不会再被当作成功。" />;
   return <div className="videoTableScroll"><div className="videoTable">
     <div className="videoTableHead"><span>视频与文案</span><span>数据快照</span><span>时间</span><span>操作</span></div>
     {videos.map((video) => {
       const duration = formatDuration(video.durationSeconds);
-      const expanded = expandedTranscripts.has(video.id);
+      const expanded = expandedAnalyses.has(video.id);
+      const latestJob = jobs
+        .filter((job) => job.type === 'analyze_video' && String(job.payload.videoId || '') === video.id)
+        .sort((left, right) => (right.updatedAt || right.createdAt || '').localeCompare(left.updatedAt || left.createdAt || ''))[0];
+      const jobStatus = latestJob?.status || '';
+      const analysisStatus: AnalysisStatus = video.analysis
+        ? 'ready'
+        : ['pending', 'queued', 'waiting'].includes(jobStatus)
+          ? 'queued'
+          : ['claimed', 'running', 'processing'].includes(jobStatus)
+            ? 'processing'
+            : ['failed', 'error', 'expired', 'cancelled'].includes(jobStatus)
+              ? 'error'
+              : video.analysisStatus;
+      const analysisError = video.analysisError || latestJob?.error || latestJob?.message;
+      const buttonLabel = analysisStatus === 'queued'
+        ? '排队中'
+        : analysisStatus === 'processing'
+          ? '分析中…'
+          : analysisStatus === 'ready'
+            ? expanded ? '收起分析' : '查看分析'
+            : analysisStatus === 'error'
+              ? '重新分析'
+              : 'AI分析';
       const metrics = [
         ['点赞', video.likeCount],
         ['评论', video.commentCount],
@@ -1071,19 +1637,38 @@ function VideoTable({ videos, expandedTranscripts, onTranscript }: {
               {video.coverUrl ? <img src={video.coverUrl} alt="" referrerPolicy="no-referrer" /> : <span>无封面</span>}
               {duration && <i>{duration}</i>}
             </a>
-            <div className="videoCopy"><a href={video.url} target="_blank" rel="noreferrer">{video.title || '未命名视频'} ↗</a><p>{video.description || '未提取到视频文案'}</p></div>
+            <div className="videoCopy"><a href={video.url} target="_blank" rel="noreferrer">{video.title || '未命名视频'} ↗</a>{video.description.trim() && video.description.trim() !== video.title.trim() ? <p>{video.description}</p> : null}</div>
           </div>
           <div className="metricGrid">{metrics.map(([label, value]) => <span key={label}><small>{label}</small><b>{formatMetric(value)}</b></span>)}</div>
           <div className="videoTimes"><span><small>发布</small><b>{formatTime(video.publishedAt)}</b></span><span><small>采集</small><b>{formatTime(video.lastSeenAt)}</b></span></div>
-          <button className={`transcriptButton ${video.transcriptStatus}`} disabled={video.transcriptStatus === 'processing'} onClick={() => onTranscript(video)}>
-            {video.transcriptStatus === 'processing' ? '识别中…' : video.transcript ? (expanded ? '收起口播稿' : '查看口播稿') : video.transcriptStatus === 'error' ? '重新提取' : '一键提取口播稿'}
+          <button className={`analysisButton ${analysisStatus}`} onClick={() => onAnalysis({ ...video, analysisStatus })}>
+            {buttonLabel}
           </button>
         </div>
-        {expanded && <div className={`transcriptPanel ${video.transcriptStatus}`}>
-          <div><b>本地口播稿</b>{video.transcriptUpdatedAt && <small>更新于 {formatTime(video.transcriptUpdatedAt)}</small>}</div>
-          {video.transcriptStatus === 'processing' && <p>正在从原视频临时提取音频并在本机识别，请保持 Chrome 和本地服务运行。</p>}
-          {video.transcriptStatus === 'error' && <p className="transcriptError">{video.transcriptError || '识别失败，请重新尝试。'}</p>}
-          {video.transcript && <><p>{video.transcript}</p><button type="button" onClick={() => onTranscript(video, true)}>重新提取</button></>}
+        {expanded && <div className={`analysisPanel ${analysisStatus}`}>
+          <section className="analysisPane transcriptPane">
+            <div className="analysisPaneHeader"><b>原视频口播稿</b>{video.transcriptUpdatedAt && <small>更新于 {formatTime(video.transcriptUpdatedAt)}</small>}</div>
+            {video.transcript && <p className="transcriptText">{video.transcript}</p>}
+            {!video.transcript && (analysisStatus === 'queued' || analysisStatus === 'processing') && <p className="analysisPending">正在同一任务中从完整原视频提取音频，并在主机本地识别口播稿。</p>}
+            {!video.transcript && video.transcriptStatus === 'error' && <p className="analysisError">{video.transcriptError || '本地口播识别失败。'}</p>}
+            {!video.transcript && analysisStatus === 'ready' && <p className="analysisEmpty">该视频未识别到清晰口播内容。</p>}
+            {!video.transcript && analysisStatus === 'idle' && <p className="analysisEmpty">开始 AI 分析后，口播稿会与分析结果一起永久保存。</p>}
+          </section>
+          <section className="analysisPane aiPane">
+            <div className="analysisPaneHeader"><b>AI视频分析</b>{video.analysisUpdatedAt && <small>更新于 {formatTime(video.analysisUpdatedAt)}</small>}</div>
+            {(analysisStatus === 'queued' || analysisStatus === 'processing') && <p className="analysisPending">{analysisStatus === 'queued' ? '任务正在等待主机 Chrome 执行。' : '正在读取完整原视频并分析画面、人物行为、文字与内容结构；不会用关键帧或口播稿代替原视频。'}</p>}
+            {analysisStatus === 'error' && <p className="analysisError">{analysisError || '视频分析失败，请点击“重新分析”。'}</p>}
+            {video.analysis && <div className="analysisFields">
+              <section className="wide"><small>内容摘要</small><p>{video.analysis.summary || '未生成摘要'}</p></section>
+              <section><small>视频主题</small><p>{video.analysis.topic || '未识别'}</p></section>
+              <section><small>核心观点</small><p>{video.analysis.corePoint || '未识别'}</p></section>
+              <section><small>画面内容</small><p>{video.analysis.visualContent || '未识别'}</p></section>
+              <section><small>人物行为</small><p>{video.analysis.personActions || '未识别'}</p></section>
+              <section><small>字幕与画面文字</small><p>{video.analysis.onScreenText || '未识别'}</p></section>
+              <section><small>结构与叙事</small><p>{video.analysis.structureNarrative || '未识别'}</p></section>
+            </div>}
+            {!video.analysis && analysisStatus === 'idle' && <p className="analysisEmpty">点击“AI分析”后生成并永久保存。分析只聚焦视频具体内容，不分析钩子、高潮、引导、语气、音乐或环境音。</p>}
+          </section>
         </div>}
       </article>;
     })}

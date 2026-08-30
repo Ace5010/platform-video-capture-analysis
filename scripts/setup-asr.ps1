@@ -40,4 +40,8 @@ if ($LASTEXITCODE -ne 0) {
     throw "ASR dependency installation failed, exit code: $LASTEXITCODE"
 }
 
-Write-Host '[setup-asr] setup complete. The small model downloads on first transcription.'
+if ($null -eq (Get-Command 'ffmpeg.exe' -ErrorAction SilentlyContinue) -or $null -eq (Get-Command 'ffprobe.exe' -ErrorAction SilentlyContinue)) {
+    throw 'FFmpeg and ffprobe are required for complete-video validation and lossless segmentation'
+}
+
+Write-Host '[setup-asr] setup complete. The large-v3 model downloads on the first AI analysis.'

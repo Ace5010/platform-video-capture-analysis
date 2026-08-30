@@ -27,7 +27,7 @@ MAX_URL_LENGTH = 8_192
 MAX_REDIRECTS = 4
 DOWNLOAD_TIMEOUT_SECONDS = 30
 
-MODEL_NAME = (os.environ.get("DOUYIN_ASR_MODEL") or "small").strip()
+MODEL_NAME = (os.environ.get("DOUYIN_ASR_MODEL") or "large-v3").strip()
 LANGUAGE = (os.environ.get("DOUYIN_ASR_LANGUAGE") or "zh").strip()
 
 # These suffixes are used by Douyin for direct media/music delivery. API,

@@ -1,8 +1,17 @@
 const SIX_HOURS_MINUTES = 360;
 const ALARM_NAME = 'douyin-monitor-six-hour-check';
+const WATCHDOG_ALARM_NAME = 'douyin-monitor-collection-watchdog';
+const CONNECTOR_ALARM_NAME = 'douyin-monitor-connector-poll';
+const WATCHDOG_DELAY_MINUTES = 1;
+const CONNECTOR_POLL_MINUTES = 1;
 const SCHEDULER_STATE_KEY = 'schedulerState';
 const COLLECTION_LOCK_KEY = 'collectionLock';
+const SCHEDULED_CATCH_UP_KEY = 'scheduledCatchUp';
+const CONNECTOR_TOKEN_KEY = 'connectorToken';
+const CONNECTOR_STATE_KEY = 'connectorState';
+const CONNECTOR_OUTBOX_KEY = 'connectorEventOutbox';
 const COLLECTION_LOCK_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+const SERVICE_WORKER_KEEPALIVE_MS = 20_000;
 const ACCOUNT_DOM_WAIT_MS = 25_000;
 const DETAIL_DOM_WAIT_MS = 15_000;
 const MEDIA_CAPTURE_WAIT_MS = 22_000;
@@ -19,12 +28,22 @@ const MEDIA_URL_PATTERNS = [
   'https://*.byteimg.com/*',
 ];
 const TRANSCRIBE_ENDPOINT = 'http://127.0.0.1:43128/transcribe';
+const CONNECTOR_BASE_URL = 'http://127.0.0.1:43129';
+const CONNECTOR_REQUEST_TIMEOUT_MS = 15_000;
 
 let pendingResultsMutation = Promise.resolve();
+let collectionLockMutation = Promise.resolve();
+let connectorOutboxMutation = Promise.resolve();
 let collectionInProgress = false;
+let connectorPollInProgress = false;
+let schedulerInitializationPromise = null;
+const WORKER_INSTANCE_ID = createMessageId();
 
 chrome.runtime.onInstalled.addListener(async () => {
-  await initializeScheduler({ allowCatchUp: true });
+  await Promise.all([
+    initializeScheduler({ allowCatchUp: true }),
+    initializeConnector(),
+  ]);
   const stored = await chrome.storage.local.get('pendingResults');
   if (!Array.isArray(stored.pendingResults)) {
     await chrome.storage.local.set({ pendingResults: [] });
@@ -33,9 +52,11 @@ chrome.runtime.onInstalled.addListener(async () => {
 
 chrome.runtime.onStartup.addListener(() => {
   void initializeScheduler({ allowCatchUp: true });
+  void initializeConnector();
 });
 
 void initializeScheduler({ allowCatchUp: true });
+void initializeConnector();
 
 async function ensureSixHourAlarm() {
   let existing = await chrome.alarms.get(ALARM_NAME);
@@ -47,6 +68,204 @@ async function ensureSixHourAlarm() {
     existing = await chrome.alarms.get(ALARM_NAME);
   }
   return existing;
+}
+
+async function ensureConnectorAlarm() {
+  let existing = await chrome.alarms.get(CONNECTOR_ALARM_NAME);
+  if (!existing) {
+    await chrome.alarms.create(CONNECTOR_ALARM_NAME, {
+      delayInMinutes: CONNECTOR_POLL_MINUTES,
+      periodInMinutes: CONNECTOR_POLL_MINUTES,
+    });
+    existing = await chrome.alarms.get(CONNECTOR_ALARM_NAME);
+  }
+  return existing;
+}
+
+async function initializeConnector() {
+  await ensureConnectorAlarm();
+  const stored = await chrome.storage.local.get(CONNECTOR_OUTBOX_KEY);
+  if (!Array.isArray(stored[CONNECTOR_OUTBOX_KEY])) {
+    await chrome.storage.local.set({ [CONNECTOR_OUTBOX_KEY]: [] });
+  }
+  void pollConnectorQueue();
+}
+
+async function saveConnectorState(patch) {
+  const stored = await chrome.storage.local.get(CONNECTOR_STATE_KEY);
+  const current = stored[CONNECTOR_STATE_KEY] && typeof stored[CONNECTOR_STATE_KEY] === 'object'
+    ? stored[CONNECTOR_STATE_KEY]
+    : {};
+  const next = {
+    ...current,
+    ...Object.fromEntries(Object.entries(patch || {}).filter(([, value]) => value !== undefined)),
+    checkedAt: new Date().toISOString(),
+  };
+  await chrome.storage.local.set({ [CONNECTOR_STATE_KEY]: next });
+  return next;
+}
+
+async function connectorRequest(path, { token, body, timeoutMs = CONNECTOR_REQUEST_TIMEOUT_MS } = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const response = await fetch(`${CONNECTOR_BASE_URL}${path}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body || {}),
+      signal: controller.signal,
+    });
+    const responseText = await response.text();
+    let payload = {};
+    if (responseText) {
+      try { payload = JSON.parse(responseText); } catch { payload = {}; }
+    }
+    if (!response.ok) {
+      const error = new Error(`主机任务服务返回 ${response.status}`);
+      error.status = response.status;
+      throw error;
+    }
+    return payload;
+  } catch (error) {
+    if (error?.name === 'AbortError') throw new Error('主机任务服务响应超时');
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function ensureConnectorToken() {
+  const stored = await chrome.storage.local.get(CONNECTOR_TOKEN_KEY);
+  if (typeof stored[CONNECTOR_TOKEN_KEY] === 'string' && stored[CONNECTOR_TOKEN_KEY]) {
+    return stored[CONNECTOR_TOKEN_KEY];
+  }
+  const response = await connectorRequest('/connector/pair', {
+    body: {
+      extensionId: chrome.runtime.id || null,
+      extensionVersion: chrome.runtime.getManifest().version,
+      workerId: WORKER_INSTANCE_ID,
+      capabilities: ['collect_latest', 'archive_account', 'analyze_video'],
+    },
+  });
+  const token = response?.token || response?.connectorToken;
+  if (typeof token !== 'string' || !token) {
+    await saveConnectorState({ connected: false, paired: false, lastError: '等待主机完成扩展配对' });
+    return null;
+  }
+  await chrome.storage.local.set({ [CONNECTOR_TOKEN_KEY]: token });
+  await saveConnectorState({ connected: true, paired: true, lastError: null });
+  return token;
+}
+
+function mutateConnectorOutbox(mutator) {
+  const operation = connectorOutboxMutation.then(async () => {
+    const stored = await chrome.storage.local.get(CONNECTOR_OUTBOX_KEY);
+    const current = Array.isArray(stored[CONNECTOR_OUTBOX_KEY]) ? stored[CONNECTOR_OUTBOX_KEY] : [];
+    const next = mutator(current);
+    await chrome.storage.local.set({ [CONNECTOR_OUTBOX_KEY]: next });
+    return next;
+  });
+  connectorOutboxMutation = operation.catch(() => {});
+  return operation;
+}
+
+async function enqueueConnectorEvent(event, { pendingMessageId = null } = {}) {
+  if (!event || !Object.hasOwn(event, 'jobId') || !event.eventId || !event.type) {
+    throw new Error('任务事件缺少幂等标识');
+  }
+  await mutateConnectorOutbox((current) => {
+    const withoutDuplicate = current.filter((item) => (item?.event || item)?.eventId !== event.eventId);
+    return [...withoutDuplicate, { event, pendingMessageId }];
+  });
+}
+
+async function readConnectorOutbox() {
+  await connectorOutboxMutation.catch(() => {});
+  const stored = await chrome.storage.local.get(CONNECTOR_OUTBOX_KEY);
+  return Array.isArray(stored[CONNECTOR_OUTBOX_KEY]) ? stored[CONNECTOR_OUTBOX_KEY] : [];
+}
+
+async function flushConnectorOutbox(token) {
+  const events = await readConnectorOutbox();
+  for (const record of events) {
+    const event = record?.event || record;
+    try {
+      await connectorRequest('/connector/events', { token, body: event });
+      await mutateConnectorOutbox((current) => current.filter((item) => (item?.event || item)?.eventId !== event.eventId));
+      if (record?.pendingMessageId) {
+        await acknowledgePendingResults([record.pendingMessageId]);
+      }
+    } catch (error) {
+      if (error?.status === 401 || error?.status === 403) {
+        await chrome.storage.local.remove(CONNECTOR_TOKEN_KEY);
+        await saveConnectorState({ connected: false, paired: false, lastError: '扩展配对已失效，正在重新配对' });
+      } else {
+        await saveConnectorState({ connected: false, lastError: errorMessage(error) });
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+async function sendConnectorHeartbeat(token, jobId = null, status = 'idle') {
+  const response = await connectorRequest('/connector/heartbeat', {
+    token,
+    body: {
+      workerId: WORKER_INSTANCE_ID,
+      extensionVersion: chrome.runtime.getManifest().version,
+      jobId,
+      status,
+      sentAt: new Date().toISOString(),
+    },
+  });
+  if (Array.isArray(response?.accounts)) {
+    const accounts = response.accounts.map(normalizeConnectorAccount).filter(Boolean);
+    await syncAccountsAndScheduler(accounts);
+  }
+  return response;
+}
+
+async function pollConnectorQueue() {
+  if (connectorPollInProgress) return;
+  connectorPollInProgress = true;
+  try {
+    const token = await ensureConnectorToken();
+    if (!token) return;
+    if (!await flushConnectorOutbox(token)) return;
+    await sendConnectorHeartbeat(token, null, collectionInProgress ? 'busy' : 'idle');
+    if (collectionInProgress) return;
+    const response = await connectorRequest('/connector/jobs/claim', {
+      token,
+      body: {
+        workerId: WORKER_INSTANCE_ID,
+        extensionVersion: chrome.runtime.getManifest().version,
+        capabilities: ['collect_latest', 'archive_account', 'analyze_video'],
+      },
+    });
+    const job = response?.job;
+    if (!job) {
+      await saveConnectorState({ connected: true, paired: true, activeJobId: null, lastError: null });
+      return;
+    }
+    if (typeof job.id !== 'string' || typeof job.type !== 'string') {
+      throw new Error('主机任务服务返回了无效任务');
+    }
+    await saveConnectorState({ connected: true, paired: true, activeJobId: job.id, lastError: null });
+    await executeConnectorJob(job, token);
+    await saveConnectorState({ connected: true, activeJobId: null, lastCompletedJobId: job.id, lastError: null });
+  } catch (error) {
+    if (error?.status === 401 || error?.status === 403) {
+      await chrome.storage.local.remove(CONNECTOR_TOKEN_KEY);
+      await saveConnectorState({ connected: false, paired: false, activeJobId: null, lastError: '扩展配对已失效，正在重新配对' });
+    } else {
+      await saveConnectorState({ connected: false, activeJobId: null, lastError: errorMessage(error) });
+    }
+  } finally {
+    connectorPollInProgress = false;
+  }
 }
 
 function emptySchedulerState() {
@@ -124,8 +343,22 @@ async function getSchedulerSnapshot() {
   });
 }
 
-async function initializeScheduler({ allowCatchUp = false } = {}) {
-  const stored = await chrome.storage.local.get(['accounts', SCHEDULER_STATE_KEY]);
+function initializeScheduler(options = {}) {
+  if (schedulerInitializationPromise) return schedulerInitializationPromise;
+  schedulerInitializationPromise = initializeSchedulerOnce(options)
+    .finally(() => {
+      schedulerInitializationPromise = null;
+    });
+  return schedulerInitializationPromise;
+}
+
+async function initializeSchedulerOnce({ allowCatchUp = false } = {}) {
+  const stored = await chrome.storage.local.get([
+    'accounts',
+    SCHEDULER_STATE_KEY,
+    COLLECTION_LOCK_KEY,
+    SCHEDULED_CATCH_UP_KEY,
+  ]);
   const previous = normalizeSchedulerState(stored[SCHEDULER_STATE_KEY]);
   const previousNextRun = previous.nextRunAt ? Date.parse(previous.nextRunAt) : Number.NaN;
   const wasOverdue = Number.isFinite(previousNextRun) && previousNextRun <= Date.now();
@@ -133,13 +366,26 @@ async function initializeScheduler({ allowCatchUp = false } = {}) {
   const alarm = existingAlarm || await ensureSixHourAlarm();
   const accounts = Array.isArray(stored.accounts) ? stored.accounts.filter(isValidAccount) : [];
   const scheduledAccounts = accounts.filter((account) => account.initialSyncStatus === 'complete');
+  const existingLock = stored[COLLECTION_LOCK_KEY];
+  const orphanedLock = Boolean(existingLock?.token && existingLock.ownerId !== WORKER_INSTANCE_ID);
+  if (orphanedLock) {
+    await chrome.storage.local.remove(COLLECTION_LOCK_KEY);
+    collectionInProgress = false;
+  }
   const state = await saveSchedulerState({
     alarmRegistered: Boolean(alarm),
     monitoredAccountCount: scheduledAccounts.length,
     checkedAt: new Date().toISOString(),
   });
-  if (allowCatchUp && !existingAlarm && wasOverdue && scheduledAccounts.length) {
+  if (previous.lastRunStatus === 'running' && scheduledAccounts.length && !collectionInProgress && (!existingLock?.token || orphanedLock)) {
+    void runScheduledCollection('recovery', {
+      runId: existingLock?.runId,
+      completedAccountIds: Array.isArray(existingLock?.completedAccountIds) ? existingLock.completedAccountIds : [],
+    });
+  } else if (allowCatchUp && !existingAlarm && wasOverdue && scheduledAccounts.length) {
     void runScheduledCollection('catch-up');
+  } else if (stored[SCHEDULED_CATCH_UP_KEY] && !collectionInProgress && (!existingLock?.token || orphanedLock)) {
+    void runPendingScheduledCatchUp();
   }
   return state;
 }
@@ -166,7 +412,7 @@ async function syncAccountsAndScheduler(incomingAccounts, dashboardTabId) {
   }, dashboardTabId);
 }
 
-async function acquireCollectionLock(trigger) {
+async function acquireCollectionLock(trigger, runId = createMessageId()) {
   if (collectionInProgress) return null;
   collectionInProgress = true;
   try {
@@ -179,8 +425,18 @@ async function acquireCollectionLock(trigger) {
     }
     const token = createMessageId();
     await chrome.storage.local.set({
-      [COLLECTION_LOCK_KEY]: { token, trigger, startedAt: new Date().toISOString() },
+      [COLLECTION_LOCK_KEY]: {
+        token,
+        ownerId: WORKER_INSTANCE_ID,
+        runId,
+        trigger,
+        startedAt: new Date().toISOString(),
+        heartbeatAt: new Date().toISOString(),
+        plannedAccountIds: [],
+        completedAccountIds: [],
+      },
     });
+    await scheduleCollectionWatchdog();
     return token;
   } catch (error) {
     collectionInProgress = false;
@@ -195,18 +451,136 @@ async function releaseCollectionLock(token) {
     if (stored[COLLECTION_LOCK_KEY]?.token === token) {
       await chrome.storage.local.remove(COLLECTION_LOCK_KEY);
     }
+    await chrome.alarms.clear(WATCHDOG_ALARM_NAME);
   } finally {
     collectionInProgress = false;
+  }
+  void runPendingScheduledCatchUp();
+}
+
+async function queueScheduledCatchUp(trigger) {
+  const queuedAt = new Date().toISOString();
+  await chrome.storage.local.set({
+    [SCHEDULED_CATCH_UP_KEY]: {
+      trigger,
+      queuedAt,
+    },
+  });
+  await saveSchedulerState({
+    lastAttemptAt: queuedAt,
+    lastRunStatus: 'queued',
+    lastTrigger: trigger,
+    lastError: '到点时已有采集任务，已排队并将在当前任务结束后补采全部监控账号',
+    checkedAt: queuedAt,
+  });
+}
+
+async function runPendingScheduledCatchUp() {
+  if (collectionInProgress) return false;
+  const stored = await chrome.storage.local.get(SCHEDULED_CATCH_UP_KEY);
+  const pending = stored[SCHEDULED_CATCH_UP_KEY];
+  if (!pending) return false;
+  await chrome.storage.local.remove(SCHEDULED_CATCH_UP_KEY);
+  void runScheduledCollection('queued-catch-up');
+  return true;
+}
+
+async function scheduleCollectionWatchdog() {
+  await chrome.alarms.create(WATCHDOG_ALARM_NAME, { delayInMinutes: WATCHDOG_DELAY_MINUTES });
+}
+
+function mutateCollectionLock(token, mutator) {
+  const operation = collectionLockMutation.then(async () => {
+    const stored = await chrome.storage.local.get(COLLECTION_LOCK_KEY);
+    const current = stored[COLLECTION_LOCK_KEY];
+    if (!current || current.token !== token) return null;
+    const next = mutator(current);
+    await chrome.storage.local.set({ [COLLECTION_LOCK_KEY]: next });
+    return next;
+  });
+  collectionLockMutation = operation.catch(() => {});
+  return operation;
+}
+
+async function touchCollectionLock(token) {
+  if (!token) return;
+  await mutateCollectionLock(token, (current) => ({
+    ...current,
+    heartbeatAt: new Date().toISOString(),
+  }));
+  await scheduleCollectionWatchdog();
+}
+
+async function setCollectionPlan(token, accounts) {
+  if (!token) return;
+  await mutateCollectionLock(token, (current) => ({
+    ...current,
+    plannedAccountIds: accounts.map((account) => account.id),
+  }));
+}
+
+async function checkpointCollectionAccount(token, accountId) {
+  if (!token || !accountId) return;
+  await mutateCollectionLock(token, (current) => ({
+    ...current,
+    completedAccountIds: [...new Set([...(current.completedAccountIds || []), accountId])],
+    heartbeatAt: new Date().toISOString(),
+  }));
+}
+
+async function handleCollectionWatchdog() {
+  const stored = await chrome.storage.local.get([COLLECTION_LOCK_KEY, SCHEDULER_STATE_KEY]);
+  const lock = stored[COLLECTION_LOCK_KEY];
+  if (!lock?.token) {
+    await chrome.alarms.clear(WATCHDOG_ALARM_NAME);
+    return;
+  }
+  if (lock.ownerId === WORKER_INSTANCE_ID && collectionInProgress) {
+    await scheduleCollectionWatchdog();
+    return;
+  }
+
+  await chrome.storage.local.remove(COLLECTION_LOCK_KEY);
+  collectionInProgress = false;
+  if (lock.trigger === 'manual') {
+    await persistAndDeliver({
+      type: 'COLLECTION_ERROR',
+      accountId: null,
+      message: '上一次手动采集被 Chrome 中断，锁已自动释放，请重新检查',
+      capturedAt: new Date().toISOString(),
+    });
+    void runPendingScheduledCatchUp();
+    return;
+  }
+  const schedulerState = normalizeSchedulerState(stored[SCHEDULER_STATE_KEY]);
+  if (schedulerState.lastRunStatus === 'running') {
+    void runScheduledCollection('recovery', {
+      runId: lock.runId,
+      completedAccountIds: Array.isArray(lock.completedAccountIds) ? lock.completedAccountIds : [],
+    });
+  } else {
+    void runPendingScheduledCatchUp();
   }
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name !== ALARM_NAME) return;
-  void runScheduledCollection('alarm');
+  if (alarm.name === ALARM_NAME) {
+    void runScheduledCollection('alarm');
+    return;
+  }
+  if (alarm.name === WATCHDOG_ALARM_NAME) {
+    void handleCollectionWatchdog();
+    return;
+  }
+  if (alarm.name === CONNECTOR_ALARM_NAME) void pollConnectorQueue();
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.source !== 'douyin-monitor') return;
+  if (!isTrustedDashboardSender(sender)) {
+    sendResponse({ accepted: false, ok: false, error: '仅允许本机工作台调用 Chrome 采集组件' });
+    return;
+  }
 
   if (message.type === 'PING') {
     void Promise.all([readPendingResults(), getSchedulerSnapshot()])
@@ -251,18 +625,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     let lockToken = null;
+    const runId = createMessageId();
     let responseSent = false;
     void (async () => {
-      lockToken = await acquireCollectionLock('manual');
+      lockToken = await acquireCollectionLock('manual', runId);
       if (!lockToken) {
         sendResponse({ accepted: false, error: '已有采集任务正在运行，请等待当前任务完成' });
         responseSent = true;
         return;
       }
       await syncAccountsAndScheduler(allAccounts, sender.tab?.id);
+      await setCollectionPlan(lockToken, accounts);
       sendResponse({ accepted: true });
       responseSent = true;
-      await collectAll(accounts, sender.tab?.id);
+      await keepServiceWorkerAliveUntil(
+        () => collectAll(accounts, sender.tab?.id, { runId, lockToken }),
+        lockToken,
+      );
     })()
       .catch((error) => {
         if (!responseSent) sendResponse({ accepted: false, error: errorMessage(error) });
@@ -304,44 +683,74 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-async function runScheduledCollection(trigger = 'alarm') {
-  const lockToken = await acquireCollectionLock(trigger);
+function isTrustedDashboardSender(sender) {
+  if (!sender || sender.id !== chrome.runtime.id) return false;
+  const senderUrl = sender.tab?.url || sender.url;
+  if (typeof senderUrl !== 'string') return false;
+  try {
+    const parsed = new URL(senderUrl);
+    return parsed.protocol === 'http:'
+      && parsed.port === '3000'
+      && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1');
+  } catch {
+    return false;
+  }
+}
+
+async function runScheduledCollection(trigger = 'alarm', resume = {}) {
+  const runId = resume.runId || createMessageId();
+  const lockToken = await acquireCollectionLock(trigger, runId);
   if (!lockToken) {
-    await saveSchedulerState({
-      lastRunStatus: 'skipped',
-      lastError: '到点时已有采集任务运行，本轮由当前采集结果替代',
-      checkedAt: new Date().toISOString(),
-    });
+    await queueScheduledCatchUp(trigger);
     return;
   }
   const startedAt = new Date().toISOString();
   try {
     const { accounts = [] } = await chrome.storage.local.get('accounts');
-    const scheduledAccounts = Array.isArray(accounts)
+    const allScheduledAccounts = Array.isArray(accounts)
       ? accounts
         .filter((account) => isValidAccount(account) && account.initialSyncStatus === 'complete')
         .map((account) => ({ ...account, syncMode: 'latest' }))
       : [];
+    const completedAccountIds = new Set(Array.isArray(resume.completedAccountIds) ? resume.completedAccountIds : []);
+    const scheduledAccounts = allScheduledAccounts.filter((account) => !completedAccountIds.has(account.id));
+    await setCollectionPlan(lockToken, allScheduledAccounts);
     await saveSchedulerState({
-      monitoredAccountCount: scheduledAccounts.length,
+      monitoredAccountCount: allScheduledAccounts.length,
       lastAttemptAt: startedAt,
-      lastRunStatus: scheduledAccounts.length ? 'running' : 'waiting',
+      lastRunStatus: allScheduledAccounts.length ? 'running' : 'waiting',
       lastTrigger: trigger,
-      lastError: scheduledAccounts.length ? null : '暂无已完成首次建档的账号',
+      lastError: allScheduledAccounts.length ? null : '暂无已完成首次建档的账号',
       checkedAt: startedAt,
     });
-    if (!scheduledAccounts.length) return;
+    if (!allScheduledAccounts.length) return;
+    if (!scheduledAccounts.length && trigger === 'recovery') {
+      const recoveredAt = new Date().toISOString();
+      await saveSchedulerState({
+        lastCompletedAt: recoveredAt,
+        lastSuccessAt: recoveredAt,
+        lastRunStatus: 'success',
+        lastTrigger: trigger,
+        lastError: null,
+        missedRunRecoveredAt: recoveredAt,
+        checkedAt: recoveredAt,
+      });
+      return;
+    }
 
-    const summary = await collectAll(scheduledAccounts);
+    const summary = await keepServiceWorkerAliveUntil(
+      () => collectAll(scheduledAccounts, undefined, { runId, lockToken }),
+      lockToken,
+    );
     const completedAt = new Date().toISOString();
     const lastRunStatus = summary.failed === 0 ? 'success' : summary.succeeded > 0 ? 'partial' : 'error';
     await saveSchedulerState({
       lastCompletedAt: completedAt,
-      lastSuccessAt: summary.succeeded > 0 ? completedAt : undefined,
+      lastSuccessAt: summary.failed === 0 ? completedAt : undefined,
       lastRunStatus,
       lastTrigger: trigger,
       lastError: summary.failed > 0 ? `${summary.failed} 个账号采集失败` : null,
-      missedRunRecoveredAt: trigger === 'catch-up' ? completedAt : undefined,
+      missedRunRecoveredAt: trigger === 'catch-up' || trigger === 'recovery' ? completedAt : undefined,
       checkedAt: completedAt,
     });
   } catch (error) {
@@ -364,6 +773,197 @@ async function runScheduledCollection(trigger = 'alarm') {
   }
 }
 
+function normalizeConnectorAccount(value) {
+  if (!value || typeof value !== 'object') return null;
+  const id = typeof value.id === 'string' ? value.id : typeof value.accountId === 'string' ? value.accountId : null;
+  const url = typeof value.url === 'string'
+    ? value.url
+    : typeof value.profileUrl === 'string'
+      ? value.profileUrl
+      : typeof value.profile_url === 'string'
+        ? value.profile_url
+        : null;
+  if (!id || !url) return null;
+  const initialSyncStatus = value.initialSyncStatus === 'complete'
+    || value.initial_sync_status === 'complete'
+    || Boolean(value.initialSyncCompletedAt || value.initial_sync_completed_at)
+    ? 'complete'
+    : 'pending';
+  const account = {
+    ...value,
+    id,
+    url,
+    name: value.name || value.nickname || value.accountName || '抖音账号',
+    avatarUrl: value.avatarUrl || value.avatar_url || null,
+    initialSyncStatus,
+    initialSyncCompletedAt: value.initialSyncCompletedAt || value.initial_sync_completed_at || null,
+    syncMode: initialSyncStatus === 'complete' ? 'latest' : 'initial',
+  };
+  return isValidAccount(account) ? account : null;
+}
+
+function canonicalConnectorJobType(type) {
+  const aliases = {
+    collect_latest: 'collect_latest',
+    collection_latest: 'collect_latest',
+    archive_account: 'archive_account',
+    archive30: 'archive_account',
+    analyze_video: 'analyze_video',
+    analysis_capture: 'analyze_video',
+    sync_accounts: 'sync_accounts',
+  };
+  return aliases[type] || null;
+}
+
+async function resolveConnectorAccounts(payload, mode) {
+  const stored = await chrome.storage.local.get('accounts');
+  const storedAccounts = Array.isArray(stored.accounts)
+    ? stored.accounts.map(normalizeConnectorAccount).filter(Boolean)
+    : [];
+  const incoming = [
+    ...(Array.isArray(payload?.accounts) ? payload.accounts : []),
+    ...(payload?.account && typeof payload.account === 'object' ? [payload.account] : []),
+  ].map(normalizeConnectorAccount).filter(Boolean);
+  const byId = new Map(storedAccounts.map((account) => [account.id, account]));
+  for (const account of incoming) {
+    byId.set(account.id, { ...byId.get(account.id), ...account });
+  }
+
+  const requestedIds = [...new Set([
+    ...(Array.isArray(payload?.accountIds) ? payload.accountIds : []),
+    ...(typeof payload?.accountId === 'string' ? [payload.accountId] : []),
+    ...incoming.map((account) => account.id),
+  ].filter((value) => typeof value === 'string' && value))];
+  let accounts = requestedIds.length
+    ? requestedIds.map((id) => byId.get(id)).filter(Boolean)
+    : [...byId.values()];
+  if (mode === 'latest' && requestedIds.length === 0) {
+    accounts = accounts.filter((account) => account.initialSyncStatus === 'complete');
+  }
+  accounts = accounts.map((account) => ({
+    ...account,
+    syncMode: mode,
+  }));
+  if (mode === 'initial' && accounts.length > 1) accounts = accounts.slice(0, 1);
+  if (!accounts.length) throw new Error('任务没有匹配到可采集的监控账号');
+  return accounts;
+}
+
+async function executeConnectorJob(job, token) {
+  const type = canonicalConnectorJobType(job.type);
+  const payload = job.payload && typeof job.payload === 'object' ? job.payload : {};
+  if (!type) {
+    const event = {
+      jobId: job.id,
+      eventId: `${job.id}:unsupported`,
+      type: 'job_failed',
+      occurredAt: new Date().toISOString(),
+      payload: { message: `不支持的主机任务类型：${job.type}` },
+    };
+    await enqueueConnectorEvent(event);
+    await flushConnectorOutbox(token);
+    return;
+  }
+  if (type === 'sync_accounts') {
+    const accounts = Array.isArray(payload.accounts)
+      ? payload.accounts.map(normalizeConnectorAccount).filter(Boolean)
+      : [];
+    await syncAccountsAndScheduler(accounts);
+    await enqueueConnectorEvent({
+      jobId: job.id,
+      eventId: `${job.id}:completed`,
+      type: 'job_completed',
+      occurredAt: new Date().toISOString(),
+      payload: { syncedAccountCount: accounts.length },
+    });
+    await flushConnectorOutbox(token);
+    return;
+  }
+
+  let lockToken = null;
+  const heartbeat = setInterval(() => {
+    void sendConnectorHeartbeat(token, job.id, 'running').catch(() => {});
+  }, SERVICE_WORKER_KEEPALIVE_MS);
+  try {
+    lockToken = await acquireCollectionLock(`connector:${type}`, job.id);
+    if (!lockToken) throw new Error('Chrome 正在执行另一项采集任务，本任务将等待主机重新派发');
+    await sendConnectorHeartbeat(token, job.id, 'running');
+
+    if (type === 'collect_latest' || type === 'archive_account') {
+      const mode = type === 'archive_account' ? 'initial' : 'latest';
+      const accounts = await resolveConnectorAccounts(payload, mode);
+      await setCollectionPlan(lockToken, accounts);
+      const summary = await keepServiceWorkerAliveUntil(
+        () => collectAll(accounts, undefined, {
+          runId: job.id,
+          lockToken,
+          connectorJobId: job.id,
+        }),
+        lockToken,
+      );
+      await enqueueConnectorEvent({
+        jobId: job.id,
+        eventId: `${job.id}:${summary.failed ? 'failed' : 'completed'}`,
+        type: summary.failed ? 'job_failed' : 'job_completed',
+        occurredAt: new Date().toISOString(),
+        payload: {
+          total: summary.total,
+          succeeded: summary.succeeded,
+          failed: summary.failed,
+          errors: summary.errors,
+        },
+      });
+      await flushConnectorOutbox(token);
+      return;
+    }
+
+    const videoId = normalizeVideoId(payload.videoId, payload.videoUrl || payload.url);
+    if (!videoId) throw new Error('视频分析任务缺少有效的视频 ID');
+    const media = await captureFullVideoForAnalysis({
+      videoId,
+      accountId: typeof payload.accountId === 'string' ? payload.accountId : null,
+      videoUrl: normalizeVideoUrl(payload.videoUrl || payload.url, videoId),
+    });
+    await connectorRequest('/connector/events', {
+      token,
+      body: {
+        jobId: job.id,
+        eventId: `${job.id}:analysis_media`,
+        type: 'analysis_media',
+        occurredAt: new Date().toISOString(),
+        payload: {
+          videoUrl: media.video.url,
+          audioUrl: media.audio?.url || null,
+          videoId,
+          accountId: typeof payload.accountId === 'string' ? payload.accountId : null,
+          title: typeof payload.title === 'string' ? payload.title : null,
+          description: typeof payload.description === 'string' ? payload.description : null,
+          sourceVideoUrl: media.sourceVideoUrl,
+          mediaMeta: {
+            video: media.video.metadata,
+            audio: media.audio?.metadata || null,
+            page: media.page,
+          },
+        },
+      },
+      timeoutMs: 30_000,
+    });
+  } catch (error) {
+    await enqueueConnectorEvent({
+      jobId: job.id,
+      eventId: `${job.id}:failed`,
+      type: 'job_failed',
+      occurredAt: new Date().toISOString(),
+      payload: { message: errorMessage(error) },
+    });
+    await flushConnectorOutbox(token);
+    throw error;
+  } finally {
+    clearInterval(heartbeat);
+    await releaseCollectionLock(lockToken);
+  }
+}
+
 function collectionModeForAccount(account) {
   if (account?.syncMode === 'initial' || account?.syncMode === 'latest') return account.syncMode;
   return account?.initialSyncStatus === 'complete' ? 'latest' : 'initial';
@@ -382,37 +982,60 @@ async function markAccountInitialized(accountId, capturedAt) {
   });
 }
 
-async function collectAll(accounts, dashboardTabId) {
+function withoutPlayMetrics(video) {
+  const sanitized = { ...(video || {}) };
+  delete sanitized.playCount;
+  delete sanitized.play_count;
+  delete sanitized.viewCount;
+  delete sanitized.view_count;
+  return sanitized;
+}
+
+async function collectAll(accounts, dashboardTabId, {
+  runId = createMessageId(),
+  lockToken = null,
+  connectorJobId = null,
+} = {}) {
   const totalAccounts = accounts.length;
   let succeeded = 0;
   let failed = 0;
   const errors = [];
+  const startedAt = new Date().toISOString();
+  await sendToDashboard({
+    type: 'COLLECTION_BATCH_STARTED',
+    runId,
+    totalAccounts,
+    startedAt,
+  }, dashboardTabId);
+
   for (let index = 0; index < totalAccounts; index += 1) {
     const account = accounts[index];
-    const accountBaseProgress = Math.round(index / totalAccounts * 90);
-    const accountProgressSpan = 90 / totalAccounts;
 
     await sendToDashboard({
       type: 'COLLECTION_STARTED',
+      runId,
       accountId: account.id,
       accountName: account.name || null,
       mode: collectionModeForAccount(account),
-      progress: Math.max(3, accountBaseProgress),
+      accountIndex: index + 1,
+      totalAccounts,
       startedAt: new Date().toISOString(),
     }, dashboardTabId);
 
     try {
       const mode = collectionModeForAccount(account);
       const result = await collectAccount(account, mode, async ({ stage, completed, total }) => {
-        const ratio = total > 0 ? completed / total : 0;
         await sendToDashboard({
-          type: 'COLLECTION_PROGRESS',
+          type: 'COLLECTION_ACCOUNT_PROGRESS',
+          runId,
           accountId: account.id,
+          accountName: account.name || null,
           mode,
           stage,
-          completed,
-          total,
-          progress: Math.min(95, Math.max(3, Math.round(accountBaseProgress + ratio * accountProgressSpan))),
+          accountIndex: index + 1,
+          totalAccounts,
+          completedVideos: completed,
+          totalVideos: total,
         }, dashboardTabId);
       });
 
@@ -423,39 +1046,69 @@ async function collectAll(accounts, dashboardTabId) {
       const capturedAt = new Date().toISOString();
       await persistAndDeliver({
         type: 'COLLECTION_RESULT',
+        runId,
+        connectorJobId,
+        messageId: `${runId}:${account.id}:${mode}:result`,
         accountId: account.id,
         accountName: result.accountName,
         accountAvatarUrl: result.accountAvatarUrl,
+        accountUrl: account.url,
         mode,
-        videos: result.videos.map((video) => ({ ...video, capturedAt })),
+        videos: result.videos.map((video) => ({ ...withoutPlayMetrics(video), capturedAt })),
         capturedAt,
         warning: result.warning,
       }, dashboardTabId);
       if (mode === 'initial') await markAccountInitialized(account.id, capturedAt);
+      await checkpointCollectionAccount(lockToken, account.id);
       succeeded += 1;
     } catch (error) {
       failed += 1;
       errors.push({ accountId: account.id, message: errorMessage(error) });
-      await persistAndDeliver({
-        type: 'COLLECTION_ERROR',
-        accountId: account.id,
-        accountName: account.name || null,
-        mode: collectionModeForAccount(account),
-        message: `${account.name || '账号'}：${errorMessage(error)}`,
-        capturedAt: new Date().toISOString(),
-      }, dashboardTabId);
+      try {
+        await persistAndDeliver({
+          type: 'COLLECTION_ERROR',
+          runId,
+          connectorJobId,
+          messageId: `${runId}:${account.id}:${collectionModeForAccount(account)}:error`,
+          accountId: account.id,
+          accountName: account.name || null,
+          accountUrl: account.url,
+          mode: collectionModeForAccount(account),
+          message: `${account.name || '账号'}：${errorMessage(error)}`,
+          capturedAt: new Date().toISOString(),
+        }, dashboardTabId);
+      } catch (deliveryError) {
+        errors.push({ accountId: account.id, message: `失败状态保存失败：${errorMessage(deliveryError)}` });
+      }
     }
   }
 
+  const completedAt = new Date().toISOString();
+  const summary = { total: totalAccounts, succeeded, failed, errors };
   await sendToDashboard({
-    type: 'COLLECTION_PROGRESS',
-    accountId: null,
-    stage: 'complete',
-    completed: totalAccounts,
-    total: totalAccounts,
-    progress: 100,
+    type: 'COLLECTION_BATCH_COMPLETED',
+    runId,
+    totalAccounts,
+    succeeded,
+    failed,
+    startedAt,
+    completedAt,
   }, dashboardTabId);
-  return { total: totalAccounts, succeeded, failed, errors };
+  return summary;
+}
+
+async function keepServiceWorkerAliveUntil(task, lockToken) {
+  await chrome.runtime.getPlatformInfo().catch(() => {});
+  await touchCollectionLock(lockToken).catch(() => {});
+  const keepAlive = setInterval(() => {
+    void chrome.runtime.getPlatformInfo().catch(() => {});
+    void touchCollectionLock(lockToken).catch(() => {});
+  }, SERVICE_WORKER_KEEPALIVE_MS);
+  try {
+    return await task();
+  } finally {
+    clearInterval(keepAlive);
+  }
 }
 
 async function collectAccount(account, mode, onProgress) {
@@ -754,6 +1407,456 @@ function scoreMediaCandidate(urlValue, requestType, contentTypeValue) {
   return 0;
 }
 
+function extractVerifiedVideoMediaSources(expectedVideoId) {
+  const targetId = String(expectedVideoId || '');
+  const videoCandidates = new Map();
+  const audioCandidates = new Map();
+  if (!/^\d+$/.test(targetId)) return { videoCandidates: [], audioCandidates: [] };
+
+  const numberOrNull = (...values) => {
+    for (const value of values) {
+      const number = Number(value);
+      if (Number.isFinite(number) && number > 0) return number;
+    }
+    return null;
+  };
+  const normalizedMediaUrl = (value) => {
+    if (typeof value !== 'string' || !value || value.length > 8192) return null;
+    try {
+      const parsed = new URL(value, location.href);
+      const hostname = parsed.hostname.toLowerCase();
+      const allowedHost = [
+        'douyinvod.com',
+        'douyinstatic.com',
+        'douyinpic.com',
+        'zjcdn.com',
+        'bytecdn.cn',
+        'byteimg.com',
+      ].some((suffix) => hostname === suffix || hostname.endsWith(`.${suffix}`));
+      if (parsed.protocol !== 'https:' || (parsed.port && parsed.port !== '443') || !allowedHost) return null;
+      return parsed.href;
+    } catch {
+      return null;
+    }
+  };
+  const metadataFrom = (value, inherited = {}) => {
+    if (!value || typeof value !== 'object') return inherited;
+    return {
+      width: numberOrNull(value.width, value.video_width, value.videoWidth, inherited.width),
+      height: numberOrNull(value.height, value.video_height, value.videoHeight, inherited.height),
+      bitrate: numberOrNull(value.bit_rate, value.bitRate, value.bitrate, value.bandwidth, inherited.bitrate),
+      contentLength: numberOrNull(value.data_size, value.dataSize, value.file_size, value.fileSize, inherited.contentLength),
+      quality: String(value.gear_name || value.gearName || value.quality_type || value.qualityType || value.quality || inherited.quality || ''),
+      codec: String(value.codec_type || value.codecType || value.codec || inherited.codec || '') || null,
+    };
+  };
+  const addCandidate = (kind, rawUrl, metadata) => {
+    const url = normalizedMediaUrl(rawUrl);
+    if (!url) return;
+    const candidate = { url, ...metadataFrom(metadata) };
+    const score = (candidate.width || 0) * (candidate.height || 0) * 1_000_000
+      + (candidate.bitrate || 0) * 1_000
+      + (candidate.contentLength || 0);
+    const destination = kind === 'audio' ? audioCandidates : videoCandidates;
+    const previous = destination.get(url);
+    if (!previous || score >= previous.score) destination.set(url, { ...candidate, score });
+  };
+  const urlsFrom = (value) => {
+    if (typeof value === 'string') return [value];
+    if (Array.isArray(value)) return value.flatMap((item) => urlsFrom(item)).slice(0, 64);
+    if (!value || typeof value !== 'object') return [];
+    const values = [];
+    for (const key of ['url_list', 'urlList', 'urls', 'url', 'src', 'main_url', 'mainUrl']) {
+      if (Object.hasOwn(value, key)) values.push(...urlsFrom(value[key]));
+    }
+    return values.slice(0, 64);
+  };
+  const collectMediaTree = (root) => {
+    const queue = [{ value: root, path: '', metadata: {} }];
+    const seen = new WeakSet();
+    let visited = 0;
+    while (queue.length && visited < 60_000) {
+      const current = queue.shift();
+      const value = current.value;
+      if (!value || typeof value !== 'object') continue;
+      if (seen.has(value)) continue;
+      seen.add(value);
+      visited += 1;
+      const metadata = metadataFrom(value, current.metadata);
+      const path = current.path.toLowerCase();
+      const mime = String(value.mime_type || value.mimeType || value.format || '').toLowerCase();
+      const imagePath = /(?:cover|avatar|poster|thumb|image|logo|sticker)/.test(path);
+      const audioPath = /(?:^|\.)(?:audio|music|sound)(?:\.|$)/.test(path) || mime.startsWith('audio/');
+      const videoPath = /(?:^|\.)(?:video|bit_rate|bitrate)(?:\.|$)/.test(path) || mime.startsWith('video/');
+      const addressPath = /(?:play_addr|playaddr|play_url|playurl|download_addr|downloadaddr|url_list|urllist|\.urls?$|\.src$)/.test(path);
+      if (!imagePath && (addressPath || mime.startsWith('video/') || mime.startsWith('audio/'))) {
+        const kind = audioPath && !videoPath ? 'audio' : 'video';
+        for (const url of urlsFrom(value)) addCandidate(kind, url, metadata);
+      }
+      for (const [key, child] of Object.entries(value)) {
+        const childPath = current.path ? `${current.path}.${key}` : key;
+        if (typeof child === 'string') {
+          const lowered = childPath.toLowerCase();
+          if (!/(?:cover|avatar|poster|thumb|image|logo|sticker)/.test(lowered)
+            && /(?:play_addr|playaddr|play_url|playurl|download_addr|downloadaddr|url_list|urllist|\.url$|\.src$)/.test(lowered)) {
+            const kind = /(?:^|\.)(?:audio|music|sound)(?:\.|$)/.test(lowered)
+              && !/(?:^|\.)(?:video|bit_rate|bitrate)(?:\.|$)/.test(lowered)
+              ? 'audio'
+              : 'video';
+            addCandidate(kind, child, metadata);
+          }
+        } else if (child && typeof child === 'object') {
+          queue.push({ value: child, path: childPath, metadata });
+        }
+      }
+    }
+  };
+  const objectMatchesTarget = (value, keyHint) => {
+    if (String(keyHint || '') === targetId) return true;
+    if (!value || typeof value !== 'object') return false;
+    for (const key of ['aweme_id', 'awemeId', 'item_id', 'itemId', 'video_id', 'videoId', 'group_id', 'groupId', 'id']) {
+      if (Object.hasOwn(value, key) && String(value[key] || '') === targetId) return true;
+    }
+    return false;
+  };
+  const scanRoot = (root) => {
+    const queue = [{ value: root, key: '' }];
+    const seen = new WeakSet();
+    let visited = 0;
+    let matches = 0;
+    while (queue.length && visited < 150_000 && matches < 32) {
+      const { value, key } = queue.shift();
+      if (!value || typeof value !== 'object' || seen.has(value)) continue;
+      seen.add(value);
+      visited += 1;
+      if (objectMatchesTarget(value, key)) {
+        collectMediaTree(value);
+        matches += 1;
+      }
+      for (const [childKey, child] of Object.entries(value)) {
+        if (child && typeof child === 'object') queue.push({ value: child, key: childKey });
+      }
+    }
+  };
+  const parseStructuredText = (raw) => {
+    if (typeof raw !== 'string' || !raw.trim() || raw.length > 16 * 1024 * 1024) return null;
+    const candidates = [raw.trim()];
+    try { candidates.push(decodeURIComponent(raw.trim())); } catch { /* not URI encoded */ }
+    for (const candidate of candidates) {
+      try {
+        const parsed = JSON.parse(candidate);
+        if (parsed && typeof parsed === 'object') return parsed;
+      } catch { /* try the next representation */ }
+    }
+    return null;
+  };
+
+  const roots = [];
+  for (const key of ['_ROUTER_DATA', '__INITIAL_STATE__', '__SSR_DATA__', '__NEXT_DATA__', '__NUXT__', 'RENDER_DATA']) {
+    try {
+      const value = window[key];
+      if (value && typeof value === 'object') roots.push(value);
+      else {
+        const parsed = parseStructuredText(value);
+        if (parsed) roots.push(parsed);
+      }
+    } catch { /* ignore inaccessible page globals */ }
+  }
+  const scripts = [...document.querySelectorAll(
+    'script[type="application/json"], script#__NEXT_DATA__, script[id*="RENDER_DATA"], script[id*="SSR"], script[id*="STATE"]',
+  )].slice(0, 40);
+  for (const script of scripts) {
+    const parsed = parseStructuredText(script.textContent || '');
+    if (parsed) roots.push(parsed);
+  }
+  for (const root of roots) scanRoot(root);
+
+  const clean = (values) => [...values.values()]
+    .sort((left, right) => right.score - left.score)
+    .map((value) => {
+      const candidate = { ...value };
+      delete candidate.score;
+      return candidate;
+    })
+    .slice(0, 64);
+  return { videoCandidates: clean(videoCandidates), audioCandidates: clean(audioCandidates) };
+}
+
+function allowedMediaUrl(urlValue) {
+  try {
+    const parsed = new URL(urlValue);
+    const hostname = parsed.hostname.toLowerCase();
+    if (parsed.protocol !== 'https:' || (parsed.port && parsed.port !== '443')) return false;
+    return hostname === 'douyinvod.com'
+      || hostname.endsWith('.douyinvod.com')
+      || hostname === 'douyinstatic.com'
+      || hostname.endsWith('.douyinstatic.com')
+      || hostname === 'douyinpic.com'
+      || hostname.endsWith('.douyinpic.com')
+      || hostname === 'zjcdn.com'
+      || hostname.endsWith('.zjcdn.com')
+      || hostname === 'bytecdn.cn'
+      || hostname.endsWith('.bytecdn.cn')
+      || hostname === 'byteimg.com'
+      || hostname.endsWith('.byteimg.com');
+  } catch {
+    return false;
+  }
+}
+
+function positiveNumber(...values) {
+  for (const value of values) {
+    const number = Number(value);
+    if (Number.isFinite(number) && number > 0) return number;
+  }
+  return 0;
+}
+
+function numberFromSearch(searchParams, keys) {
+  for (const key of keys) {
+    const value = searchParams.get(key);
+    if (value === null) continue;
+    const match = String(value).match(/\d+(?:\.\d+)?/);
+    const parsed = match ? Number(match[0]) : 0;
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return 0;
+}
+
+function responseHeaderValue(headers, name) {
+  if (!Array.isArray(headers)) return '';
+  const target = name.toLowerCase();
+  return headers.find((header) => header?.name?.toLowerCase() === target)?.value || '';
+}
+
+function fullMediaCandidate(urlValue, requestType, contentTypeValue = '', responseHeaders = [], pageMetadata = null) {
+  if (!allowedMediaUrl(urlValue)) return null;
+  let parsed;
+  try { parsed = new URL(urlValue); } catch { return null; }
+  const loweredUrl = urlValue.toLowerCase();
+  const contentType = String(contentTypeValue || responseHeaderValue(responseHeaders, 'content-type')).toLowerCase();
+  const audioMarker = contentType.startsWith('audio/')
+    || /(?:media-audio|mime_type=audio|\baudio\b|mp4a|ies-music)/.test(loweredUrl)
+    || /\.(?:mp3|m4a|aac|wav|ogg)(?:\?|$)/.test(loweredUrl);
+  const videoMarker = contentType.startsWith('video/')
+    || /(?:mime_type=video|\bvideo\b|\.mp4(?:\?|$)|\.m4v(?:\?|$))/.test(loweredUrl)
+    || requestType === 'media';
+  if (!audioMarker && !videoMarker) return null;
+
+  const width = positiveNumber(
+    pageMetadata?.width,
+    numberFromSearch(parsed.searchParams, ['vwidth', 'width', 'video_width', 'vw']),
+  );
+  const height = positiveNumber(
+    pageMetadata?.height,
+    numberFromSearch(parsed.searchParams, ['vheight', 'height', 'video_height', 'vh']),
+  );
+  const bitrate = positiveNumber(
+    pageMetadata?.bitrate,
+    numberFromSearch(parsed.searchParams, ['bitrate', 'video_bitrate', 'br', 'vbr', 'bandwidth']),
+  );
+  const contentLength = positiveNumber(
+    pageMetadata?.contentLength,
+    responseHeaderValue(responseHeaders, 'content-length'),
+  );
+  const qualityText = `${pageMetadata?.quality || ''} ${parsed.pathname} ${parsed.search}`.toLowerCase();
+  const qualityHint = /(?:origin|source|original|4k|2160)/.test(qualityText) ? 5
+    : /(?:2k|1440|uhd)/.test(qualityText) ? 4
+      : /1080|fullhd|fhd/.test(qualityText) ? 3
+        : /720|hd/.test(qualityText) ? 2
+          : /540|sd/.test(qualityText) ? 1
+            : 0;
+  const metadata = {
+    contentType: contentType || null,
+    requestType: requestType || null,
+    contentLength: contentLength || null,
+    width: width || null,
+    height: height || null,
+    bitrate: bitrate || null,
+    qualityHint: qualityHint || null,
+    codec: pageMetadata?.codec || null,
+    targetBound: pageMetadata?.targetBound === true,
+    sourceKind: pageMetadata?.sourceKind || 'network',
+  };
+  if (audioMarker) {
+    return {
+      kind: 'audio',
+      url: urlValue,
+      metadata,
+      score: bitrate * 1_000_000 + contentLength,
+    };
+  }
+  const pixels = width && height ? width * height : 0;
+  return {
+    kind: 'video',
+    url: urlValue,
+    metadata,
+    score: pixels * 1_000_000 + bitrate * 1_000 + qualityHint * 100_000 + contentLength,
+  };
+}
+
+function createFullVideoCapture(tabId, timeoutMs) {
+  const videoCandidates = new Map();
+  const audioCandidates = new Map();
+  let targetActivated = false;
+  let settled = false;
+  let resolvePromise;
+  const promise = new Promise((resolve) => { resolvePromise = resolve; });
+
+  const consider = (details, contentType = '', pageMetadata = null) => {
+    if (details.tabId !== tabId) return;
+    const candidateMetadata = pageMetadata || {
+      targetBound: targetActivated,
+      sourceKind: targetActivated ? 'target-network' : 'preload-network',
+    };
+    const candidate = fullMediaCandidate(
+      details.url,
+      details.type,
+      contentType,
+      details.responseHeaders,
+      candidateMetadata,
+    );
+    if (!candidate) return;
+    videoCandidates.delete(candidate.url);
+    audioCandidates.delete(candidate.url);
+    const destination = candidate.kind === 'video' ? videoCandidates : audioCandidates;
+    const previous = destination.get(candidate.url);
+    if (!previous || candidate.score >= previous.score) destination.set(candidate.url, candidate);
+  };
+  const onBeforeRequest = (details) => consider(details);
+  const onHeadersReceived = (details) => consider(
+    details,
+    responseHeaderValue(details.responseHeaders, 'content-type'),
+  );
+  const removeListeners = () => {
+    if (chrome.webRequest.onBeforeRequest.hasListener(onBeforeRequest)) {
+      chrome.webRequest.onBeforeRequest.removeListener(onBeforeRequest);
+    }
+    if (chrome.webRequest.onHeadersReceived.hasListener(onHeadersReceived)) {
+      chrome.webRequest.onHeadersReceived.removeListener(onHeadersReceived);
+    }
+  };
+  const best = (candidates) => {
+    const values = [...candidates.values()];
+    const structured = values.filter((candidate) => candidate.metadata.sourceKind === 'structured');
+    const targetBound = values.filter((candidate) => candidate.metadata.targetBound === true);
+    const eligible = structured.length ? structured : targetBound.length ? targetBound : values;
+    return eligible.sort((left, right) => right.score - left.score)[0] || null;
+  };
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    removeListeners();
+    resolvePromise({ video: best(videoCandidates), audio: best(audioCandidates) });
+  };
+
+  chrome.webRequest.onBeforeRequest.addListener(
+    onBeforeRequest,
+    { urls: MEDIA_URL_PATTERNS, types: ['media', 'xmlhttprequest', 'other'] },
+  );
+  chrome.webRequest.onHeadersReceived.addListener(
+    onHeadersReceived,
+    { urls: MEDIA_URL_PATTERNS, types: ['media', 'xmlhttprequest', 'other'] },
+    ['responseHeaders'],
+  );
+  const timer = setTimeout(finish, timeoutMs);
+  return {
+    promise,
+    stop: finish,
+    markTargetActivated() {
+      targetActivated = true;
+    },
+    considerCurrentSource(url, pageMetadata) {
+      if (typeof url !== 'string' || !url) return;
+      consider({ tabId, url, type: 'media', responseHeaders: [] }, 'video/mp4', {
+        ...pageMetadata,
+        targetBound: true,
+        sourceKind: 'current-source',
+      });
+    },
+    considerStructuredSources(sources) {
+      for (const source of sources?.videoCandidates || []) {
+        consider({ tabId, url: source.url, type: 'media', responseHeaders: [] }, 'video/mp4', {
+          ...source,
+          targetBound: true,
+          sourceKind: 'structured',
+        });
+      }
+      for (const source of sources?.audioCandidates || []) {
+        consider({ tabId, url: source.url, type: 'media', responseHeaders: [] }, 'audio/mp4', {
+          ...source,
+          targetBound: true,
+          sourceKind: 'structured',
+        });
+      }
+    },
+  };
+}
+
+async function captureFullVideoForAnalysis({ videoId, accountId, videoUrl }) {
+  let tab;
+  let capture;
+  try {
+    tab = await chrome.tabs.create({ url: 'about:blank', active: false });
+    if (!tab.id) throw new Error('无法创建完整视频采集标签页');
+    capture = createFullVideoCapture(tab.id, MEDIA_CAPTURE_WAIT_MS);
+    await chrome.tabs.update(tab.id, { url: videoUrl });
+    await waitForTab(tab.id);
+    const readiness = await executeInTab(tab.id, waitForVideoDetailDom, [DETAIL_DOM_WAIT_MS]);
+    const observedFromReady = videoIdFromUrl(readiness?.url);
+    if (!readiness?.ready) throw new Error('目标视频详情页没有完成加载');
+    if (observedFromReady !== videoId) {
+      throw new Error(`目标视频校验失败，页面实际打开的是 ${observedFromReady || '未知视频'}`);
+    }
+    capture.markTargetActivated();
+    const structuredSources = await executeInTab(
+      tab.id,
+      extractVerifiedVideoMediaSources,
+      [videoId],
+      'MAIN',
+    );
+    capture.considerStructuredSources(structuredSources);
+
+    const page = await executeInTab(tab.id, activateVerifiedVideoPlayback, [videoId, 10_000]);
+    if (!page?.targetMatches) {
+      throw new Error(`目标视频校验失败，播放页实际是 ${page?.observedVideoId || '未知视频'}`);
+    }
+    capture.considerCurrentSource(page.currentSrc, {
+      width: page.videoWidth,
+      height: page.videoHeight,
+    });
+    const selected = await capture.promise;
+    const finalPage = await executeInTab(tab.id, inspectVerifiedVideoTarget, [videoId]);
+    if (!finalPage?.targetMatches) {
+      throw new Error(`采集期间页面切换到了 ${finalPage?.observedVideoId || '未知视频'}，已丢弃媒体地址`);
+    }
+    if (!selected.video) throw new Error('没有捕获到目标视频的完整视觉媒体流');
+    return {
+      accountId,
+      videoId,
+      sourceVideoUrl: videoUrl,
+      video: {
+        url: selected.video.url,
+        metadata: selected.video.metadata,
+      },
+      audio: selected.audio ? {
+        url: selected.audio.url,
+        metadata: selected.audio.metadata,
+      } : null,
+      page: {
+        videoWidth: page.videoWidth || null,
+        videoHeight: page.videoHeight || null,
+        durationSeconds: page.durationSeconds || null,
+        observedVideoId: page.observedVideoId,
+      },
+    };
+  } finally {
+    capture?.stop();
+    if (tab?.id) await chrome.tabs.remove(tab.id).catch(() => {});
+  }
+}
+
 async function requestLocalTranscription({ videoId, videoUrl, mediaUrl }) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TRANSCRIBE_TIMEOUT_MS);
@@ -809,8 +1912,58 @@ async function persistAndDeliver(message, dashboardTabId) {
     messageId: message.messageId || createMessageId(),
   };
   await mutatePendingResults((current) => [...current, envelope]);
+  const connectorEvent = connectorEventFromCollectionEnvelope(envelope);
+  if (connectorEvent) {
+    await enqueueConnectorEvent(connectorEvent, { pendingMessageId: envelope.messageId });
+  }
   await sendToDashboard(envelope, dashboardTabId);
   return envelope;
+}
+
+function connectorEventFromCollectionEnvelope(envelope) {
+  if (envelope?.type === 'COLLECTION_RESULT') {
+    const videos = Array.isArray(envelope.videos) ? envelope.videos : [];
+    return {
+      jobId: envelope.connectorJobId || null,
+      eventId: envelope.messageId,
+      type: 'collection_result',
+      occurredAt: envelope.capturedAt || new Date().toISOString(),
+      payload: {
+        accountId: envelope.accountId,
+        mode: envelope.mode,
+        account: {
+          id: envelope.accountId,
+          name: envelope.accountName || null,
+          url: envelope.accountUrl || null,
+          avatarUrl: envelope.accountAvatarUrl || null,
+        },
+        videos,
+        snapshots: videos.map((video) => ({
+          videoId: video.id,
+          likeCount: video.likeCount ?? null,
+          commentCount: video.commentCount ?? null,
+          favoriteCount: video.favoriteCount ?? null,
+          shareCount: video.shareCount ?? null,
+          capturedAt: video.capturedAt || envelope.capturedAt || null,
+        })),
+        completedAt: envelope.capturedAt || null,
+      },
+    };
+  }
+  if (envelope?.type === 'COLLECTION_ERROR') {
+    return {
+      jobId: envelope.connectorJobId || null,
+      eventId: envelope.messageId,
+      type: 'job_failed',
+      occurredAt: envelope.capturedAt || new Date().toISOString(),
+      payload: {
+        accountId: envelope.accountId || null,
+        mode: envelope.mode || null,
+        message: envelope.message || '采集失败',
+      },
+    };
+  }
+  return null;
 }
 
 async function readPendingResults() {
@@ -856,7 +2009,12 @@ async function sendToDashboard(message, preferredTabId) {
     }
   }
 
-  const tabs = await chrome.tabs.query({ url: DASHBOARD_URL_PATTERNS });
+  let tabs;
+  try {
+    tabs = await chrome.tabs.query({ url: DASHBOARD_URL_PATTERNS });
+  } catch {
+    return false;
+  }
   let delivered = false;
   for (const tab of tabs) {
     if (!tab.id || tab.id === preferredTabId) continue;
@@ -873,8 +2031,10 @@ async function sendToDashboard(message, preferredTabId) {
 function normalizeAckIds(message) {
   const candidates = [
     ...(Array.isArray(message.messageIds) ? message.messageIds : []),
+    ...(Array.isArray(message.eventIds) ? message.eventIds : []),
     ...(Array.isArray(message.ids) ? message.ids : []),
     message.messageId,
+    message.eventId,
   ];
   return [...new Set(candidates.filter((value) => typeof value === 'string' && value))];
 }
@@ -1730,4 +2890,71 @@ function activateVideoPlayback(timeoutMs) {
     try { await video.play(); } catch { /* media requests may already be active */ }
     return { found: true, currentSrc: video.currentSrc || video.src || null };
   });
+}
+
+function activateVerifiedVideoPlayback(expectedVideoId, timeoutMs) {
+  const observedVideoId = () => location.pathname.match(/\/video\/(\d+)/)?.[1]
+    || new URL(location.href).searchParams.get('modal_id')
+    || null;
+  const currentObservedId = observedVideoId();
+  if (currentObservedId !== expectedVideoId) {
+    return Promise.resolve({
+      targetMatches: false,
+      observedVideoId: currentObservedId,
+      pageUrl: location.href,
+    });
+  }
+  const findVideo = () => [...document.querySelectorAll('video')]
+    .find((candidate) => candidate.getClientRects().length > 0)
+    || document.querySelector('video');
+  const immediate = findVideo();
+  const waitForVideo = immediate ? Promise.resolve(immediate) : new Promise((resolve) => {
+    let settled = false;
+    const finish = (video) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(interval);
+      clearTimeout(timeout);
+      resolve(video);
+    };
+    const interval = setInterval(() => {
+      const video = findVideo();
+      if (video) finish(video);
+    }, 250);
+    const timeout = setTimeout(() => finish(null), timeoutMs);
+  });
+  return waitForVideo.then(async (video) => {
+    const finalObservedId = observedVideoId();
+    if (!video || finalObservedId !== expectedVideoId) {
+      return {
+        targetMatches: false,
+        observedVideoId: finalObservedId,
+        pageUrl: location.href,
+      };
+    }
+    video.muted = true;
+    video.preload = 'auto';
+    try { await video.play(); } catch { /* network media requests may already be active */ }
+    const duration = Number(video.duration);
+    return {
+      targetMatches: true,
+      observedVideoId: finalObservedId,
+      pageUrl: location.href,
+      currentSrc: video.currentSrc || video.src || null,
+      videoWidth: Number(video.videoWidth) || null,
+      videoHeight: Number(video.videoHeight) || null,
+      durationSeconds: Number.isFinite(duration) && duration > 0 ? duration : null,
+    };
+  });
+}
+
+function inspectVerifiedVideoTarget(expectedVideoId) {
+  const observedVideoId = location.pathname.match(/\/video\/(\d+)/)?.[1]
+    || new URL(location.href).searchParams.get('modal_id')
+    || null;
+  return {
+    targetMatches: observedVideoId === expectedVideoId,
+    observedVideoId,
+    pageUrl: location.href,
+  };
 }

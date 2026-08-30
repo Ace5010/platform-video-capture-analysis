@@ -1,7 +1,11 @@
 const WEB_SOURCE = 'douyin-monitor';
 const EXTENSION_SOURCE = 'douyin-monitor-extension';
+const TRUSTED_DASHBOARD = location.protocol === 'http:'
+  && location.port === '3000'
+  && (location.hostname === 'localhost' || location.hostname === '127.0.0.1');
 
 function postToPage(message) {
+  if (!TRUSTED_DASHBOARD) return;
   window.postMessage({ ...message, source: EXTENSION_SOURCE }, window.location.origin);
 }
 
@@ -14,13 +18,43 @@ function postRuntimeError(message, accountId = null, videoId = null) {
   });
 }
 
+function isInvalidatedContext(error) {
+  return /extension context invalidated/i.test(String(error?.message || error || ''));
+}
+
+function sendToRuntime(message, callback) {
+  try {
+    chrome.runtime.sendMessage(message, (response) => {
+      let runtimeError;
+      try {
+        runtimeError = chrome.runtime.lastError;
+      } catch (error) {
+        if (!isInvalidatedContext(error)) callback(undefined, error);
+        return;
+      }
+      if (runtimeError) {
+        if (!isInvalidatedContext(runtimeError)) callback(undefined, runtimeError);
+        return;
+      }
+      callback(response, null);
+    });
+    return true;
+  } catch (error) {
+    if (!isInvalidatedContext(error)) callback(undefined, error);
+    return false;
+  }
+}
+
 window.addEventListener('message', (event) => {
-  if (event.source !== window || event.data?.source !== WEB_SOURCE) return;
+  if (!TRUSTED_DASHBOARD
+    || event.source !== window
+    || event.origin !== window.location.origin
+    || event.data?.source !== WEB_SOURCE) return;
 
   if (event.data.type === 'PING') {
-    chrome.runtime.sendMessage(event.data, (response) => {
-      if (chrome.runtime.lastError) {
-        postRuntimeError(chrome.runtime.lastError.message);
+    sendToRuntime(event.data, (response, runtimeError) => {
+      if (runtimeError) {
+        postRuntimeError(runtimeError.message);
         return;
       }
       if (!response?.ok) {
@@ -40,11 +74,11 @@ window.addEventListener('message', (event) => {
     return;
   }
 
-  chrome.runtime.sendMessage(event.data, (response) => {
+  sendToRuntime(event.data, (response, runtimeError) => {
     const requestedVideoId = event.data.videoId || event.data.video?.id || null;
-    if (chrome.runtime.lastError) {
+    if (runtimeError) {
       postRuntimeError(
-        chrome.runtime.lastError.message,
+        runtimeError.message,
         event.data.accountId || null,
         requestedVideoId,
       );
@@ -63,7 +97,8 @@ window.addEventListener('message', (event) => {
 });
 
 chrome.runtime.onMessage.addListener((message) => {
+  if (!TRUSTED_DASHBOARD) return;
   postToPage(message);
 });
 
-postToPage({ type: 'BRIDGE_READY' });
+if (TRUSTED_DASHBOARD) postToPage({ type: 'BRIDGE_READY' });
