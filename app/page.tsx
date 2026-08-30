@@ -4,6 +4,18 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import {
+  analyticsMetricValue,
+  calculateDelta,
+  metricRank,
+  orderVideosOldestFirst,
+  previousPublishedVideo,
+  snapshotMetricChange,
+  summarizeMetric,
+  type AnalyticsMetricKey,
+  type NumericDelta,
+} from '../lib/video-analytics';
+
 type AccountStatus = 'waiting' | 'checking' | 'ready' | 'error';
 type TranscriptStatus = 'idle' | 'processing' | 'ready' | 'error';
 type AnalysisStatus = 'idle' | 'queued' | 'processing' | 'ready' | 'error';
@@ -11,6 +23,8 @@ type SyncMode = 'initial' | 'latest';
 type InitialSyncStatus = 'pending' | 'complete' | 'error';
 type Platform = 'douyin' | 'xiaohongshu' | 'bilibili' | 'youtube';
 type SchedulerRunStatus = 'never' | 'waiting' | 'running' | 'success' | 'partial' | 'error' | 'skipped';
+type AnalyticsView = 'details' | 'comparison';
+type AnalyticsSortMode = 'published' | 'value';
 
 type Account = {
   id: string;
@@ -147,6 +161,13 @@ const navItems = [
   ['⌁', '总数据分析'],
 ];
 
+const ANALYTICS_METRICS = [
+  { key: 'likeCount' as const, label: '点赞', color: '#d45b4f' },
+  { key: 'commentCount' as const, label: '评论', color: '#4c72c7' },
+  { key: 'favoriteCount' as const, label: '收藏', color: '#d18d32' },
+  { key: 'shareCount' as const, label: '分享', color: '#418f72' },
+];
+
 type PlatformMeta = {
   name: string;
   tagline: string;
@@ -231,7 +252,7 @@ function readStored<T>(key: string, fallback: T): T {
 function nullableNumber(value: unknown): number | null {
   if (value === null || value === undefined || value === '') return null;
   const number = Number(value);
-  return Number.isFinite(number) ? number : null;
+  return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
 function textValue(value: unknown) {
@@ -332,7 +353,38 @@ function formatTime(value: string | null) {
 
 function formatMetric(value: number | null) {
   if (value === null) return '—';
-  return new Intl.NumberFormat('zh-CN').format(value);
+  return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 }).format(value);
+}
+
+function formatCompactMetric(value: number | null) {
+  if (value === null) return '—';
+  return new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 }).format(value);
+}
+
+function formatSignedMetric(value: number, compact = false) {
+  if (value === 0) return '0';
+  const formatted = compact ? formatCompactMetric(Math.abs(value)) : formatMetric(Math.abs(value));
+  return `${value > 0 ? '+' : '−'}${formatted}`;
+}
+
+function formatSignedPercentage(value: number) {
+  if (value === 0) return '0%';
+  const formatted = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 }).format(Math.abs(value));
+  return `${value > 0 ? '+' : '−'}${formatted}%`;
+}
+
+function formatDeltaDetail(delta: NumericDelta | null) {
+  if (!delta) return '数据不足';
+  if (delta.absolute === 0) return '持平';
+  const absolute = formatSignedMetric(delta.absolute);
+  return delta.percentage === null
+    ? `${absolute}（基线为 0）`
+    : `${absolute}（${formatSignedPercentage(delta.percentage)}）`;
+}
+
+function deltaTone(delta: NumericDelta | null) {
+  if (!delta || delta.absolute === 0) return 'neutral';
+  return delta.absolute > 0 ? 'positive' : 'negative';
 }
 
 function formatDuration(value: number | null) {
@@ -375,6 +427,7 @@ export default function Home() {
   const [hostJobs, setHostJobs] = useState<HostJob[]>([]);
   const [hostConnected, setHostConnected] = useState(false);
   const [activeNav, setActiveNav] = useState('主页仪表盘');
+  const [analyticsView, setAnalyticsView] = useState<AnalyticsView>('details');
   const [activePlatform, setActivePlatform] = useState<Platform>(() => {
     const stored = readStored<string>(activePlatformStoreKey, '');
     return stored === 'douyin' || stored === 'xiaohongshu' || stored === 'bilibili' || stored === 'youtube'
@@ -919,6 +972,12 @@ export default function Home() {
     () => selectedAccount ? videos.filter((video) => video.accountId === selectedAccount.id) : [],
     [selectedAccount, videos],
   );
+  const selectedAccountSnapshots = useMemo(() => {
+    if (!selectedAccount) return [];
+    const videoIds = new Set(selectedAccountVideos.map((video) => video.id));
+    return snapshots.filter((snapshot) => videoIds.has(snapshot.videoId)
+      && (!snapshot.accountId || snapshot.accountId === selectedAccount.id));
+  }, [selectedAccount, selectedAccountVideos, snapshots]);
   const latestVideos = useMemo(() => {
     if (!selectedAccount) return [];
     const byId = new Map(selectedAccountVideos.map((video) => [video.id, video]));
@@ -1297,7 +1356,10 @@ export default function Home() {
         <nav className="navigation" aria-label="主导航">
           <p className="navLabel">工作区</p>
           {navItems.map(([icon, label]) => (
-            <button className={activeNav === label ? 'navItem active' : 'navItem'} key={label} onClick={() => setActiveNav(label)}>
+            <button className={activeNav === label ? 'navItem active' : 'navItem'} key={label} onClick={() => {
+              setActiveNav(label);
+              if (label === '总数据分析') setAnalyticsView('details');
+            }}>
               <span className="navIcon">{icon}</span>{label}
             </button>
           ))}
@@ -1370,12 +1432,25 @@ export default function Home() {
             {activeNav === '总数据分析' && (
               <>
                 <AccountSelector accounts={accounts} videos={videos} selectedAccountId={selectedAccount?.id || ''} onSelect={setSelectedAccountId} />
-                <AnalyticsBoard
-                  videos={selectedAccountVideos}
-                  accountName={selectedAccount?.name || null}
-                />
-                <SectionHeading title={selectedAccount ? `${selectedAccount.name} · 全部视频数据` : '全部视频数据'} count={`${selectedAccountVideos.length} 条 · 当前账号内去重`} />
-                <VideoTable videos={selectedAccountVideos} jobs={hostJobs} expandedAnalyses={expandedAnalyses} onAnalysis={requestAnalysis} />
+                <SectionHeading title={selectedAccount ? `${selectedAccount.name} · 总数据分析` : '总数据分析'} count={`${selectedAccountVideos.length} 条去重视频 · 仅当前账号`} />
+                <AnalyticsViewTabs activeView={analyticsView} onChange={setAnalyticsView} />
+                {analyticsView === 'details'
+                  ? <>
+                    <SectionHeading title="全部视频数据" count={`${selectedAccountVideos.length} 条 · 当前账号内去重`} />
+                    <VideoTable
+                      videos={selectedAccountVideos}
+                      snapshots={selectedAccountSnapshots}
+                      showSnapshotChanges
+                      jobs={hostJobs}
+                      expandedAnalyses={expandedAnalyses}
+                      onAnalysis={requestAnalysis}
+                    />
+                  </>
+                  : <AnalyticsBoard
+                    videos={selectedAccountVideos}
+                    snapshots={selectedAccountSnapshots}
+                    accountName={selectedAccount?.name || null}
+                  />}
               </>
             )}
           </>
@@ -1446,75 +1521,201 @@ export default function Home() {
   );
 }
 
-function AnalyticsBoard({ videos, accountName }: { videos: Video[]; accountName: string | null }) {
-  const orderedVideos = [...videos].sort((left, right) => (left.publishedAt || left.firstSeenAt).localeCompare(right.publishedAt || right.firstSeenAt));
-  const dimensions = [
-    { key: 'likeCount' as const, label: '点赞', color: '#d45b4f' },
-    { key: 'commentCount' as const, label: '评论', color: '#4c72c7' },
-    { key: 'favoriteCount' as const, label: '收藏', color: '#d18d32' },
-    { key: 'shareCount' as const, label: '分享', color: '#418f72' },
-  ];
-
-  if (!videos.length) {
-    return <EmptyData title={accountName ? `${accountName} 尚无建档数据` : '等待首次建档'} detail="完成当前账号的首次建档后，这里会根据首次近 30 条非置顶视频及后续发现的新视频生成独立统计和走势，不会混入其他账号。" />;
-  }
-
-  return <>
-    <SectionHeading title={accountName ? `${accountName} · 总数据分析` : '总数据分析'} count={`${videos.length} 条去重视频 · 仅当前账号`} />
-    <section className="analysisStats">{dimensions.map((dimension) => {
-      const total = videos.reduce((sum, video) => sum + (video[dimension.key] || 0), 0);
-      return <article key={dimension.key} style={{ '--metric-color': dimension.color } as React.CSSProperties}>
-        <small>当前{dimension.label}合计</small><strong>{formatMetric(total)}</strong><p>{videos.length} 条视频最新快照的{dimension.label}数据之和</p>
-      </article>;
-    })}</section>
-    <section className="metricTrendGrid">{dimensions.map((dimension) => <MetricTrendChart
-      key={dimension.key}
-      label={dimension.label}
-      color={dimension.color}
-      videos={orderedVideos}
-      metricKey={dimension.key}
-    />)}</section>
-  </>;
+function AnalyticsViewTabs({ activeView, onChange }: {
+  activeView: AnalyticsView;
+  onChange: (view: AnalyticsView) => void;
+}) {
+  return <section className="analyticsViewTabs" role="tablist" aria-label="总数据分析视图">
+    <button type="button" role="tab" aria-selected={activeView === 'details'} className={activeView === 'details' ? 'active' : ''} onClick={() => onChange('details')}>
+      <b>视频明细</b><small>直接查看每条视频和快照变化</small>
+    </button>
+    <button type="button" role="tab" aria-selected={activeView === 'comparison'} className={activeView === 'comparison' ? 'active' : ''} onClick={() => onChange('comparison')}>
+      <b>差异对比</b><small>比较账号内视频表现与排名</small>
+    </button>
+  </section>;
 }
 
-function MetricTrendChart({ videos, metricKey, label, color }: {
+function AnalyticsBoard({ videos, snapshots, accountName }: {
   videos: Video[];
-  metricKey: 'likeCount' | 'commentCount' | 'favoriteCount' | 'shareCount';
-  label: string;
-  color: string;
+  snapshots: Snapshot[];
+  accountName: string | null;
 }) {
-  const width = Math.max(900, videos.length * 28);
-  const height = 220;
-  const paddingX = 28;
-  const paddingTop = 24;
-  const paddingBottom = 38;
-  const values = videos.map((video) => video[metricKey] || 0);
-  const maximum = Math.max(1, ...values);
-  const xAt = (index: number) => videos.length === 1 ? width / 2 : paddingX + index * ((width - paddingX * 2) / (videos.length - 1));
-  const yAt = (value: number) => paddingTop + (1 - value / maximum) * (height - paddingTop - paddingBottom);
-  const points = values.map((value, index) => `${xAt(index)},${yAt(value)}`).join(' ');
+  const [metricKey, setMetricKey] = useState<AnalyticsMetricKey>('likeCount');
+  const [sortMode, setSortMode] = useState<AnalyticsSortMode>('published');
+  const [selectedVideoId, setSelectedVideoId] = useState('');
+  const orderedVideos = useMemo(() => orderVideosOldestFirst(videos), [videos]);
+  const selectedVideo = orderedVideos.find((video) => video.id === selectedVideoId)
+    || orderedVideos.at(-1)
+    || null;
 
-  return <article className="metricTrendCard">
-    <div className="analysisHeader"><h3>{label}表现走势</h3><span>{videos.length} 个视频节点</span></div>
-    <div className="metricChartScroll">
-      <svg className="metricLineChart" viewBox={`0 0 ${width} ${height}`} style={{ width }} role="img" aria-label={`${label}数据按视频发布时间走势`}>
-        <line className="metricAxis" x1={paddingX} y1={height - paddingBottom} x2={width - paddingX} y2={height - paddingBottom} />
-        <polyline points={points} fill="none" stroke={color} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
-        {videos.map((video, index) => {
-          const value = values[index];
-          const showDate = index === 0 || index === videos.length - 1 || index % 5 === 0;
-          return <g key={`${video.accountId}:${video.id}`}>
-            <a href={video.url} target="_blank" rel="noreferrer">
-              <circle className="metricNode" cx={xAt(index)} cy={yAt(value)} r="4.5" fill="white" stroke={color} strokeWidth="2.5">
-                <title>{`${video.title}｜${label} ${formatMetric(value)}`}</title>
-              </circle>
-            </a>
-            {showDate && <text x={xAt(index)} y={height - 13} textAnchor="middle">{video.publishedAt ? new Date(video.publishedAt).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' }) : `#${index + 1}`}</text>}
+  if (!videos.length) {
+    return <EmptyData title={accountName ? `${accountName} 尚无建档数据` : '等待首次建档'} detail="完成当前账号的首次建档后，这里会根据首次近 30 条非置顶视频及后续发现的新视频生成独立统计，不会混入其他账号。" />;
+  }
+
+  return <section className="analyticsComparisonView">
+    <section className="analysisStats">{ANALYTICS_METRICS.map((dimension) => {
+      const summary = summarizeMetric(videos, dimension.key);
+      return <article key={dimension.key} style={{ '--metric-color': dimension.color } as React.CSSProperties}>
+        <div className="analysisStatTitle"><small>{dimension.label}账号基准</small><span>{summary.validCount}/{summary.totalCount} 条有效</span></div>
+        <strong>{formatMetric(summary.median)}</strong>
+        <p className="analysisStatPrimaryLabel">账号中位数</p>
+        <div className="analysisStatRows">
+          <span><small>最近 3 条均值</small><b>{formatMetric(summary.recentAverage)}</b></span>
+          <span><small>此前 3 条均值</small><b>{formatMetric(summary.previousAverage)}</b></span>
+        </div>
+        <p className={`summaryDelta ${deltaTone(summary.recentDelta)}`}>
+          {summary.recentDelta ? `最近 3 条较此前 3 条 ${formatDeltaDetail(summary.recentDelta)}` : '完整的两组 3 条样本不足'}
+        </p>
+      </article>;
+    })}</section>
+    <p className="analysisMethodNote">统计、排名和视频间差异均使用每条视频当前保存的最新累计值；发布时间不同会影响累计量，结果用于看差异，不代表等时长表现。</p>
+
+    <MetricBarComparison
+      videos={orderedVideos}
+      metricKey={metricKey}
+      sortMode={sortMode}
+      selectedVideoId={selectedVideo?.id || ''}
+      onMetricChange={setMetricKey}
+      onSortChange={setSortMode}
+      onSelectVideo={setSelectedVideoId}
+    />
+    {selectedVideo && <SelectedVideoComparison video={selectedVideo} videos={orderedVideos} snapshots={snapshots} />}
+  </section>;
+}
+
+function MetricBarComparison({ videos, metricKey, sortMode, selectedVideoId, onMetricChange, onSortChange, onSelectVideo }: {
+  videos: Video[];
+  metricKey: AnalyticsMetricKey;
+  sortMode: AnalyticsSortMode;
+  selectedVideoId: string;
+  onMetricChange: (metric: AnalyticsMetricKey) => void;
+  onSortChange: (mode: AnalyticsSortMode) => void;
+  onSelectVideo: (videoId: string) => void;
+}) {
+  const metric = ANALYTICS_METRICS.find((item) => item.key === metricKey) || ANALYTICS_METRICS[0];
+  const chronologicalIndex = new Map(videos.map((video, index) => [video.id, index + 1]));
+  const displayedVideos = sortMode === 'published'
+    ? videos
+    : [...videos].sort((left, right) => {
+      const leftValue = analyticsMetricValue(left[metricKey]);
+      const rightValue = analyticsMetricValue(right[metricKey]);
+      if (leftValue === null && rightValue === null) return (chronologicalIndex.get(left.id) || 0) - (chronologicalIndex.get(right.id) || 0);
+      if (leftValue === null) return 1;
+      if (rightValue === null) return -1;
+      return rightValue - leftValue || (chronologicalIndex.get(left.id) || 0) - (chronologicalIndex.get(right.id) || 0);
+    });
+  const width = Math.max(760, displayedVideos.length * 58 + 74);
+  const height = 300;
+  const paddingLeft = 58;
+  const paddingRight = 16;
+  const paddingTop = 24;
+  const paddingBottom = 48;
+  const baseline = height - paddingBottom;
+  const plotHeight = baseline - paddingTop;
+  const values = displayedVideos.map((video) => analyticsMetricValue(video[metricKey])).filter((value): value is number => value !== null);
+  const maximum = Math.max(1, ...values);
+  const bandWidth = (width - paddingLeft - paddingRight) / Math.max(1, displayedVideos.length);
+  const barWidth = Math.min(30, bandWidth * .58);
+  const ticks = [0, .25, .5, .75, 1];
+
+  return <article className="metricComparisonCard">
+    <div className="metricComparisonHeader">
+      <div><h3>视频表现差异</h3><p>一根柱子代表一条视频；点击后查看四项具体变化。</p></div>
+      <div className="metricControls">
+        <div className="metricTabs" role="tablist" aria-label="选择对比指标">
+          {ANALYTICS_METRICS.map((item) => <button key={item.key} type="button" role="tab" aria-selected={metricKey === item.key} className={metricKey === item.key ? 'active' : ''} style={{ '--metric-color': item.color } as React.CSSProperties} onClick={() => onMetricChange(item.key)}>{item.label}</button>)}
+        </div>
+        <div className="metricSort" aria-label="视频排序方式">
+          <button type="button" className={sortMode === 'published' ? 'active' : ''} onClick={() => onSortChange('published')}>发布顺序</button>
+          <button type="button" className={sortMode === 'value' ? 'active' : ''} onClick={() => onSortChange('value')}>数据高低</button>
+        </div>
+      </div>
+    </div>
+    <div className="metricBarChartScroll">
+      <svg className="metricBarChart" viewBox={`0 0 ${width} ${height}`} style={{ width }} role="img" aria-label={`${metric.label}数据按视频对比柱状图`}>
+        {ticks.map((ratio) => {
+          const y = baseline - plotHeight * ratio;
+          return <g key={ratio}>
+            <line className="metricGridLine" x1={paddingLeft} y1={y} x2={width - paddingRight} y2={y} />
+            <text className="metricAxisLabel" x={paddingLeft - 10} y={y + 4} textAnchor="end">{formatCompactMetric(maximum * ratio)}</text>
+          </g>;
+        })}
+        {displayedVideos.map((video, index) => {
+          const value = analyticsMetricValue(video[metricKey]);
+          const centerX = paddingLeft + bandWidth * index + bandWidth / 2;
+          const validValue = value !== null;
+          const barHeight = validValue ? (value / maximum) * plotHeight : 0;
+          const y = baseline - barHeight;
+          const isSelected = video.id === selectedVideoId;
+          const chronologicalNumber = chronologicalIndex.get(video.id) || index + 1;
+          const label = `第 ${chronologicalNumber} 条视频，${video.title}，${metric.label}${validValue ? formatMetric(value) : '缺少数据'}`;
+          return <g
+            className={`metricBarGroup ${isSelected ? 'selected' : ''}`}
+            key={`${video.accountId}:${video.id}`}
+            role="button"
+            tabIndex={0}
+            aria-label={label}
+            onClick={() => onSelectVideo(video.id)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                onSelectVideo(video.id);
+              }
+            }}
+          >
+            <title>{`${video.title}｜${metric.label} ${validValue ? formatMetric(value) : '缺少数据'}`}</title>
+            <rect className="metricBarHitArea" x={centerX - bandWidth / 2} y={paddingTop} width={bandWidth} height={plotHeight + 24} />
+            {validValue && value > 0
+              ? <rect className="metricValueBar" x={centerX - barWidth / 2} y={y} width={barWidth} height={barHeight} rx="4" fill={metric.color} opacity={isSelected ? 1 : .62} />
+              : validValue
+                ? <circle className="metricZeroMarker" cx={centerX} cy={baseline} r="3" fill={metric.color} />
+              : <rect className="metricMissingBar" x={centerX - barWidth / 2} y={baseline - 3} width={barWidth} height="3" rx="1.5" />}
+            {isSelected && <rect className="metricSelectedOutline" x={centerX - barWidth / 2 - 4} y={paddingTop - 6} width={barWidth + 8} height={plotHeight + 12} rx="7" />}
+            <text className="metricVideoLabel" x={centerX} y={height - 19} textAnchor="middle">#{String(chronologicalNumber).padStart(2, '0')}</text>
           </g>;
         })}
       </svg>
     </div>
-    <p className="metricChartNote">优先按发布时间从左到右排列，缺少发布时间时按首次发现时间；每个圆点代表一条视频，悬停查看数值，点击打开原视频。</p>
+    <p className="metricChartNote">编号始终按发布时间排列，缺少发布时间时按首次发现时间；切换“数据高低”只改变图中顺序，不改变“上一条视频”的比较基准。</p>
+  </article>;
+}
+
+function SelectedVideoComparison({ video, videos, snapshots }: {
+  video: Video;
+  videos: Video[];
+  snapshots: Snapshot[];
+}) {
+  const previousVideo = previousPublishedVideo(video, videos);
+  const sequence = orderVideosOldestFirst(videos).findIndex((candidate) => candidate.id === video.id) + 1;
+  const previousSequence = previousVideo
+    ? orderVideosOldestFirst(videos).findIndex((candidate) => candidate.id === previousVideo.id) + 1
+    : null;
+  return <article className="selectedVideoComparison">
+    <div className="selectedVideoHeader">
+      <a className="selectedVideoCover" href={video.url} target="_blank" rel="noreferrer">
+        {video.coverUrl ? <img src={video.coverUrl} alt="" referrerPolicy="no-referrer" /> : <span>无封面</span>}
+      </a>
+      <div><span>已选择第 {sequence} 条视频</span><h3>{video.title}</h3><p>发布于 {formatTime(video.publishedAt || video.firstSeenAt)} · <a href={video.url} target="_blank" rel="noreferrer">打开原视频 ↗</a></p></div>
+    </div>
+    <section className="comparisonMetricGrid">{ANALYTICS_METRICS.map((dimension) => {
+      const snapshotChange = snapshotMetricChange(video, snapshots, dimension.key);
+      const previousDelta = previousVideo ? calculateDelta(video[dimension.key], previousVideo[dimension.key]) : null;
+      const rank = metricRank(video, videos, dimension.key);
+      const snapshotText = snapshotChange.sampleCount < 2
+        ? snapshotChange.sampleCount === 1 ? '仅 1 次快照，暂不能计算增长' : '暂无快照变化数据'
+        : snapshotChange.delta ? formatDeltaDetail(snapshotChange.delta) : '首末快照缺少该指标';
+      const previousText = previousVideo
+        ? previousDelta ? formatDeltaDetail(previousDelta) : '当前或上一条视频数据不足'
+        : '无更早视频可比较';
+      return <article key={dimension.key} style={{ '--metric-color': dimension.color } as React.CSSProperties}>
+        <div className="comparisonMetricTitle"><span>{dimension.label}</span><b>{formatMetric(video[dimension.key])}</b></div>
+        <dl>
+          <div><dt>较首次快照</dt><dd className={deltaTone(snapshotChange.delta)}><span>{snapshotText}</span>{snapshotChange.sampleCount >= 2 && snapshotChange.firstCapturedAt && snapshotChange.latestCapturedAt ? <small>{formatTime(snapshotChange.firstCapturedAt)} → {formatTime(snapshotChange.latestCapturedAt)}</small> : null}</dd></div>
+          <div><dt>较上一条视频（各自最新值）</dt><dd className={deltaTone(previousDelta)}><span>{previousText}</span>{previousVideo && previousSequence ? <small title={previousVideo.title}>当前采集 {formatTime(video.lastSeenAt)} · 对比第 {previousSequence} 条 {formatTime(previousVideo.lastSeenAt)}</small> : null}</dd></div>
+          <div><dt>账号内排名</dt><dd><span>{rank ? `${rank} / ${videos.filter((candidate) => metricRank(candidate, videos, dimension.key) !== null).length}` : '无排名'}</span></dd></div>
+        </dl>
+      </article>;
+    })}</section>
   </article>;
 }
 
@@ -1589,8 +1790,10 @@ function AccountBoard({ accounts, onAdd, onRemove, onInitialSync, isCollecting }
   })}</section>;
 }
 
-function VideoTable({ videos, jobs, expandedAnalyses, onAnalysis }: {
+function VideoTable({ videos, snapshots = [], showSnapshotChanges = false, jobs, expandedAnalyses, onAnalysis }: {
   videos: Video[];
+  snapshots?: Snapshot[];
+  showSnapshotChanges?: boolean;
   jobs: HostJob[];
   expandedAnalyses: Set<string>;
   onAnalysis: (video: Video) => void;
@@ -1625,10 +1828,10 @@ function VideoTable({ videos, jobs, expandedAnalyses, onAnalysis }: {
               ? '重新分析'
               : 'AI分析';
       const metrics = [
-        ['点赞', video.likeCount],
-        ['评论', video.commentCount],
-        ['收藏', video.favoriteCount],
-        ['分享', video.shareCount],
+        ['点赞', 'likeCount', video.likeCount],
+        ['评论', 'commentCount', video.commentCount],
+        ['收藏', 'favoriteCount', video.favoriteCount],
+        ['分享', 'shareCount', video.shareCount],
       ] as const;
       return <article className="videoRecord" key={`${video.accountId}:${video.id}`}>
         <div className="videoMainRow">
@@ -1639,7 +1842,16 @@ function VideoTable({ videos, jobs, expandedAnalyses, onAnalysis }: {
             </a>
             <div className="videoCopy"><a href={video.url} target="_blank" rel="noreferrer">{video.title || '未命名视频'} ↗</a>{video.description.trim() && video.description.trim() !== video.title.trim() ? <p>{video.description}</p> : null}</div>
           </div>
-          <div className="metricGrid">{metrics.map(([label, value]) => <span key={label}><small>{label}</small><b>{formatMetric(value)}</b></span>)}</div>
+          <div className="metricGrid">{metrics.map(([label, key, value]) => {
+            const snapshotChange = showSnapshotChanges ? snapshotMetricChange(video, snapshots, key) : null;
+            const change = snapshotChange?.delta || null;
+            const changeLabel = !snapshotChange
+              ? null
+              : change
+                ? change.absolute === 0 ? '较首次 持平' : `较首次 ${formatSignedMetric(change.absolute, true)}`
+                : snapshotChange.sampleCount < 2 ? '快照不足' : '首末缺数据';
+            return <span key={label}><small>{label}</small><b>{formatMetric(value)}</b>{changeLabel && <em className={`metricDeltaTag ${deltaTone(change)}`}>{changeLabel}</em>}</span>;
+          })}</div>
           <div className="videoTimes"><span><small>发布</small><b>{formatTime(video.publishedAt)}</b></span><span><small>采集</small><b>{formatTime(video.lastSeenAt)}</b></span></div>
           <button className={`analysisButton ${analysisStatus}`} onClick={() => onAnalysis({ ...video, analysisStatus })}>
             {buttonLabel}

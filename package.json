@@ -13,6 +13,7 @@
     "test:connector": "node scripts/test-extension-connector.mjs",
     "test:host": ".venv\\Scripts\\python.exe scripts/test-host-service.py",
     "test:scheduler": "node scripts/test-extension-scheduler.mjs",
+    "test:video-analytics": "node --experimental-strip-types scripts/test-video-analytics.ts",
     "build": "vinext build",
     "start": "vinext start",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
