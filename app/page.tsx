@@ -351,6 +351,28 @@ function formatTime(value: string | null) {
   }).format(date);
 }
 
+function formatCalendarDate(value: string | null, includeYear = false) {
+  if (!value) return '日期未知';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '日期未知';
+  return new Intl.DateTimeFormat('zh-CN', {
+    ...(includeYear ? { year: 'numeric' as const } : {}),
+    month: '2-digit',
+    day: '2-digit',
+  }).format(date);
+}
+
+function formatClockTime(value: string | null) {
+  if (!value) return '时间未知';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '时间未知';
+  return new Intl.DateTimeFormat('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(date);
+}
+
 function formatMetric(value: number | null) {
   if (value === null) return '—';
   return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 }).format(value);
@@ -1609,7 +1631,7 @@ function MetricBarComparison({ videos, metricKey, sortMode, selectedVideoId, onM
   const paddingLeft = 58;
   const paddingRight = 16;
   const paddingTop = 24;
-  const paddingBottom = 48;
+  const paddingBottom = 58;
   const baseline = height - paddingBottom;
   const plotHeight = baseline - paddingTop;
   const values = displayedVideos.map((video) => analyticsMetricValue(video[metricKey])).filter((value): value is number => value !== null);
@@ -1617,17 +1639,18 @@ function MetricBarComparison({ videos, metricKey, sortMode, selectedVideoId, onM
   const bandWidth = (width - paddingLeft - paddingRight) / Math.max(1, displayedVideos.length);
   const barWidth = Math.min(30, bandWidth * .58);
   const ticks = [0, .25, .5, .75, 1];
+  const hasFallbackDates = videos.some((video) => !video.publishedAt);
 
   return <article className="metricComparisonCard">
     <div className="metricComparisonHeader">
-      <div><h3>视频表现差异</h3><p>一根柱子代表一条视频；点击后查看四项具体变化。</p></div>
+      <div><h3>各视频数据对比</h3><p>柱下为视频发布日期和时间，柱高为当前保存的{metric.label}累计值；点击日期查看对应视频。{hasFallbackDates ? '带 * 的日期表示发布时间缺失，使用首次发现时间。' : ''}</p></div>
       <div className="metricControls">
         <div className="metricTabs" role="tablist" aria-label="选择对比指标">
           {ANALYTICS_METRICS.map((item) => <button key={item.key} type="button" role="tab" aria-selected={metricKey === item.key} className={metricKey === item.key ? 'active' : ''} style={{ '--metric-color': item.color } as React.CSSProperties} onClick={() => onMetricChange(item.key)}>{item.label}</button>)}
         </div>
         <div className="metricSort" aria-label="视频排序方式">
-          <button type="button" className={sortMode === 'published' ? 'active' : ''} onClick={() => onSortChange('published')}>发布顺序</button>
-          <button type="button" className={sortMode === 'value' ? 'active' : ''} onClick={() => onSortChange('value')}>数据高低</button>
+          <button type="button" className={sortMode === 'published' ? 'active' : ''} onClick={() => onSortChange('published')}>按发布时间</button>
+          <button type="button" className={sortMode === 'value' ? 'active' : ''} onClick={() => onSortChange('value')}>按数据高低</button>
         </div>
       </div>
     </div>
@@ -1647,8 +1670,11 @@ function MetricBarComparison({ videos, metricKey, sortMode, selectedVideoId, onM
           const barHeight = validValue ? (value / maximum) * plotHeight : 0;
           const y = baseline - barHeight;
           const isSelected = video.id === selectedVideoId;
-          const chronologicalNumber = chronologicalIndex.get(video.id) || index + 1;
-          const label = `第 ${chronologicalNumber} 条视频，${video.title}，${metric.label}${validValue ? formatMetric(value) : '缺少数据'}`;
+          const dateValue = video.publishedAt || video.firstSeenAt;
+          const dateLabel = formatCalendarDate(dateValue);
+          const displayDateLabel = `${dateLabel}${video.publishedAt ? '' : '*'}`;
+          const timeLabel = video.publishedAt ? formatClockTime(dateValue) : '首次发现';
+          const label = `${displayDateLabel} ${timeLabel}，${video.title}，${metric.label}${validValue ? formatMetric(value) : '缺少数据'}`;
           return <g
             className={`metricBarGroup ${isSelected ? 'selected' : ''}`}
             key={`${video.accountId}:${video.id}`}
@@ -1664,19 +1690,21 @@ function MetricBarComparison({ videos, metricKey, sortMode, selectedVideoId, onM
             }}
           >
             <title>{`${video.title}｜${metric.label} ${validValue ? formatMetric(value) : '缺少数据'}`}</title>
-            <rect className="metricBarHitArea" x={centerX - bandWidth / 2} y={paddingTop} width={bandWidth} height={plotHeight + 24} />
+            <rect className="metricBarHitArea" x={centerX - bandWidth / 2} y={paddingTop} width={bandWidth} height={plotHeight + 42} />
             {validValue && value > 0
               ? <rect className="metricValueBar" x={centerX - barWidth / 2} y={y} width={barWidth} height={barHeight} rx="4" fill={metric.color} opacity={isSelected ? 1 : .62} />
               : validValue
                 ? <circle className="metricZeroMarker" cx={centerX} cy={baseline} r="3" fill={metric.color} />
               : <rect className="metricMissingBar" x={centerX - barWidth / 2} y={baseline - 3} width={barWidth} height="3" rx="1.5" />}
             {isSelected && <rect className="metricSelectedOutline" x={centerX - barWidth / 2 - 4} y={paddingTop - 6} width={barWidth + 8} height={plotHeight + 12} rx="7" />}
-            <text className="metricVideoLabel" x={centerX} y={height - 19} textAnchor="middle">#{String(chronologicalNumber).padStart(2, '0')}</text>
+            <text className="metricVideoLabel" textAnchor="middle">
+              <tspan x={centerX} y={height - 29}>{displayDateLabel}</tspan>
+              <tspan className="metricVideoTimeLabel" x={centerX} y={height - 15}>{timeLabel}</tspan>
+            </text>
           </g>;
         })}
       </svg>
     </div>
-    <p className="metricChartNote">编号始终按发布时间排列，缺少发布时间时按首次发现时间；切换“数据高低”只改变图中顺序，不改变“上一条视频”的比较基准。</p>
   </article>;
 }
 
@@ -1686,36 +1714,47 @@ function SelectedVideoComparison({ video, videos, snapshots }: {
   snapshots: Snapshot[];
 }) {
   const previousVideo = previousPublishedVideo(video, videos);
-  const sequence = orderVideosOldestFirst(videos).findIndex((candidate) => candidate.id === video.id) + 1;
-  const previousSequence = previousVideo
-    ? orderVideosOldestFirst(videos).findIndex((candidate) => candidate.id === previousVideo.id) + 1
-    : null;
   return <article className="selectedVideoComparison">
+    <div className="selectedVideoPanelHeading">
+      <h3>所选视频数据</h3>
+      <p>点击上方任一日期后，这里会显示对应视频的当前累计值、首次记录后变化、与上一条视频的差异和账号内排名。</p>
+    </div>
     <div className="selectedVideoHeader">
       <a className="selectedVideoCover" href={video.url} target="_blank" rel="noreferrer">
         {video.coverUrl ? <img src={video.coverUrl} alt="" referrerPolicy="no-referrer" /> : <span>无封面</span>}
       </a>
-      <div><span>已选择第 {sequence} 条视频</span><h3>{video.title}</h3><p>发布于 {formatTime(video.publishedAt || video.firstSeenAt)} · <a href={video.url} target="_blank" rel="noreferrer">打开原视频 ↗</a></p></div>
+      <div><span>所选日期 · {formatCalendarDate(video.publishedAt || video.firstSeenAt, true)}{video.publishedAt ? ' 发布' : ' 首次发现'}</span><h3>{video.title}</h3><p>点击上方其他日期可切换视频 · <a href={video.url} target="_blank" rel="noreferrer">打开原视频 ↗</a></p></div>
     </div>
-    <section className="comparisonMetricGrid">{ANALYTICS_METRICS.map((dimension) => {
-      const snapshotChange = snapshotMetricChange(video, snapshots, dimension.key);
-      const previousDelta = previousVideo ? calculateDelta(video[dimension.key], previousVideo[dimension.key]) : null;
-      const rank = metricRank(video, videos, dimension.key);
-      const snapshotText = snapshotChange.sampleCount < 2
-        ? snapshotChange.sampleCount === 1 ? '仅 1 次快照，暂不能计算增长' : '暂无快照变化数据'
-        : snapshotChange.delta ? formatDeltaDetail(snapshotChange.delta) : '首末快照缺少该指标';
-      const previousText = previousVideo
-        ? previousDelta ? formatDeltaDetail(previousDelta) : '当前或上一条视频数据不足'
-        : '无更早视频可比较';
-      return <article key={dimension.key} style={{ '--metric-color': dimension.color } as React.CSSProperties}>
-        <div className="comparisonMetricTitle"><span>{dimension.label}</span><b>{formatMetric(video[dimension.key])}</b></div>
-        <dl>
-          <div><dt>较首次快照</dt><dd className={deltaTone(snapshotChange.delta)}><span>{snapshotText}</span>{snapshotChange.sampleCount >= 2 && snapshotChange.firstCapturedAt && snapshotChange.latestCapturedAt ? <small>{formatTime(snapshotChange.firstCapturedAt)} → {formatTime(snapshotChange.latestCapturedAt)}</small> : null}</dd></div>
-          <div><dt>较上一条视频（各自最新值）</dt><dd className={deltaTone(previousDelta)}><span>{previousText}</span>{previousVideo && previousSequence ? <small title={previousVideo.title}>当前采集 {formatTime(video.lastSeenAt)} · 对比第 {previousSequence} 条 {formatTime(previousVideo.lastSeenAt)}</small> : null}</dd></div>
-          <div><dt>账号内排名</dt><dd><span>{rank ? `${rank} / ${videos.filter((candidate) => metricRank(candidate, videos, dimension.key) !== null).length}` : '无排名'}</span></dd></div>
-        </dl>
-      </article>;
-    })}</section>
+    <div className="selectedComparisonTableWrap">
+      <table className="selectedComparisonTable">
+        <thead><tr><th>指标</th><th>当前累计</th><th>首次记录后变化</th><th>比上一条视频</th><th>账号内排名</th></tr></thead>
+        <tbody>{ANALYTICS_METRICS.map((dimension) => {
+          const snapshotChange = snapshotMetricChange(video, snapshots, dimension.key);
+          const previousDelta = previousVideo ? calculateDelta(video[dimension.key], previousVideo[dimension.key]) : null;
+          const rank = metricRank(video, videos, dimension.key);
+          const validCount = videos.filter((candidate) => metricRank(candidate, videos, dimension.key) !== null).length;
+          const snapshotText = snapshotChange.sampleCount < 2
+            ? snapshotChange.sampleCount === 1 ? '等待下次采集' : '暂无历史记录'
+            : snapshotChange.delta ? formatDeltaDetail(snapshotChange.delta) : '首末记录缺少数据';
+          const previousText = previousVideo
+            ? previousDelta ? formatDeltaDetail(previousDelta) : '两条视频数据不足'
+            : '没有更早视频';
+          const snapshotTitle = snapshotChange.sampleCount >= 2 && snapshotChange.firstCapturedAt && snapshotChange.latestCapturedAt
+            ? `首次记录 ${formatTime(snapshotChange.firstCapturedAt)}；最近记录 ${formatTime(snapshotChange.latestCapturedAt)}`
+            : snapshotText;
+          const previousTitle = previousVideo
+            ? `对比对象：${formatCalendarDate(previousVideo.publishedAt || previousVideo.firstSeenAt, true)}${previousVideo.publishedAt ? ' 发布' : ' 首次发现'} · ${previousVideo.title}`
+            : previousText;
+          return <tr key={dimension.key} style={{ '--metric-color': dimension.color } as React.CSSProperties}>
+            <th scope="row"><i aria-hidden="true" /><span>{dimension.label}</span></th>
+            <td data-label="当前累计"><b>{formatMetric(video[dimension.key])}</b></td>
+            <td data-label="首次记录后变化" className={deltaTone(snapshotChange.delta)} title={snapshotTitle}>{snapshotText}</td>
+            <td data-label="比上一条视频" className={deltaTone(previousDelta)} title={previousTitle}><span>{previousText}</span>{previousVideo ? <small>对比 {formatCalendarDate(previousVideo.publishedAt || previousVideo.firstSeenAt)}{previousVideo.publishedAt ? '' : '*'}</small> : null}</td>
+            <td data-label="账号内排名">{rank ? `第 ${rank} 名 / 共 ${validCount} 条` : '无排名'}</td>
+          </tr>;
+        })}</tbody>
+      </table>
+    </div>
   </article>;
 }
 
