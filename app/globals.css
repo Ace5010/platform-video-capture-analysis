@@ -12,12 +12,13 @@
 
 * { box-sizing: border-box; }
 html, body { min-height: 100%; }
+html { scrollbar-gutter: stable; }
 body { margin: 0; background: var(--canvas); color: var(--ink); font-family: Arial, "Microsoft YaHei", sans-serif; font-size: 14px; line-height: 1.5; }
 button, input { font: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: .58; }
 
-.appShell { min-height: 100vh; display: grid; grid-template-columns: 236px 1fr; }
+.appShell { min-height: 100vh; display: grid; grid-template-columns: 236px minmax(0, 1fr); }
 .sidebar { position: fixed; inset: 0 auto 0 0; width: 236px; display: flex; flex-direction: column; padding: 26px 18px 20px; border-right: 1px solid #dededb; background: #eeefed; }
 .brand { display: flex; align-items: center; gap: 12px; padding: 0 8px 28px; }
 .brandMarkWrap { position: relative; display: grid; }
@@ -57,7 +58,7 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 .logoutButton { width: 100%; padding: 6px 12px; border: 0; background: transparent; color: #85827b; font-size: 11px; text-align: left; }
 .logoutButton:hover { color: #343330; }
 
-.workspace { grid-column: 2; width: min(1180px, calc(100% - 64px)); margin: 0 auto; padding: 48px 0 80px; }
+.workspace { grid-column: 2; min-width: 0; width: min(1180px, calc(100% - 64px)); margin: 0 auto; padding: 48px 0 80px; }
 .topbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 28px; }
 h1, h2, h3, p { margin-top: 0; }
 h1 { margin-bottom: 8px; font-size: clamp(27px, 2.4vw, 32px); line-height: 1.2; letter-spacing: -.025em; }
@@ -202,7 +203,7 @@ h1 { margin-bottom: 8px; font-size: clamp(27px, 2.4vw, 32px); line-height: 1.2; 
 .metricTabs button:hover, .metricSort button:hover { background: rgb(255 255 255 / 65%); color: var(--ink); }
 .metricTabs button.active { background: white; color: var(--ink); box-shadow: inset 0 -2px var(--metric-color), 0 1px 2px rgb(0 0 0 / 5%); }
 .metricSort button.active { background: #2f2f2c; color: white; }
-.metricBarChartScroll { margin-top: 16px; overflow-x: auto; border: 1px solid #eeeeea; border-radius: 9px; background: #fafaf8; }
+.metricBarChartScroll { width: 100%; min-width: 0; max-width: 100%; margin-top: 16px; overflow-x: auto; border: 1px solid #eeeeea; border-radius: 9px; background: #fafaf8; }
 .metricBarChart { display: block; height: 300px; }
 .metricGridLine { stroke: #deddd8; stroke-width: 1; }
 .metricAxisLabel, .metricVideoLabel { fill: #77756f; font: 10px Consolas, monospace; }
@@ -300,7 +301,7 @@ h1 { margin-bottom: 8px; font-size: clamp(27px, 2.4vw, 32px); line-height: 1.2; 
 .accessNotice { margin: 18px 0; padding: 12px 14px; border-radius: 8px; background: #f4f4f1; color: #55534f; font-size: 12px; line-height: 1.7; }
 
 @media (max-width: 920px) {
-  .appShell { grid-template-columns: 76px 1fr; }
+  .appShell { grid-template-columns: 76px minmax(0, 1fr); }
   .sidebar { width: 76px; padding-inline: 10px; }
   .brand { justify-content: center; padding-inline: 0; }
   .brandText, .brandText strong, .brandText small, .navLabel, .navItem:not(.active) { font-size: 0; }
