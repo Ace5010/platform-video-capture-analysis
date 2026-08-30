@@ -311,4 +311,23 @@ assert.equal(vm.runInContext("allowedMediaUrl('http://v.douyinvod.com/insecure')
 const ackIds = vm.runInContext("normalizeAckIds({ eventIds: ['a', 'b'], eventId: 'c', messageIds: ['a'] })", context);
 assert.deepEqual([...ackIds], ['a', 'b', 'c']);
 
+// A hidden tab may keep HTMLMediaElement.play() pending indefinitely. The
+// activation helper must still return so the network capture can finish.
+const hangingVideo = {
+  getClientRects: () => [{}],
+  muted: false,
+  preload: '',
+  currentSrc: 'https://v.douyinvod.com/target-video',
+  videoWidth: 1280,
+  videoHeight: 720,
+  duration: 10,
+  play: () => new Promise(() => {}),
+};
+context.document = { querySelectorAll: () => [hangingVideo] };
+context.location = { href: 'https://www.douyin.com/video/1234567890', pathname: '/video/1234567890' };
+const activationStartedAt = Date.now();
+const activation = await vm.runInContext("activateVerifiedVideoPlayback('1234567890', 100)", context);
+assert.equal(activation.targetMatches, true);
+assert.equal(Date.now() - activationStartedAt < 4_000, true, 'hanging background-tab play() blocked page execution');
+
 console.log('Connector validation passed: automatic auth repair, stale-lock recovery, authenticated queueing, full-video handoff, URL hygiene, and quality-first stream selection.');

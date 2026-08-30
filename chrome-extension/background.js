@@ -2268,6 +2268,16 @@ function errorMessage(error) {
 
 async function executeInTab(tabId, func, args = [], world = 'ISOLATED', timeoutMs = SCRIPT_EXECUTION_TIMEOUT_MS) {
   let timeout;
+  const stageLabels = {
+    waitForVideoDetailDom: '等待视频详情页数据',
+    extractVerifiedVideoMediaSources: '读取目标视频媒体源',
+    activateVerifiedVideoPlayback: '激活目标视频播放',
+    inspectVerifiedVideoTarget: '校验目标视频页面',
+    waitForAccountVideoDom: '等待账号主页数据',
+    extractAccountPageV3: '读取账号主页视频数据',
+    extractVideoDetailPage: '读取视频详情数据',
+  };
+  const stage = stageLabels[func?.name] || '页面数据读取';
   try {
     const [execution] = await Promise.race([
       chrome.scripting.executeScript({
@@ -2277,7 +2287,10 @@ async function executeInTab(tabId, func, args = [], world = 'ISOLATED', timeoutM
         args,
       }),
       new Promise((_, reject) => {
-        timeout = setTimeout(() => reject(new Error('页面数据读取超时，任务将自动释放后重试')), timeoutMs);
+        timeout = setTimeout(
+          () => reject(new Error(`${stage}超时（页面数据读取超时），任务将自动释放后重试`)),
+          timeoutMs,
+        );
       }),
     ]);
     return execution?.result;
@@ -3056,7 +3069,14 @@ function activateVideoPlayback(timeoutMs) {
     if (!video) return { found: false };
     video.muted = true;
     video.preload = 'auto';
-    try { await video.play(); } catch { /* media requests may already be active */ }
+    // Hidden tabs can leave HTMLMediaElement.play() pending forever while
+    // Chrome throttles background playback. It is only a trigger for the
+    // network request, not a prerequisite for reading currentSrc, so never
+    // await it in a background tab.
+    try {
+      const playResult = video.play();
+      playResult?.catch?.(() => {});
+    } catch { /* media requests may already be active */ }
     return { found: true, currentSrc: video.currentSrc || video.src || null };
   });
 }
@@ -3103,7 +3123,12 @@ function activateVerifiedVideoPlayback(expectedVideoId, timeoutMs) {
     }
     video.muted = true;
     video.preload = 'auto';
-    try { await video.play(); } catch { /* network media requests may already be active */ }
+    // See activateVideoPlayback: do not let a background-tab play() promise
+    // consume the whole page-script deadline.
+    try {
+      const playResult = video.play();
+      playResult?.catch?.(() => {});
+    } catch { /* network media requests may already be active */ }
     const duration = Number(video.duration);
     return {
       targetMatches: true,
