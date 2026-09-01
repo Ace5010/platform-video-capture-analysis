@@ -34,10 +34,8 @@ def default_data_dir() -> Path:
     explicit = os.environ.get("DOUYIN_HOST_DATA_DIR") or os.environ.get("DOUYIN_DATA_DIR")
     if explicit:
         return Path(explicit).expanduser().resolve()
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if local_app_data:
-        return Path(local_app_data) / "DouyinMonitor" / "host-service"
-    return Path.home() / ".douyin-monitor" / "host-service"
+    # Keep runtime data alongside the project so it can be moved as one folder.
+    return Path(__file__).resolve().parents[1] / "data" / "host-service"
 
 
 @dataclass(frozen=True)

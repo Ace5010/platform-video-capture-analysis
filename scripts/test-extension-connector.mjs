@@ -41,7 +41,7 @@ const chrome = {
     onInstalled: eventSlot(),
     onStartup: eventSlot(),
     onMessage: eventSlot(),
-    getManifest: () => ({ version: '0.7.0' }),
+    getManifest: () => ({ version: '0.8.0' }),
     getPlatformInfo: async () => ({ os: 'win' }),
   },
   alarms: {
@@ -131,6 +131,13 @@ for (let attempt = 0; attempt < 100 && !storageData.connectorState; attempt += 1
 assert.equal(alarms.get('douyin-monitor-connector-poll')?.periodInMinutes, 1);
 assert.equal(requestRecords.some((record) => record.pathname === '/connector/jobs/claim'), true);
 assert.equal(
+  requestRecords
+    .filter((record) => record.pathname === '/connector/heartbeat' || record.pathname === '/connector/jobs/claim')
+    .every((record) => record.body.extensionVersion === '0.8.0'),
+  true,
+  'connector heartbeat and claim did not report extension v0.8.0',
+);
+assert.equal(
   requestRecords.filter((record) => record.pathname !== '/connector/pair')
     .every((record) => record.authorization === 'Bearer connector-test-token'),
   true,
@@ -142,6 +149,11 @@ requestRecords.length = 0;
 await vm.runInContext('pollConnectorQueue()', context);
 assert.equal(storageData.connectorToken, 'paired-test-token', 'stale connector token was not replaced immediately');
 assert.equal(requestRecords.some((record) => record.pathname === '/connector/pair'), true);
+assert.equal(
+  requestRecords.find((record) => record.pathname === '/connector/pair')?.body.extensionVersion,
+  '0.8.0',
+  'connector pairing did not report extension v0.8.0',
+);
 assert.equal(
   requestRecords.some((record) => record.pathname === '/connector/heartbeat' && record.authorization === 'Bearer paired-test-token'),
   true,

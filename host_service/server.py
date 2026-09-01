@@ -23,6 +23,11 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
 from .analysis import AnalysisManager
+from .compatibility import (
+    CONNECTOR_FRESHNESS_SECONDS,
+    MINIMUM_ANALYSIS_EXTENSION_VERSION,
+    effective_connector_capabilities,
+)
 from .config import HostConfig
 from .database import CANONICAL_JOB_TYPES, Database, utc_now
 from .media import cleanup_stale_temp
@@ -440,10 +445,14 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                 if canonical_type == "analyze_video":
                     if not QwenClient(self.config, self.server.secrets.load()).configured:
                         raise ApiError(HTTPStatus.PRECONDITION_REQUIRED, "请先在主机 localhost 页面配置 Qwen API Key")
-                    if not self.database.connector_supports("analyze_video"):
+                    if not self.database.connector_supports(
+                        "analyze_video",
+                        min_version=MINIMUM_ANALYSIS_EXTENSION_VERSION,
+                        fresh_within_seconds=CONNECTOR_FRESHNESS_SECONDS,
+                    ):
                         raise ApiError(
                             HTTPStatus.PRECONDITION_REQUIRED,
-                            "主机 Chrome 组件尚未加载 AI 视频分析能力，请更新一次组件；之后会自动连接",
+                            f"主机 Chrome 需要已连接的 v{MINIMUM_ANALYSIS_EXTENSION_VERSION} 或更高版本组件，并具备 AI 视频分析能力",
                         )
                     video = self.database.get_video(str(job_payload.get("videoId") or ""))
                     if not video:
@@ -498,13 +507,18 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                 raise ApiError(HTTPStatus.FORBIDDEN, "扩展来源与 extensionId 不一致")
             connector_id = str(uuid.uuid4())
             connector_token = token_urlsafe(48)
+            extension_version = str(payload.get("extensionVersion") or "")
+            capabilities = effective_connector_capabilities(
+                extension_version,
+                payload.get("capabilities") if isinstance(payload.get("capabilities"), list) else [],
+            )
             self.database.pair_connector(
                 extension_id,
                 str(payload.get("label") or "主机 Chrome")[:128],
                 connector_id,
                 token_hash(connector_token),
-                str(payload.get("extensionVersion") or ""),
-                payload.get("capabilities") if isinstance(payload.get("capabilities"), list) else [],
+                extension_version,
+                capabilities,
                 str(payload.get("workerId") or ""),
             )
             self._send_json(
@@ -515,13 +529,18 @@ class HostRequestHandler(BaseHTTPRequestHandler):
         connector = self._connector()
         payload = self._read_json()
         if path == "/connector/jobs/claim":
-            capabilities = payload.get("capabilities")
-            if capabilities is not None and not isinstance(capabilities, list):
+            requested_capabilities = payload.get("capabilities")
+            if requested_capabilities is not None and not isinstance(requested_capabilities, list):
                 raise ApiError(HTTPStatus.BAD_REQUEST, "capabilities 必须是数组")
+            extension_version = str(payload.get("extensionVersion") or "")
+            capabilities = effective_connector_capabilities(
+                extension_version,
+                requested_capabilities if isinstance(requested_capabilities, list) else [],
+            )
             self.database.update_connector_runtime(
                 connector["id"],
-                extension_version=str(payload.get("extensionVersion") or ""),
-                capabilities=capabilities if isinstance(capabilities, list) else [],
+                extension_version=extension_version,
+                capabilities=capabilities,
                 worker_id=str(payload.get("workerId") or ""),
                 worker_status="polling",
             )
@@ -534,10 +553,16 @@ class HostRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"ok": True, "job": job})
         elif path == "/connector/heartbeat":
             job_id = payload.get("jobId")
+            extension_version = str(payload.get("extensionVersion") or "")
+            requested_capabilities = payload.get("capabilities")
+            capabilities = effective_connector_capabilities(
+                extension_version,
+                requested_capabilities if isinstance(requested_capabilities, list) else [],
+            ) if isinstance(requested_capabilities, list) else None
             self.database.update_connector_runtime(
                 connector["id"],
-                extension_version=str(payload.get("extensionVersion") or ""),
-                capabilities=payload.get("capabilities") if isinstance(payload.get("capabilities"), list) else None,
+                extension_version=extension_version,
+                capabilities=capabilities,
                 worker_id=str(payload.get("workerId") or ""),
                 worker_status=str(payload.get("status") or "idle"),
                 active_job_id=str(job_id) if job_id else None,
@@ -564,7 +589,6 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "job": job,
                     "accounts": accounts,
-                    "scheduler": {"periodMinutes": 360, "authoritative": True},
                     "serverTime": utc_now(),
                 },
             )

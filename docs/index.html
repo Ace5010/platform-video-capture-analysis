@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="平台视频抓取与分析：Windows 本机运行的抖音对标账号信息抓取与 AI 视频分析工具。" />
+    <title>平台视频抓取与分析</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="hero">
+      <nav class="nav shell" aria-label="主导航">
+        <a class="brand" href="#top" aria-label="返回顶部">
+          <span class="brand-mark">P</span>
+          <span>平台视频抓取与分析</span>
+        </a>
+        <a class="repo-link" href="https://github.com/Ace5010/platform-video-capture-analysis">查看源代码</a>
+      </nav>
+
+      <div id="top" class="hero-content shell">
+        <p class="eyebrow">LOCAL-FIRST CONTENT INTELLIGENCE</p>
+        <h1>把公开的视频数据，整理成可持续分析的本地资料库</h1>
+        <p class="lead">
+          一个面向抖音对标账号研究的 Windows 本机工作台。由 Chrome 扩展负责采集，
+          SQLite 保存长期数据，本地语音识别生成口播稿，用户主动选择后再调用 Qwen 分析完整原视频。
+        </p>
+        <div class="hero-actions">
+          <a class="primary" href="#quickstart">本机运行方式</a>
+          <a class="secondary" href="#architecture">了解工作流程</a>
+        </div>
+        <p class="deployment-note">
+          本页面是项目说明站。抓取、数据库、Chrome 登录状态和 AI 分析均在用户自己的 Windows 主机上运行，GitHub Pages 不承载业务数据。
+        </p>
+      </div>
+    </header>
+
+    <main>
+      <section class="section shell" aria-labelledby="status-title">
+        <div class="section-heading">
+          <p class="eyebrow">CURRENT STATUS</p>
+          <h2 id="status-title">当前实现范围</h2>
+          <p>抖音链路已经实现，其他平台只保留入口，没有把未完成能力包装成可用功能。</p>
+        </div>
+        <div class="status-grid">
+          <article class="status-card active">
+            <span class="status-dot"></span>
+            <h3>抖音</h3>
+            <p>账号建档、最新检查、互动快照、口播识别和完整视频 AI 分析。</p>
+          </article>
+          <article class="status-card reserved">
+            <span class="status-dot"></span>
+            <h3>预留平台</h3>
+            <p>小红书、哔哩哔哩和 YouTube 当前仅保留界面入口。</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section muted-section" aria-labelledby="features-title">
+        <div class="shell">
+          <div class="section-heading">
+            <p class="eyebrow">CAPABILITIES</p>
+            <h2 id="features-title">核心能力</h2>
+          </div>
+          <div class="feature-grid">
+            <article>
+              <span class="feature-index">01</span>
+              <h3>公开数据采集</h3>
+              <p>使用主机 Chrome 中已有的抖音登录状态，采集账号主页与公开视频数据。</p>
+            </article>
+            <article>
+              <span class="feature-index">02</span>
+              <h3>本地长期存储</h3>
+              <p>账号、视频、互动快照、口播稿和分析结果统一保存在本机 SQLite。</p>
+            </article>
+            <article>
+              <span class="feature-index">03</span>
+              <h3>完整视频分析</h3>
+              <p>校验目标视频 ID，保留完整媒体语义，不偷偷降级为关键帧或只分析文本。</p>
+            </article>
+            <article>
+              <span class="feature-index">04</span>
+              <h3>本地口播识别</h3>
+              <p>通过 faster-whisper 转写，使用本地标点模型改善可读性，不改写识别文字。</p>
+            </article>
+            <article>
+              <span class="feature-index">05</span>
+              <h3>任务恢复机制</h3>
+              <p>任务采用队列、租约、心跳与幂等事件，扩展重启或短暂断线后可以继续。</p>
+            </article>
+            <article>
+              <span class="feature-index">06</span>
+              <h3>局域网工作台</h3>
+              <p>同一可信局域网内的其他设备可以登录工作台并向主机提交任务。</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="architecture" class="section shell" aria-labelledby="architecture-title">
+        <div class="section-heading">
+          <p class="eyebrow">ARCHITECTURE</p>
+          <h2 id="architecture-title">工作流程</h2>
+        </div>
+        <ol class="flow">
+          <li><span>1</span><div><strong>网页工作台</strong><p>提交采集或分析任务，查看账号、视频和趋势。</p></div></li>
+          <li><span>2</span><div><strong>Python 主机服务</strong><p>负责认证、任务队列、SQLite、媒体处理和 AI 编排。</p></div></li>
+          <li><span>3</span><div><strong>Chrome 扩展</strong><p>利用主机登录状态采集公开页面，并校验目标媒体。</p></div></li>
+          <li><span>4</span><div><strong>本地 ASR 与 Qwen</strong><p>本机生成口播稿；只有主动分析时才向百炼发送完整视频和相关文本。</p></div></li>
+        </ol>
+      </section>
+
+      <section id="quickstart" class="section quickstart" aria-labelledby="quickstart-title">
+        <div class="shell quickstart-grid">
+          <div>
+            <p class="eyebrow">QUICK START</p>
+            <h2 id="quickstart-title">在 Windows 本机运行</h2>
+            <p>需要 Node.js、Python 3、FFmpeg/ffprobe，以及支持 Manifest V3 的 Chrome。</p>
+          </div>
+          <div class="code-card" aria-label="安装和启动命令">
+            <pre><code>npm install
+npm run setup:asr
+npm run dev</code></pre>
+            <p>工作台：<code>http://localhost:3000</code></p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section shell" aria-labelledby="privacy-title">
+        <div class="privacy-card">
+          <div>
+            <p class="eyebrow">PRIVACY BOUNDARY</p>
+            <h2 id="privacy-title">重要数据不进入公开仓库</h2>
+          </div>
+          <ul>
+            <li>SQLite、API Key、模型、临时媒体和本机运行目录均由 Git 忽略。</li>
+            <li>Qwen API Key 使用 Windows 当前用户 DPAPI 加密保存。</li>
+            <li>普通采集不调用云端模型；完整视频分析只在用户主动触发后执行。</li>
+            <li>自动测试使用假 Key、临时数据库和模拟分析，不调用真实 Qwen。</li>
+          </ul>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="shell footer-inner">
+        <p>平台视频抓取与分析</p>
+        <a href="https://github.com/Ace5010/platform-video-capture-analysis">GitHub Repository</a>
+      </div>
+    </footer>
+  </body>
+</html>

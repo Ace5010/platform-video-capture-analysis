@@ -104,7 +104,6 @@
           activeJobId: response.activeJobId || null,
           collectionInProgress: Boolean(response.collectionInProgress),
           pendingCount: Array.isArray(response.pendingResults) ? response.pendingResults.length : 0,
-          schedulerState: response.schedulerState || null,
         });
         for (const pendingResult of response.pendingResults || []) {
           postToPage(pendingResult);
@@ -131,7 +130,6 @@
         );
         return;
       }
-      if (response?.schedulerState) postToPage({ type: 'SCHEDULER_STATE', schedulerState: response.schedulerState });
     });
   }
 

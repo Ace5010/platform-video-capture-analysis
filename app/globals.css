@@ -43,9 +43,11 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 .brandText small { margin-top: 3px; color: #77756f; font-size: 12px; }
 .navLabel { margin: 0 12px 9px; color: #85827b; font-size: 12px; font-weight: 700; }
 .navigation { display: flex; flex-direction: column; gap: 5px; }
-.navItem { display: flex; align-items: center; gap: 11px; width: 100%; min-height: 42px; padding: 0 12px; border: 0; border-radius: 9px; background: transparent; color: #66645f; text-align: left; }
+.navItem { position: relative; display: flex; align-items: center; gap: 11px; width: 100%; min-height: 42px; padding: 0 12px; border: 0; border-radius: 9px; background: transparent; color: #66645f; text-align: left; }
 .navItem:hover { background: #f7f7f5; color: var(--ink); }
 .navItem.active { background: white; color: var(--ink); font-weight: 700; box-shadow: 0 1px 2px rgb(0 0 0 / 5%); }
+.navText { min-width: 0; }
+.navUpdateBadge { min-width: 20px; margin-left: auto; padding: 2px 6px; border-radius: 999px; background: #d94b43; color: white; font-size: 10px; font-weight: 800; line-height: 16px; text-align: center; }
 .navIcon { display: grid; place-items: center; width: 18px; height: 18px; font-size: 12px; font-weight: 800; }
 .sidebarFoot { margin-top: auto; }
 .localStatus { display: flex; gap: 10px; padding: 13px 12px; border: 1px solid #dededb; border-radius: 10px; background: rgb(255 255 255 / 45%); }
@@ -54,7 +56,6 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 .localStatus b, .localStatus small { display: block; }
 .localStatus b { font-size: 13px; }
 .localStatus small { margin-top: 4px; color: #77756f; font-size: 11px; }
-.scheduleSummary { width: 100%; margin-top: 10px; padding: 10px 12px; color: #77756f; font-size: 12px; }
 .logoutButton { width: 100%; padding: 6px 12px; border: 0; background: transparent; color: #85827b; font-size: 11px; text-align: left; }
 .logoutButton:hover { color: #343330; }
 
@@ -64,10 +65,6 @@ h1, h2, h3, p { margin-top: 0; }
 h1 { margin-bottom: 8px; font-size: clamp(27px, 2.4vw, 32px); line-height: 1.2; letter-spacing: -.025em; }
 .subtitle { margin-bottom: 0; color: var(--muted); font-size: 14px; }
 .topActions { display: flex; align-items: center; gap: 10px; }
-.nextRun { min-width: 95px; padding-right: 8px; }
-.nextRun span, .nextRun b { display: block; }
-.nextRun span { margin-bottom: 4px; color: #85827b; font-size: 12px; }
-.nextRun b { font-size: 14px; }
 .qwenControl { display: grid; min-width: 108px; min-height: 40px; align-content: center; padding: 4px 11px; border: 1px solid #deddd9; border-radius: 8px; background: white; color: #55534f; text-align: left; }
 .qwenControl span, .qwenControl b { display: block; }
 .qwenControl span { color: #85827b; font-size: 10px; line-height: 1.2; }
@@ -92,13 +89,12 @@ h1 { margin-bottom: 8px; font-size: clamp(27px, 2.4vw, 32px); line-height: 1.2; 
 .collectionHeader { display: flex; justify-content: space-between; gap: 20px; }
 .collectionHeader h2 { margin-bottom: 6px; font-size: 18px; }
 .collectionHeader div > span { color: #77756f; font-size: 13px; }
-.schedulerStatusGrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 18px; padding-top: 16px; border-top: 1px solid #ecebe7; }
-.schedulerStatusGrid > span { min-width: 0; padding: 10px 11px; border-radius: 8px; background: #f6f6f3; }
-.schedulerStatusGrid small, .schedulerStatusGrid b { display: block; }
-.schedulerStatusGrid small { margin-bottom: 6px; color: #85827b; font-size: 11px; }
-.schedulerStatusGrid b { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
-.schedulerStatusGrid .schedulerHealthy { color: var(--green); }
-.schedulerNote { margin: 12px 0 0; color: #77756f; font-size: 12px; line-height: 1.65; }
+.taskStatusGrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 18px; padding-top: 16px; border-top: 1px solid #ecebe7; }
+.taskStatusGrid > span { min-width: 0; padding: 10px 11px; border-radius: 8px; background: #f6f6f3; }
+.taskStatusGrid small, .taskStatusGrid b { display: block; }
+.taskStatusGrid small { margin-bottom: 6px; color: #85827b; font-size: 11px; }
+.taskStatusGrid b { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.taskNote { margin: 12px 0 0; color: #77756f; font-size: 12px; line-height: 1.65; }
 .sectionHeading { display: flex; align-items: end; justify-content: space-between; margin: 36px 0 14px; }
 .sectionHeading h2 { margin: 0; font-size: 20px; line-height: 1.35; }
 .sectionHeading > span { color: #77756f; font-size: 12px; }
@@ -157,6 +153,10 @@ h1 { margin-bottom: 8px; font-size: clamp(27px, 2.4vw, 32px); line-height: 1.2; 
 .accountCard h3 { margin: 18px 0 7px; font-size: 16px; }
 .accountCard > a { color: #66645f; font-size: 12px; text-decoration: none; }
 .accountCard > a:hover, .videoCopy a:hover { color: var(--ink); text-decoration: underline; }
+.accountUpdateNotice { margin-top: 14px; padding: 9px 11px; border: 1px solid #d8d6d0; border-radius: 8px; background: #f6f6f3; color: #66645f; font-size: 12px; font-weight: 700; }
+.accountUpdateNotice.updated { border-color: #efb5b0; background: #fff3f1; color: #b33c35; }
+.accountUpdateNotice.none { border-color: #c8ddd6; background: #f1f8f5; color: #397763; }
+.accountUpdateNotice.checking { border-color: #b8d4e7; background: #edf7fc; color: #32749a; }
 .accountMeta { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 22px; padding: 13px; border-radius: 8px; background: #f6f6f3; }
 .accountMeta small, .accountMeta b { display: block; }
 .accountMeta small { margin-bottom: 5px; color: #85827b; font-size: 11px; }
@@ -284,6 +284,28 @@ h1 { margin-bottom: 8px; font-size: clamp(27px, 2.4vw, 32px); line-height: 1.2; 
 .analysisFields section.wide { grid-column: 1 / -1; }
 .analysisFields small { display: block; color: #77756f; font-size: 11px; font-weight: 700; }
 .analysisFields p { margin-top: 6px; font-size: 12px; line-height: 1.7; }
+.analysisUsage { margin-top: 12px; padding: 12px; border: 1px solid #dfe7e2; border-radius: 7px; background: rgb(255 255 255 / 78%); }
+.analysisUsageHeader { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
+.analysisUsageHeader b { color: #343330; font-size: 12px; }
+.analysisUsageHeader small { color: #85827b; font-size: 10px; }
+.analysisUsageGrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+.analysisUsageGrid span { min-width: 0; padding: 8px; border-radius: 6px; background: #f4f7f5; }
+.analysisUsageGrid small, .analysisUsageGrid b { display: block; }
+.analysisUsageGrid small { color: #77756f; font-size: 10px; line-height: 1.35; }
+.analysisUsageGrid b { margin-top: 5px; overflow: hidden; color: #343330; font: 700 12px/1.35 Consolas, monospace; text-overflow: ellipsis; }
+.analysisPane .analysisUsageNote, .analysisPane .analysisUsageUnavailable, .analysisPane .analysisRequestIds { color: #77756f; font-size: 11px; line-height: 1.65; }
+.analysisPane .analysisUsageNote { margin-top: 9px; }
+.analysisPane .analysisRequestIds { margin: 9px 0 0; overflow-wrap: anywhere; }
+.analysisBillingLink { display: inline-block; margin-top: 7px; color: #356b58; font-size: 11px; text-decoration: none; }
+.analysisBillingLink:hover { text-decoration: underline; }
+.analysisPane .analysisUsageUnavailable { padding: 10px 12px; border-radius: 7px; background: #f5f5f2; }
+.analysisRunHistory { margin-top: 12px; padding-top: 12px; border-top: 1px solid #e6e5e0; }
+.analysisRunList { display: grid; gap: 6px; }
+.analysisRunItem { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.5fr); gap: 12px; padding: 8px 10px; border-radius: 6px; background: #f5f5f2; }
+.analysisRunItem span { min-width: 0; }
+.analysisRunItem b, .analysisRunItem small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.analysisRunItem b { color: #4a4945; font-size: 11px; }
+.analysisRunItem small { margin-top: 3px; color: #85827b; font-size: 10px; }
 .emptyBoard.compact { min-height: 330px; }
 .toast { position: fixed; z-index: 20; right: 24px; bottom: 24px; max-width: 380px; padding: 13px 16px; border: 1px solid #3c3c39; border-radius: 9px; background: #1d1d1b; color: white; font-size: 13px; box-shadow: 0 10px 35px rgb(0 0 0 / 20%); }
 
@@ -309,23 +331,23 @@ h1 { margin-bottom: 8px; font-size: clamp(27px, 2.4vw, 32px); line-height: 1.2; 
   .sidebar { width: 76px; padding-inline: 10px; }
   .brand { justify-content: center; padding-inline: 0; }
   .brandText, .brandText strong, .brandText small, .navLabel, .navItem:not(.active) { font-size: 0; }
+  .navUpdateBadge { position: absolute; top: 2px; right: 2px; min-width: 16px; padding: 0 4px; font-size: 9px; line-height: 16px; }
   .platformMenu { font-size: 13px; }
   .navItem { justify-content: center; padding: 0; }
   .navItem.active { font-size: 0; }
   .navIcon { font-size: 12px; }
-  .localStatus span, .scheduleSummary, .logoutButton { display: none; }
+  .localStatus span, .logoutButton { display: none; }
   .localStatus { justify-content: center; padding: 14px; }
   .workspace { grid-column: 2; width: calc(100% - 36px); }
   .statsGrid { grid-template-columns: repeat(2, 1fr); }
   .topbar { align-items: flex-start; flex-direction: column; }
   .topActions { width: 100%; }
-  .nextRun { margin-right: auto; }
   .accountGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .accountSelector { grid-template-columns: 1fr; }
   .analysisStats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .metricComparisonHeader { flex-direction: column; }
   .metricControls { width: 100%; justify-content: space-between; }
-  .schedulerStatusGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .taskStatusGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 620px) {
@@ -341,11 +363,12 @@ h1 { margin-bottom: 8px; font-size: clamp(27px, 2.4vw, 32px); line-height: 1.2; 
   .sidebarFoot { display: none; }
   .workspace { width: calc(100% - 28px); padding-top: 26px; }
   .topActions { flex-wrap: wrap; }
-  .nextRun { width: 100%; }
   .statsGrid { grid-template-columns: 1fr 1fr; margin-top: 28px; }
   .statCard { min-height: 116px; padding: 16px; }
   .collectionHeader { align-items: flex-start; }
-  .schedulerStatusGrid { grid-template-columns: 1fr 1fr; }
+  .taskStatusGrid { grid-template-columns: 1fr 1fr; }
+  .analysisUsageGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .analysisRunItem { grid-template-columns: 1fr; gap: 7px; }
   .accountGrid { grid-template-columns: 1fr; }
   .platformGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .analyticsViewTabs { gap: 7px; }

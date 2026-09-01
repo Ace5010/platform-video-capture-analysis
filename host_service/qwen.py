@@ -43,6 +43,19 @@ QWEN_VIDEO_MIN_PIXELS = 65_536
 QWEN_VIDEO_MAX_PIXELS = 2_048_000
 QWEN_VIDEO_TOTAL_PIXELS = 819_200_000
 
+# Official qwen3.8-flash list prices for the endpoint used by this app
+# (China North 2 / Beijing), checked 2026-08-31. Persist the rate snapshot with
+# every run so future price changes never rewrite historical estimates.
+QWEN38_FLASH_BEIJING_PRICING = {
+    "currency": "CNY",
+    "region": "cn-beijing",
+    "inputPerMillion": 0.8,
+    "cachedInputPerMillion": 0.1,
+    "outputPerMillion": 2.7,
+    "checkedAt": "2026-08-31",
+    "source": "https://help.aliyun.com/zh/model-studio/qwen3-8-flash",
+}
+
 
 class QwenError(RuntimeError):
     pass
@@ -124,6 +137,9 @@ class QwenClient:
     def __init__(self, config: HostConfig, secret: dict[str, Any] | None) -> None:
         self.config = config
         self.secret = secret or {}
+        self._usage_records: list[dict[str, Any]] = []
+        self._model_request_attempts = 0
+        self._usage_incomplete = False
         if config.mock_qwen and not config.testing:
             raise RuntimeError("Qwen Mock 只能在 DOUYIN_HOST_TESTING=1 时启用")
 
@@ -149,6 +165,155 @@ class QwenClient:
         ):
             raise QwenError("千问接口地址必须是阿里云官方 HTTPS 域名")
         return endpoint
+
+    @staticmethod
+    def _usage_integer(value: Any) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _reported_usage_integer(value: Any) -> int | None:
+        """Accept only provider-reported, non-negative integer token counts."""
+
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        return value
+
+    def _record_usage(self, response: dict[str, Any]) -> bool:
+        usage = response.get("usage")
+        if not isinstance(usage, dict):
+            self._usage_incomplete = True
+            return False
+        prompt_tokens = self._reported_usage_integer(usage.get("prompt_tokens"))
+        completion_tokens = self._reported_usage_integer(usage.get("completion_tokens"))
+        total_tokens = self._reported_usage_integer(usage.get("total_tokens"))
+        if (
+            prompt_tokens is None
+            or completion_tokens is None
+            or total_tokens is None
+            or total_tokens != prompt_tokens + completion_tokens
+            or total_tokens == 0
+        ):
+            self._usage_incomplete = True
+            return False
+
+        details_complete = True
+        prompt_details = usage.get("prompt_tokens_details")
+        if prompt_details is None:
+            prompt_details = {}
+        elif not isinstance(prompt_details, dict):
+            details_complete = False
+            prompt_details = {}
+        completion_details = usage.get("completion_tokens_details")
+        if completion_details is None:
+            completion_details = {}
+        elif not isinstance(completion_details, dict):
+            details_complete = False
+            completion_details = {}
+
+        detail_values: dict[str, int] = {}
+        for target, source, container in (
+            ("videoTokens", "video_tokens", prompt_details),
+            ("imageTokens", "image_tokens", prompt_details),
+            ("audioTokens", "audio_tokens", prompt_details),
+            ("textTokens", "text_tokens", prompt_details),
+            ("cachedTokens", "cached_tokens", prompt_details),
+            ("reasoningTokens", "reasoning_tokens", completion_details),
+        ):
+            raw_value = container.get(source)
+            if raw_value is None:
+                detail_values[target] = 0
+                continue
+            parsed_value = self._reported_usage_integer(raw_value)
+            if parsed_value is None:
+                details_complete = False
+                detail_values[target] = 0
+            else:
+                detail_values[target] = parsed_value
+        if detail_values["cachedTokens"] > prompt_tokens or detail_values["reasoningTokens"] > completion_tokens:
+            details_complete = False
+        if not details_complete:
+            self._usage_incomplete = True
+
+        self._usage_records.append(
+            {
+                "requestId": str(response.get("id") or "")[:256] or None,
+                "model": str(response.get("model") or self._model())[:128],
+                "promptTokens": prompt_tokens,
+                "completionTokens": completion_tokens,
+                "totalTokens": total_tokens,
+                **detail_values,
+            }
+        )
+        return details_complete
+
+    def usage_summary(self) -> dict[str, Any]:
+        """Return exact API token counts plus a clearly labeled list-price estimate."""
+
+        records = list(self._usage_records)
+        requested_model = self._model()
+        response_models = sorted({str(item.get("model")) for item in records if item.get("model")})
+        summary: dict[str, Any] = {
+            "provider": "Alibaba Cloud Model Studio",
+            "model": requested_model,
+            "requestedModel": requested_model,
+            "responseModels": response_models,
+            "requestCount": len(records),
+            "requestIds": [item["requestId"] for item in records if item.get("requestId")],
+        }
+        for field in (
+            "promptTokens",
+            "completionTokens",
+            "totalTokens",
+            "videoTokens",
+            "imageTokens",
+            "audioTokens",
+            "textTokens",
+            "cachedTokens",
+            "reasoningTokens",
+        ):
+            summary[field] = sum(self._usage_integer(item.get(field)) for item in records)
+
+        endpoint = str(self.secret.get("endpoint") or self.config.qwen_endpoint)
+        endpoint_host = (urlsplit(endpoint).hostname or "").lower()
+        summary["attemptedRequestCount"] = self._model_request_attempts
+        summary["usageComplete"] = not self._usage_incomplete and self._model_request_attempts == len(records)
+        if not summary["usageComplete"]:
+            summary.update(
+                {
+                    "estimatedCostCny": None,
+                    "pricing": dict(QWEN38_FLASH_BEIJING_PRICING) if requested_model == "qwen3.8-flash" and endpoint_host == "dashscope.aliyuncs.com" else None,
+                    "billingNote": "模型请求可能已被服务端受理，但本机未收到完整用量；费用必须到百炼账单核对。",
+                }
+            )
+            return summary
+        if requested_model == "qwen3.8-flash" and endpoint_host == "dashscope.aliyuncs.com":
+            pricing = dict(QWEN38_FLASH_BEIJING_PRICING)
+            cached_tokens = min(summary["promptTokens"], summary["cachedTokens"])
+            uncached_tokens = max(0, summary["promptTokens"] - cached_tokens)
+            estimated_cost = (
+                uncached_tokens * pricing["inputPerMillion"]
+                + cached_tokens * pricing["cachedInputPerMillion"]
+                + summary["completionTokens"] * pricing["outputPerMillion"]
+            ) / 1_000_000
+            summary.update(
+                {
+                    "estimatedCostCny": round(estimated_cost, 8),
+                    "pricing": pricing,
+                    "billingNote": "按官网原价估算；免费额度、套餐抵扣、活动优惠及账单舍入可能改变实际扣款。",
+                }
+            )
+        else:
+            summary.update(
+                {
+                    "estimatedCostCny": None,
+                    "pricing": None,
+                    "billingNote": "当前模型或地域没有内置单价快照，仅记录真实 Token；实际扣款请以百炼账单为准。",
+                }
+            )
+        return summary
 
     def _json_request(
         self,
@@ -308,35 +473,49 @@ class QwenClient:
                 }
             )
         request_content = [*content, {"type": "text", "text": prompt}]
-        response = self._json_request(
-            self._endpoint(),
-            "POST",
-            {
-                "Authorization": f"Bearer {self._api_key()}",
-                "Content-Type": "application/json",
-                "X-DashScope-OssResourceResolve": "enable",
-            },
-            {
-                "model": self._model(),
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": request_content},
-                ],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {"name": "video_analysis", "strict": True, "schema": ANALYSIS_SCHEMA},
+        endpoint = self._endpoint()
+        api_key = self._api_key()
+        model = self._model()
+        self._model_request_attempts += 1
+        try:
+            response = self._json_request(
+                endpoint,
+                "POST",
+                {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "X-DashScope-OssResourceResolve": "enable",
                 },
-                # Qwen3.8-Flash supports JSON Schema in thinking mode. Keep
-                # thinking enabled for content-analysis quality and use the
-                # documented minimum visual temperature explicitly.
-                "enable_thinking": True,
-                "temperature": 0.6,
-            },
-            timeout=1200,
-            # A timeout can happen after the provider accepted the request.
-            # Never resubmit a billable full-video inference automatically.
-            retry_network_once=False,
-        )
+                {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": request_content},
+                    ],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {"name": "video_analysis", "strict": True, "schema": ANALYSIS_SCHEMA},
+                    },
+                    # Qwen3.8-Flash supports JSON Schema in thinking mode. Keep
+                    # thinking enabled for content-analysis quality and use the
+                    # documented minimum visual temperature explicitly.
+                    "enable_thinking": True,
+                    "temperature": 0.6,
+                },
+                timeout=1200,
+                # A timeout can happen after the provider accepted the request.
+                # Never resubmit a billable full-video inference automatically.
+                retry_network_once=False,
+            )
+        except QwenBudgetExceeded:
+            # A visual-budget rejection is still a provider attempt with no
+            # complete usage receipt. Keep it in the immutable cost audit.
+            self._usage_incomplete = True
+            raise
+        except QwenError:
+            self._usage_incomplete = True
+            raise
+        self._record_usage(response)
         try:
             content_value = response["choices"][0]["message"]["content"]
             if isinstance(content_value, str):

@@ -1,14 +1,17 @@
-"""Lightweight punctuation restoration for local Chinese ASR output.
+"""Local punctuation restoration for Chinese ASR output.
 
-The recognizer remains the source of the words.  This module only restores
-readable Chinese punctuation from segment boundaries and pauses; it does not
-call a remote model or rewrite the recognized wording.
+The recognizer remains the source of every word. A local CT-Transformer only
+predicts punctuation; its output is rejected unless the non-punctuation
+characters exactly match the recognizer text. No transcript leaves the host.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import threading
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 from typing import Any
 
 
@@ -47,6 +50,10 @@ _CLAUSE_MARKERS = (
     "首先",
     "其次",
 )
+_PUNCTUATOR: Any | None = None
+_PUNCTUATOR_FAILED = False
+_PUNCTUATOR_LOCK = threading.Lock()
+_PUNCTUATOR_RUN_LOCK = threading.Lock()
 
 
 def _clean_text(value: Any) -> str:
@@ -60,6 +67,11 @@ def _clean_text(value: Any) -> str:
     # Chinese ASR sometimes inserts spaces between adjacent Han characters
     # while leaving useful spaces around Latin words and numbers intact.
     text = re.sub(r"(?<=[\u3400-\u4dbf\u4e00-\u9fff])\s+(?=[\u3400-\u4dbf\u4e00-\u9fff])", "", text)
+    # A punctuation model can occasionally append a mark next to one already
+    # inferred from an ASR pause. Keep the stronger sentence mark and discard
+    # only the impossible mixed sequence (for example "。，" or "？。").
+    text = re.sub(r"([。！？；])[，。！？；：、]+", r"\1", text)
+    text = re.sub(r"[，：、]+([。！？；])", r"\1", text)
     text = re.sub(r"([，。！？；：、])\1+", r"\1", text)
     return text
 
@@ -82,56 +94,120 @@ def _number(value: Any) -> float | None:
     return number if number >= 0 else None
 
 
-def _insert_clause_marks(text: str, minimum_prefix: int = 8) -> str:
-    """Add commas before clear discourse markers in an unsegmented transcript."""
+def punctuation_model_path() -> Path:
+    configured = (os.environ.get("DOUYIN_PUNCTUATION_MODEL") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path(__file__).resolve().parents[1] / "data" / "models" / "punctuation" / "model.int8.onnx"
 
-    if not text or any(mark in text for mark in _PUNCTUATION):
+
+def _get_local_punctuator() -> Any | None:
+    global _PUNCTUATOR, _PUNCTUATOR_FAILED
+    if _PUNCTUATOR is not None:
+        return _PUNCTUATOR
+    if _PUNCTUATOR_FAILED:
+        return None
+    with _PUNCTUATOR_LOCK:
+        if _PUNCTUATOR is not None:
+            return _PUNCTUATOR
+        model_path = punctuation_model_path()
+        if not model_path.is_file():
+            _PUNCTUATOR_FAILED = True
+            return None
+        try:
+            import sherpa_onnx
+
+            config = sherpa_onnx.OfflinePunctuationConfig(
+                model=sherpa_onnx.OfflinePunctuationModelConfig(
+                    ct_transformer=str(model_path),
+                    num_threads=2,
+                    debug=False,
+                    provider="cpu",
+                )
+            )
+            _PUNCTUATOR = sherpa_onnx.OfflinePunctuation(config)
+        except (ImportError, RuntimeError, ValueError, OSError):
+            _PUNCTUATOR_FAILED = True
+            return None
+    return _PUNCTUATOR
+
+
+def _recognized_characters(text: str) -> str:
+    return "".join(
+        character
+        for character in text
+        if character not in _PUNCTUATION and character != "…" and not character.isspace()
+    )
+
+
+def _has_readable_punctuation(text: str) -> bool:
+    """Avoid running the model repeatedly over an already restored transcript."""
+
+    plain_length = len(_recognized_characters(text))
+    if plain_length == 0:
+        return True
+    mark_count = sum(text.count(mark) for mark in _PUNCTUATION.union({"…"}))
+    longest_run = max(
+        (len(_recognized_characters(part)) for part in re.split(r"[，。！？；：、…]", text)),
+        default=plain_length,
+    )
+    minimum_marks = max(1, (plain_length + 59) // 60)
+    return mark_count >= minimum_marks and longest_run <= 48
+
+
+def _restore_with_local_model(text: str) -> str | None:
+    punctuator = _get_local_punctuator()
+    if punctuator is None:
+        return None
+    # Keep punctuation inferred from ASR segment pauses. CT-Transformer accepts
+    # existing marks and fills the gaps around them; stripping them here would
+    # throw away the recognizer's stronger timing signal.
+    if not text.strip():
+        return None
+    try:
+        with _PUNCTUATOR_RUN_LOCK:
+            restored = _clean_text(punctuator.add_punctuation(text))
+    except (RuntimeError, ValueError, OSError):
+        return None
+    if _recognized_characters(restored) != _recognized_characters(text):
+        return None
+    return restored
+
+
+def _insert_clause_marks(text: str, minimum_prefix: int = 8) -> str:
+    """Add commas before discourse markers, including in lightly punctuated text."""
+
+    if not text:
         return text
     result: list[str] = []
     cursor = 0
-    last_break = 0
+    run_length = 0
     while cursor < len(text):
         marker = next((item for item in _CLAUSE_MARKERS if text.startswith(item, cursor)), None)
-        if marker and cursor - last_break >= minimum_prefix:
-            result.append(text[last_break:cursor].rstrip())
-            result.append("，")
-            last_break = cursor
+        if marker:
+            if run_length >= minimum_prefix and result and result[-1] not in _PUNCTUATION:
+                result.append("，")
+                run_length = 0
+            result.append(marker)
+            run_length += len(marker)
             cursor += len(marker)
             continue
+        character = text[cursor]
+        result.append(character)
+        run_length = 0 if character in _PUNCTUATION or character == "…" else run_length + 1
         cursor += 1
-    result.append(text[last_break:])
     return "".join(result)
 
 
 def restore_transcript_text(text: str | None) -> str:
-    """Normalize an already concatenated transcript and guarantee punctuation."""
+    """Restore punctuation locally without changing recognized characters."""
 
     cleaned = _clean_text(text)
     if not cleaned:
         return ""
-    if not any(mark in cleaned for mark in _PUNCTUATION):
-        cleaned = _insert_clause_marks(cleaned)
-        # Without segment timing, split very long clauses at the nearest comma
-        # so an older saved transcript remains readable instead of one wall of
-        # text. The words and their order are unchanged.
-        if "，" in cleaned:
-            pieces = cleaned.split("，")
-            rebuilt: list[str] = []
-            current: list[str] = []
-            current_length = 0
-            for piece in pieces:
-                if current and current_length + 1 + len(piece) >= 42:
-                    rebuilt.append("".join(current) + "。")
-                    current = []
-                    current_length = 0
-                if current:
-                    current.append("，")
-                    current_length += 1
-                current.append(piece)
-                current_length += len(piece)
-            if current:
-                rebuilt.append("".join(current))
-            cleaned = "".join(rebuilt)
+    if not _has_readable_punctuation(cleaned):
+        restored = _restore_with_local_model(cleaned)
+        cleaned = restored if restored is not None else _insert_clause_marks(cleaned)
     if not _ends_with_punctuation(cleaned):
         cleaned = f"{cleaned}。"
     return cleaned

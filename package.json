@@ -1,6 +1,6 @@
 {
   "name": "douyin-competitor-monitor",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
@@ -14,6 +14,7 @@
     "test:asr": ".venv\\Scripts\\python.exe scripts/test-local-asr.py",
     "test:host": ".venv\\Scripts\\python.exe scripts/test-host-service.py",
     "test:scheduler": "node scripts/test-extension-scheduler.mjs",
+    "test:extension-compatibility": "node --experimental-strip-types scripts/test-extension-compatibility.ts",
     "test:video-analytics": "node --experimental-strip-types scripts/test-video-analytics.ts",
     "build": "vinext build",
     "start": "vinext start",

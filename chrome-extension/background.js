@@ -1,13 +1,12 @@
-const SIX_HOURS_MINUTES = 360;
-const ALARM_NAME = 'douyin-monitor-six-hour-check';
+const LEGACY_SCHEDULE_ALARM_NAME = 'douyin-monitor-six-hour-check';
 const WATCHDOG_ALARM_NAME = 'douyin-monitor-collection-watchdog';
 const CONNECTOR_ALARM_NAME = 'douyin-monitor-connector-poll';
 const WATCHDOG_DELAY_MINUTES = 1;
 const CONNECTOR_POLL_MINUTES = 1;
 const CONNECTOR_CAPABILITIES = ['collect_latest', 'archive_account', 'analyze_video'];
-const SCHEDULER_STATE_KEY = 'schedulerState';
 const COLLECTION_LOCK_KEY = 'collectionLock';
-const SCHEDULED_CATCH_UP_KEY = 'scheduledCatchUp';
+const LEGACY_SCHEDULER_STATE_KEY = 'schedulerState';
+const LEGACY_SCHEDULED_CATCH_UP_KEY = 'scheduledCatchUp';
 const CONNECTOR_TOKEN_KEY = 'connectorToken';
 const CONNECTOR_STATE_KEY = 'connectorState';
 const CONNECTOR_OUTBOX_KEY = 'connectorEventOutbox';
@@ -44,15 +43,11 @@ let collectionInProgress = false;
 let connectorPollInProgress = false;
 let connectorPairPromise = null;
 let activeConnectorJob = null;
-let schedulerInitializationPromise = null;
 const WORKER_INSTANCE_ID = createMessageId();
 
 chrome.runtime.onInstalled.addListener(async () => {
-  try {
-    await initializeScheduler({ allowCatchUp: true });
-  } finally {
-    await initializeConnector();
-  }
+  await disableLegacyScheduledCollection();
+  await initializeConnector();
   const stored = await chrome.storage.local.get('pendingResults');
   if (!Array.isArray(stored.pendingResults)) {
     await chrome.storage.local.set({ pendingResults: [] });
@@ -60,21 +55,21 @@ chrome.runtime.onInstalled.addListener(async () => {
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  void initializeScheduler({ allowCatchUp: true }).catch(() => undefined).then(() => initializeConnector());
+  void disableLegacyScheduledCollection().catch(() => undefined).then(() => initializeConnector());
 });
 
-void initializeScheduler({ allowCatchUp: true }).catch(() => undefined).then(() => initializeConnector());
+void disableLegacyScheduledCollection().catch(() => undefined).then(() => initializeConnector());
 
-async function ensureSixHourAlarm() {
-  let existing = await chrome.alarms.get(ALARM_NAME);
-  if (!existing) {
-    await chrome.alarms.create(ALARM_NAME, {
-      delayInMinutes: SIX_HOURS_MINUTES,
-      periodInMinutes: SIX_HOURS_MINUTES,
-    });
-    existing = await chrome.alarms.get(ALARM_NAME);
+async function disableLegacyScheduledCollection() {
+  await chrome.alarms.clear(LEGACY_SCHEDULE_ALARM_NAME);
+  await chrome.storage.local.remove([LEGACY_SCHEDULER_STATE_KEY, LEGACY_SCHEDULED_CATCH_UP_KEY]);
+  const stored = await chrome.storage.local.get(COLLECTION_LOCK_KEY);
+  const trigger = String(stored[COLLECTION_LOCK_KEY]?.trigger || '');
+  if (['alarm', 'catch-up', 'recovery', 'queued-catch-up'].includes(trigger)) {
+    await chrome.storage.local.remove(COLLECTION_LOCK_KEY);
+    await chrome.alarms.clear(WATCHDOG_ALARM_NAME);
+    collectionInProgress = false;
   }
-  return existing;
 }
 
 async function ensureConnectorAlarm() {
@@ -295,7 +290,7 @@ async function sendConnectorHeartbeat(jobId = null, status = 'idle', claimToken 
   });
   if (Array.isArray(response?.accounts)) {
     const accounts = response.accounts.map(normalizeConnectorAccount).filter(Boolean);
-    await syncAccountsAndScheduler(accounts);
+    await syncAccounts(accounts);
   }
   if (jobId && !response?.job) {
     const error = new Error('主机已回收本次任务租约，正在自动重新领取');
@@ -367,129 +362,7 @@ async function pollConnectorQueue() {
     });
 }
 
-function emptySchedulerState() {
-  return {
-    enabled: true,
-    alarmRegistered: false,
-    periodMinutes: SIX_HOURS_MINUTES,
-    monitoredAccountCount: 0,
-    registeredAt: null,
-    checkedAt: null,
-    nextRunAt: null,
-    lastAttemptAt: null,
-    lastCompletedAt: null,
-    lastSuccessAt: null,
-    lastRunStatus: 'never',
-    lastTrigger: null,
-    lastError: null,
-    missedRunRecoveredAt: null,
-  };
-}
-
-function normalizeSchedulerState(value) {
-  const fallback = emptySchedulerState();
-  if (!value || typeof value !== 'object') return fallback;
-  return {
-    ...fallback,
-    ...value,
-    enabled: value.enabled !== false,
-    alarmRegistered: value.alarmRegistered === true,
-    periodMinutes: SIX_HOURS_MINUTES,
-    monitoredAccountCount: Number.isFinite(Number(value.monitoredAccountCount))
-      ? Math.max(0, Number(value.monitoredAccountCount))
-      : 0,
-  };
-}
-
-function alarmNextRunAt(alarm) {
-  const scheduledTime = Number(alarm?.scheduledTime);
-  if (!Number.isFinite(scheduledTime)) return null;
-  const futureTime = scheduledTime > Date.now()
-    ? scheduledTime
-    : Date.now() + SIX_HOURS_MINUTES * 60 * 1000;
-  return new Date(futureTime).toISOString();
-}
-
-async function readSchedulerState() {
-  const stored = await chrome.storage.local.get(SCHEDULER_STATE_KEY);
-  return normalizeSchedulerState(stored[SCHEDULER_STATE_KEY]);
-}
-
-async function saveSchedulerState(patch, dashboardTabId) {
-  const current = await readSchedulerState();
-  const alarm = await ensureSixHourAlarm();
-  const definedPatch = Object.fromEntries(Object.entries(patch || {}).filter(([, value]) => value !== undefined));
-  const next = {
-    ...current,
-    ...definedPatch,
-    enabled: true,
-    alarmRegistered: Boolean(alarm),
-    periodMinutes: SIX_HOURS_MINUTES,
-    registeredAt: current.registeredAt || new Date().toISOString(),
-    nextRunAt: alarmNextRunAt(alarm),
-  };
-  await chrome.storage.local.set({ [SCHEDULER_STATE_KEY]: next });
-  await sendToDashboard({ type: 'SCHEDULER_STATE', schedulerState: next }, dashboardTabId);
-  return next;
-}
-
-async function getSchedulerSnapshot() {
-  const stored = await chrome.storage.local.get(['accounts', SCHEDULER_STATE_KEY]);
-  const accounts = Array.isArray(stored.accounts) ? stored.accounts.filter(isValidAccount) : [];
-  return saveSchedulerState({
-    monitoredAccountCount: accounts.filter((account) => account.initialSyncStatus === 'complete').length,
-    checkedAt: new Date().toISOString(),
-  });
-}
-
-function initializeScheduler(options = {}) {
-  if (schedulerInitializationPromise) return schedulerInitializationPromise;
-  schedulerInitializationPromise = initializeSchedulerOnce(options)
-    .finally(() => {
-      schedulerInitializationPromise = null;
-    });
-  return schedulerInitializationPromise;
-}
-
-async function initializeSchedulerOnce({ allowCatchUp = false } = {}) {
-  const stored = await chrome.storage.local.get([
-    'accounts',
-    SCHEDULER_STATE_KEY,
-    COLLECTION_LOCK_KEY,
-    SCHEDULED_CATCH_UP_KEY,
-  ]);
-  const previous = normalizeSchedulerState(stored[SCHEDULER_STATE_KEY]);
-  const previousNextRun = previous.nextRunAt ? Date.parse(previous.nextRunAt) : Number.NaN;
-  const wasOverdue = Number.isFinite(previousNextRun) && previousNextRun <= Date.now();
-  const existingAlarm = await chrome.alarms.get(ALARM_NAME);
-  const alarm = existingAlarm || await ensureSixHourAlarm();
-  const accounts = Array.isArray(stored.accounts) ? stored.accounts.filter(isValidAccount) : [];
-  const scheduledAccounts = accounts.filter((account) => account.initialSyncStatus === 'complete');
-  const existingLock = stored[COLLECTION_LOCK_KEY];
-  const orphanedLock = Boolean(existingLock?.token && existingLock.ownerId !== WORKER_INSTANCE_ID);
-  if (orphanedLock) {
-    await chrome.storage.local.remove(COLLECTION_LOCK_KEY);
-    collectionInProgress = false;
-  }
-  const state = await saveSchedulerState({
-    alarmRegistered: Boolean(alarm),
-    monitoredAccountCount: scheduledAccounts.length,
-    checkedAt: new Date().toISOString(),
-  });
-  if (previous.lastRunStatus === 'running' && scheduledAccounts.length && !collectionInProgress && (!existingLock?.token || orphanedLock)) {
-    void runScheduledCollection('recovery', {
-      runId: existingLock?.runId,
-      completedAccountIds: Array.isArray(existingLock?.completedAccountIds) ? existingLock.completedAccountIds : [],
-    });
-  } else if (allowCatchUp && !existingAlarm && wasOverdue && scheduledAccounts.length) {
-    void runScheduledCollection('catch-up');
-  } else if (stored[SCHEDULED_CATCH_UP_KEY] && !collectionInProgress && (!existingLock?.token || orphanedLock)) {
-    void runPendingScheduledCatchUp();
-  }
-  return state;
-}
-
-async function syncAccountsAndScheduler(incomingAccounts, dashboardTabId) {
+async function syncAccounts(incomingAccounts) {
   const stored = await chrome.storage.local.get('accounts');
   const previousAccounts = Array.isArray(stored.accounts) ? stored.accounts : [];
   const previousById = new Map(previousAccounts.map((account) => [account?.id, account]));
@@ -505,10 +378,7 @@ async function syncAccountsAndScheduler(incomingAccounts, dashboardTabId) {
     } : incoming;
   });
   await chrome.storage.local.set({ accounts });
-  return saveSchedulerState({
-    monitoredAccountCount: accounts.filter((account) => account.initialSyncStatus === 'complete').length,
-    checkedAt: new Date().toISOString(),
-  }, dashboardTabId);
+  return accounts;
 }
 
 async function acquireCollectionLock(trigger, runId = createMessageId()) {
@@ -564,34 +434,6 @@ async function releaseCollectionLock(token) {
   } finally {
     if (released) collectionInProgress = false;
   }
-  void runPendingScheduledCatchUp();
-}
-
-async function queueScheduledCatchUp(trigger) {
-  const queuedAt = new Date().toISOString();
-  await chrome.storage.local.set({
-    [SCHEDULED_CATCH_UP_KEY]: {
-      trigger,
-      queuedAt,
-    },
-  });
-  await saveSchedulerState({
-    lastAttemptAt: queuedAt,
-    lastRunStatus: 'queued',
-    lastTrigger: trigger,
-    lastError: '到点时已有采集任务，已排队并将在当前任务结束后补采全部监控账号',
-    checkedAt: queuedAt,
-  });
-}
-
-async function runPendingScheduledCatchUp() {
-  if (collectionInProgress) return false;
-  const stored = await chrome.storage.local.get(SCHEDULED_CATCH_UP_KEY);
-  const pending = stored[SCHEDULED_CATCH_UP_KEY];
-  if (!pending) return false;
-  await chrome.storage.local.remove(SCHEDULED_CATCH_UP_KEY);
-  void runScheduledCollection('queued-catch-up');
-  return true;
 }
 
 async function scheduleCollectionWatchdog() {
@@ -638,7 +480,7 @@ async function checkpointCollectionAccount(token, accountId) {
 }
 
 async function handleCollectionWatchdog() {
-  const stored = await chrome.storage.local.get([COLLECTION_LOCK_KEY, SCHEDULER_STATE_KEY]);
+  const stored = await chrome.storage.local.get(COLLECTION_LOCK_KEY);
   const lock = stored[COLLECTION_LOCK_KEY];
   if (!lock?.token) {
     await chrome.alarms.clear(WATCHDOG_ALARM_NAME);
@@ -671,25 +513,11 @@ async function handleCollectionWatchdog() {
       message: '上一次手动采集被 Chrome 中断，锁已自动释放，请重新检查',
       capturedAt: new Date().toISOString(),
     });
-    void runPendingScheduledCatchUp();
     return;
-  }
-  const schedulerState = normalizeSchedulerState(stored[SCHEDULER_STATE_KEY]);
-  if (schedulerState.lastRunStatus === 'running') {
-    void runScheduledCollection('recovery', {
-      runId: lock.runId,
-      completedAccountIds: Array.isArray(lock.completedAccountIds) ? lock.completedAccountIds : [],
-    });
-  } else {
-    void runPendingScheduledCatchUp();
   }
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === ALARM_NAME) {
-    void runScheduledCollection('alarm');
-    return;
-  }
   if (alarm.name === WATCHDOG_ALARM_NAME) {
     void handleCollectionWatchdog();
     return;
@@ -708,16 +536,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     void pollConnectorQueue();
     void Promise.all([
       readPendingResults(),
-      getSchedulerSnapshot(),
       chrome.storage.local.get(CONNECTOR_STATE_KEY),
     ])
-      .then(([pendingResults, schedulerState, connectorStored]) => {
+      .then(([pendingResults, connectorStored]) => {
         sendResponse({
           ok: true,
           extensionVersion: chrome.runtime.getManifest().version,
           capabilities: CONNECTOR_CAPABILITIES,
           pendingResults,
-          schedulerState,
           connectorState: connectorStored[CONNECTOR_STATE_KEY] || null,
           activeJobId: activeConnectorJob?.id || null,
           collectionInProgress,
@@ -731,10 +557,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const accounts = Array.isArray(message.accounts)
       ? message.accounts.filter(isValidAccount)
       : [];
-    void syncAccountsAndScheduler(accounts, sender.tab?.id)
-      .then((schedulerState) => {
+    void syncAccounts(accounts)
+      .then(() => {
         void pollConnectorQueue();
-        sendResponse({ ok: true, schedulerState });
+        sendResponse({ ok: true });
       })
       .catch((error) => sendResponse({ ok: false, error: errorMessage(error) }));
     return true;
@@ -774,7 +600,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         responseSent = true;
         return;
       }
-      await syncAccountsAndScheduler(allAccounts, sender.tab?.id);
+      await syncAccounts(allAccounts);
       await setCollectionPlan(lockToken, accounts);
       sendResponse({ accepted: true });
       responseSent = true;
@@ -834,82 +660,6 @@ function isTrustedDashboardSender(sender) {
       && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1');
   } catch {
     return false;
-  }
-}
-
-async function runScheduledCollection(trigger = 'alarm', resume = {}) {
-  const runId = resume.runId || createMessageId();
-  const lockToken = await acquireCollectionLock(trigger, runId);
-  if (!lockToken) {
-    await queueScheduledCatchUp(trigger);
-    return;
-  }
-  const startedAt = new Date().toISOString();
-  try {
-    const { accounts = [] } = await chrome.storage.local.get('accounts');
-    const allScheduledAccounts = Array.isArray(accounts)
-      ? accounts
-        .filter((account) => isValidAccount(account) && account.initialSyncStatus === 'complete')
-        .map((account) => ({ ...account, syncMode: 'latest' }))
-      : [];
-    const completedAccountIds = new Set(Array.isArray(resume.completedAccountIds) ? resume.completedAccountIds : []);
-    const scheduledAccounts = allScheduledAccounts.filter((account) => !completedAccountIds.has(account.id));
-    await setCollectionPlan(lockToken, allScheduledAccounts);
-    await saveSchedulerState({
-      monitoredAccountCount: allScheduledAccounts.length,
-      lastAttemptAt: startedAt,
-      lastRunStatus: allScheduledAccounts.length ? 'running' : 'waiting',
-      lastTrigger: trigger,
-      lastError: allScheduledAccounts.length ? null : '暂无已完成首次建档的账号',
-      checkedAt: startedAt,
-    });
-    if (!allScheduledAccounts.length) return;
-    if (!scheduledAccounts.length && trigger === 'recovery') {
-      const recoveredAt = new Date().toISOString();
-      await saveSchedulerState({
-        lastCompletedAt: recoveredAt,
-        lastSuccessAt: recoveredAt,
-        lastRunStatus: 'success',
-        lastTrigger: trigger,
-        lastError: null,
-        missedRunRecoveredAt: recoveredAt,
-        checkedAt: recoveredAt,
-      });
-      return;
-    }
-
-    const summary = await keepServiceWorkerAliveUntil(
-      () => collectAll(scheduledAccounts, undefined, { runId, lockToken }),
-      lockToken,
-    );
-    const completedAt = new Date().toISOString();
-    const lastRunStatus = summary.failed === 0 ? 'success' : summary.succeeded > 0 ? 'partial' : 'error';
-    await saveSchedulerState({
-      lastCompletedAt: completedAt,
-      lastSuccessAt: summary.failed === 0 ? completedAt : undefined,
-      lastRunStatus,
-      lastTrigger: trigger,
-      lastError: summary.failed > 0 ? `${summary.failed} 个账号采集失败` : null,
-      missedRunRecoveredAt: trigger === 'catch-up' || trigger === 'recovery' ? completedAt : undefined,
-      checkedAt: completedAt,
-    });
-  } catch (error) {
-    const capturedAt = new Date().toISOString();
-    await saveSchedulerState({
-      lastCompletedAt: capturedAt,
-      lastRunStatus: 'error',
-      lastTrigger: trigger,
-      lastError: errorMessage(error),
-      checkedAt: capturedAt,
-    });
-    await persistAndDeliver({
-      type: 'COLLECTION_ERROR',
-      accountId: null,
-      message: `定时采集启动失败：${errorMessage(error)}`,
-      capturedAt,
-    });
-  } finally {
-    await releaseCollectionLock(lockToken);
   }
 }
 
@@ -1010,7 +760,7 @@ async function executeConnectorJob(job) {
     const accounts = Array.isArray(payload.accounts)
       ? payload.accounts.map(normalizeConnectorAccount).filter(Boolean)
       : [];
-    await syncAccountsAndScheduler(accounts);
+    await syncAccounts(accounts);
     await enqueueConnectorEvent({
       jobId: job.id,
       claimToken,
@@ -1157,6 +907,7 @@ async function collectAll(accounts, dashboardTabId, {
   await sendToDashboard({
     type: 'COLLECTION_BATCH_STARTED',
     runId,
+    connectorJobId,
     totalAccounts,
     startedAt,
   }, dashboardTabId);
@@ -1167,6 +918,7 @@ async function collectAll(accounts, dashboardTabId, {
     await sendToDashboard({
       type: 'COLLECTION_STARTED',
       runId,
+      connectorJobId,
       accountId: account.id,
       accountName: account.name || null,
       mode: collectionModeForAccount(account),
@@ -1181,6 +933,7 @@ async function collectAll(accounts, dashboardTabId, {
         await sendToDashboard({
           type: 'COLLECTION_ACCOUNT_PROGRESS',
           runId,
+          connectorJobId,
           accountId: account.id,
           accountName: account.name || null,
           mode,
@@ -1243,6 +996,7 @@ async function collectAll(accounts, dashboardTabId, {
   await sendToDashboard({
     type: 'COLLECTION_BATCH_COMPLETED',
     runId,
+    connectorJobId,
     totalAccounts,
     succeeded,
     failed,

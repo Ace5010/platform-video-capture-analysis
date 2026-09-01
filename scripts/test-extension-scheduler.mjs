@@ -11,8 +11,13 @@ const storageData = {
     { id: 'account-c', url: 'https://www.douyin.com/user/c', initialSyncStatus: 'complete' },
   ],
   pendingResults: [],
+  schedulerState: { alarmRegistered: true, nextRunAt: new Date(Date.now() + 3600000).toISOString() },
+  scheduledCatchUp: { queuedAt: new Date().toISOString() },
+  collectionLock: { token: 'legacy-scheduled-lock', trigger: 'alarm' },
 };
-const alarms = new Map();
+const alarms = new Map([
+  ['douyin-monitor-six-hour-check', { name: 'douyin-monitor-six-hour-check', periodInMinutes: 360 }],
+]);
 const deliveredMessages = [];
 let keepAliveCalls = 0;
 
@@ -47,7 +52,7 @@ const chrome = {
     onInstalled: eventSlot(),
     onStartup: eventSlot(),
     onMessage: runtimeOnMessage,
-    getManifest: () => ({ version: '0.7.0' }),
+    getManifest: () => ({ version: '0.8.0' }),
     getPlatformInfo: async () => {
       keepAliveCalls += 1;
       return { os: 'win' };
@@ -69,7 +74,9 @@ const chrome = {
     local: {
       get: async (keys) => storageGet(keys),
       set: async (patch) => Object.assign(storageData, structuredClone(patch)),
-      remove: async (key) => { delete storageData[key]; },
+      remove: async (keys) => {
+        for (const key of Array.isArray(keys) ? keys : [keys]) delete storageData[key];
+      },
     },
   },
   tabs: {
@@ -132,14 +139,15 @@ const context = vm.createContext({
 });
 vm.runInContext(extensionSource, context, { filename: 'background.js' });
 
-for (let attempt = 0; attempt < 50 && !storageData.schedulerState; attempt += 1) {
+for (let attempt = 0; attempt < 50 && !alarms.has('douyin-monitor-connector-poll'); attempt += 1) {
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
 
-assert.equal(alarms.get('douyin-monitor-six-hour-check')?.periodInMinutes, 360);
-assert.equal(storageData.schedulerState?.alarmRegistered, true);
-assert.equal(storageData.schedulerState?.monitoredAccountCount, 2);
-assert.ok(Date.parse(storageData.schedulerState?.nextRunAt) > Date.now());
+assert.equal(alarms.has('douyin-monitor-six-hour-check'), false);
+assert.equal('schedulerState' in storageData, false);
+assert.equal('scheduledCatchUp' in storageData, false);
+assert.equal('collectionLock' in storageData, false);
+assert.equal(alarms.get('douyin-monitor-connector-poll')?.periodInMinutes, 1);
 
 function sendMessage(message) {
   return new Promise((resolve, reject) => {
@@ -157,8 +165,8 @@ function sendMessage(message) {
 
 const ping = await sendMessage({ source: 'douyin-monitor', type: 'PING' });
 assert.equal(ping.ok, true);
-assert.equal(ping.extensionVersion, '0.7.0');
-assert.equal(ping.schedulerState.monitoredAccountCount, 2);
+assert.equal(ping.extensionVersion, '0.8.0');
+assert.equal('schedulerState' in ping, false);
 
 const synced = await sendMessage({
   source: 'douyin-monitor',
@@ -171,7 +179,6 @@ const synced = await sendMessage({
 assert.equal(synced.ok, true);
 assert.deepEqual(storageData.accounts.map((account) => account.id), ['account-a', 'account-b']);
 assert.equal(storageData.accounts[0].initialSyncStatus, 'complete');
-assert.equal(storageData.schedulerState.monitoredAccountCount, 2);
 
 storageData.pendingResults.push({ messageId: 'ack-by-event-id', type: 'COLLECTION_RESULT' });
 const acknowledged = await sendMessage({
@@ -183,10 +190,9 @@ assert.equal(acknowledged.ok, true);
 assert.equal(storageData.pendingResults.some((item) => item.messageId === 'ack-by-event-id'), false);
 
 const manualLock = await vm.runInContext("acquireCollectionLock('manual', 'manual-test-run')", context);
-await vm.runInContext("runScheduledCollection('alarm')", context);
-assert.equal(storageData.schedulerState.lastRunStatus, 'queued');
-assert.ok(storageData.scheduledCatchUp?.queuedAt);
-delete storageData.scheduledCatchUp;
+const secondManualLock = await vm.runInContext("acquireCollectionLock('manual', 'second-manual-test-run')", context);
+assert.ok(manualLock);
+assert.equal(secondManualLock, null);
 context.manualLock = manualLock;
 await vm.runInContext('releaseCollectionLock(manualLock)', context);
 
@@ -225,4 +231,4 @@ assert.equal(deliveredMessages.filter((message) => message.type === 'COLLECTION_
 assert.equal(deliveredMessages.some((message) => message.type?.startsWith('COLLECTION_') && 'progress' in message), false);
 assert.ok(keepAliveCalls >= 1);
 
-console.log('Scheduler validation passed: alarm, status snapshot, account sync, multi-account continuation, and semantic batch completion.');
+console.log('Manual collection validation passed: legacy six-hour scheduling is removed while connector polling, account sync, locking, multi-account continuation, and semantic batch completion remain active.');

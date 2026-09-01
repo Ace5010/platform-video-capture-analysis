@@ -1,2 +1,5 @@
 # Local CPU speech recognition service
 faster-whisper==1.2.1
+# Local CPU punctuation restoration; no transcript is uploaded.
+sherpa-onnx==1.13.2
+sherpa-onnx-bin==1.13.2

@@ -15,6 +15,11 @@ import {
   type AnalyticsMetricKey,
   type NumericDelta,
 } from '../lib/video-analytics';
+import {
+  isAnalysisExtensionCompatible,
+  MINIMUM_ANALYSIS_EXTENSION_VERSION,
+  REQUIRED_ANALYSIS_EXTENSION_CAPABILITY,
+} from '../lib/extension-compatibility';
 
 type AccountStatus = 'waiting' | 'checking' | 'ready' | 'error';
 type TranscriptStatus = 'idle' | 'processing' | 'ready' | 'error';
@@ -22,7 +27,6 @@ type AnalysisStatus = 'idle' | 'queued' | 'processing' | 'ready' | 'error';
 type SyncMode = 'initial' | 'latest';
 type InitialSyncStatus = 'pending' | 'complete' | 'error';
 type Platform = 'douyin' | 'xiaohongshu' | 'bilibili' | 'youtube';
-type SchedulerRunStatus = 'never' | 'waiting' | 'running' | 'success' | 'partial' | 'error' | 'skipped';
 type AnalyticsView = 'details' | 'comparison';
 type AnalyticsSortMode = 'published' | 'value';
 
@@ -39,6 +43,8 @@ type Account = {
   initialSyncStatus: InitialSyncStatus;
   initialSyncCompletedAt: string | null;
   latestVideoIds: string[];
+  latestCheckNewVideoCount: number | null;
+  latestCheckNewVideoIds: string[];
   currentSyncMode: SyncMode | null;
 };
 
@@ -63,6 +69,8 @@ type Video = {
   transcriptUpdatedAt: string | null;
   transcriptError: string | null;
   analysis: VideoAnalysis | null;
+  analysisUsage: AnalysisUsage | null;
+  analysisRuns: AnalysisRun[];
   analysisStatus: AnalysisStatus;
   analysisUpdatedAt: string | null;
   analysisError: string | null;
@@ -76,6 +84,47 @@ type VideoAnalysis = {
   personActions: string;
   onScreenText: string;
   structureNarrative: string;
+};
+
+type AnalysisUsage = {
+  provider: string;
+  model: string;
+  requestedModel: string;
+  responseModels: string[];
+  requestCount: number;
+  attemptedRequestCount: number;
+  requestIds: string[];
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  videoTokens: number;
+  imageTokens: number;
+  audioTokens: number;
+  textTokens: number;
+  cachedTokens: number;
+  reasoningTokens: number;
+  usageComplete: boolean;
+  estimatedCostCny: number | null;
+  billingNote: string;
+  pricing: {
+    currency: string;
+    region: string;
+    inputPerMillion: number;
+    cachedInputPerMillion: number;
+    outputPerMillion: number;
+    checkedAt: string;
+    source: string;
+  } | null;
+};
+
+type AnalysisRun = {
+  id: string;
+  jobId: string;
+  status: string;
+  usage: AnalysisUsage | null;
+  error: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
 };
 
 type HostJob = {
@@ -104,6 +153,7 @@ type Snapshot = {
 
 type CollectionMessage = {
   runId?: string;
+  connectorJobId?: string | null;
   eventId?: string;
   messageId?: string;
   accountId?: string;
@@ -136,23 +186,6 @@ type CollectionTaskState = {
   succeeded: number;
   failed: number;
   completedAt: string | null;
-};
-
-type SchedulerState = {
-  enabled: boolean;
-  alarmRegistered: boolean;
-  periodMinutes: number;
-  monitoredAccountCount: number;
-  registeredAt: string | null;
-  checkedAt: string | null;
-  nextRunAt: string | null;
-  lastAttemptAt: string | null;
-  lastCompletedAt: string | null;
-  lastSuccessAt: string | null;
-  lastRunStatus: SchedulerRunStatus;
-  lastTrigger: 'alarm' | 'catch-up' | 'recovery' | null;
-  lastError: string | null;
-  missedRunRecoveredAt: string | null;
 };
 
 const navItems = [
@@ -194,8 +227,8 @@ const processedResultStoreKey = 'douyin-monitor.processed-results.v1';
 const activePlatformStoreKey = 'douyin-monitor.active-platform.v1';
 const selectedAccountStoreKey = 'douyin-monitor.selected-account.v1';
 const migrationMarkerStoreKey = 'douyin-monitor.sqlite-migration.v1';
-const requiredExtensionVersion = '0.7.0';
-const requiredExtensionCapability = 'analyze_video';
+const requiredExtensionVersion = MINIMUM_ANALYSIS_EXTENSION_VERSION;
+const requiredExtensionCapability = REQUIRED_ANALYSIS_EXTENSION_CAPABILITY;
 
 function isLoopbackHostname(hostname: string) {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
@@ -277,10 +310,10 @@ function normalizeAnalysis(raw: unknown): VideoAnalysis | null {
 }
 
 function normalizeAnalysisStatus(value: unknown, analysis: VideoAnalysis | null): AnalysisStatus {
-  if (analysis) return 'ready';
   if (value === 'queued' || value === 'pending' || value === 'waiting') return 'queued';
   if (value === 'processing' || value === 'running' || value === 'claimed') return 'processing';
   if (value === 'error' || value === 'failed' || value === 'expired') return 'error';
+  if (analysis) return 'ready';
   return 'idle';
 }
 
@@ -301,6 +334,10 @@ function normalizeAccount(raw: Partial<Account>, index: number): Account {
     initialSyncStatus,
     initialSyncCompletedAt: raw.initialSyncCompletedAt || null,
     latestVideoIds: Array.isArray(raw.latestVideoIds) ? raw.latestVideoIds.map(String).slice(0, 3) : [],
+    latestCheckNewVideoCount: typeof raw.latestCheckNewVideoCount === 'number' && raw.latestCheckNewVideoCount >= 0
+      ? Math.floor(raw.latestCheckNewVideoCount)
+      : null,
+    latestCheckNewVideoIds: Array.isArray(raw.latestCheckNewVideoIds) ? raw.latestCheckNewVideoIds.map(String) : [],
     currentSyncMode: null,
   };
 }
@@ -338,10 +375,128 @@ function normalizeVideo(raw: Partial<Video>, capturedAt = new Date().toISOString
     transcriptUpdatedAt: raw.transcriptUpdatedAt || null,
     transcriptError: raw.transcriptError || null,
     analysis,
+    analysisUsage: normalizeAnalysisUsage(raw.analysisUsage),
+    analysisRuns: Array.isArray(raw.analysisRuns)
+      ? raw.analysisRuns.map(normalizeAnalysisRun).filter((run): run is AnalysisRun => run !== null)
+      : [],
     analysisStatus: normalizeAnalysisStatus(raw.analysisStatus, analysis),
     analysisUpdatedAt: raw.analysisUpdatedAt || null,
     analysisError: raw.analysisError || null,
   };
+}
+
+function normalizeAnalysisUsage(value: unknown): AnalysisUsage | null {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as Record<string, unknown>;
+  const validInteger = (item: unknown) => typeof item === 'number' && Number.isInteger(item) && item >= 0;
+  const number = (item: unknown): number => validInteger(item) ? Number(item) : 0;
+  const finiteNumber = (item: unknown): number => typeof item === 'number' && Number.isFinite(item) && item >= 0 ? item : 0;
+  const pricingRaw = raw.pricing && typeof raw.pricing === 'object' ? raw.pricing as Record<string, unknown> : null;
+  const requestCount = number(raw.requestCount);
+  const attemptedRequestCount = number(raw.attemptedRequestCount ?? raw.requestCount);
+  const promptTokens = number(raw.promptTokens);
+  const completionTokens = number(raw.completionTokens);
+  const totalTokens = number(raw.totalTokens);
+  const tokenFieldsValid = [
+    raw.requestCount,
+    raw.attemptedRequestCount ?? raw.requestCount,
+    raw.promptTokens,
+    raw.completionTokens,
+    raw.totalTokens,
+    raw.videoTokens,
+    raw.imageTokens,
+    raw.audioTokens,
+    raw.textTokens,
+    raw.cachedTokens,
+    raw.reasoningTokens,
+  ].every(validInteger);
+  const positiveUsageComplete = totalTokens > 0
+    && totalTokens === promptTokens + completionTokens
+    && attemptedRequestCount === requestCount;
+  const zeroRequestComplete = attemptedRequestCount === 0
+    && requestCount === 0
+    && promptTokens === 0
+    && completionTokens === 0
+    && totalTokens === 0;
+  const usageComplete = raw.usageComplete === true
+    && tokenFieldsValid
+    && (positiveUsageComplete || zeroRequestComplete);
+  const estimatedCost = !usageComplete || raw.estimatedCostCny == null || !Number.isFinite(Number(raw.estimatedCostCny))
+    ? null
+    : Math.max(0, Number(raw.estimatedCostCny));
+  return {
+    provider: String(raw.provider || 'Alibaba Cloud Model Studio'),
+    model: String(raw.model || 'qwen3.8-flash'),
+    requestedModel: String(raw.requestedModel || raw.model || 'qwen3.8-flash'),
+    responseModels: Array.isArray(raw.responseModels) ? raw.responseModels.map(String).filter(Boolean) : [],
+    requestCount,
+    attemptedRequestCount,
+    requestIds: Array.isArray(raw.requestIds) ? raw.requestIds.map(String).filter(Boolean) : [],
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    videoTokens: number(raw.videoTokens),
+    imageTokens: number(raw.imageTokens),
+    audioTokens: number(raw.audioTokens),
+    textTokens: number(raw.textTokens),
+    cachedTokens: number(raw.cachedTokens),
+    reasoningTokens: number(raw.reasoningTokens),
+    usageComplete,
+    estimatedCostCny: estimatedCost,
+    billingNote: String(raw.billingNote || '实际扣款以百炼账单为准。'),
+    pricing: pricingRaw ? {
+      currency: String(pricingRaw.currency || 'CNY'),
+      region: String(pricingRaw.region || ''),
+      inputPerMillion: finiteNumber(pricingRaw.inputPerMillion),
+      cachedInputPerMillion: finiteNumber(pricingRaw.cachedInputPerMillion),
+      outputPerMillion: finiteNumber(pricingRaw.outputPerMillion),
+      checkedAt: String(pricingRaw.checkedAt || ''),
+      source: String(pricingRaw.source || ''),
+    } : null,
+  };
+}
+
+function normalizeAnalysisRun(value: unknown): AnalysisRun | null {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as Record<string, unknown>;
+  const id = String(raw.id || '');
+  const jobId = String(raw.jobId || '');
+  if (!id || !jobId) return null;
+  return {
+    id,
+    jobId,
+    status: String(raw.status || 'unknown'),
+    usage: normalizeAnalysisUsage(raw.usage),
+    error: typeof raw.error === 'string' && raw.error.trim() ? raw.error : null,
+    createdAt: typeof raw.createdAt === 'string' ? raw.createdAt : null,
+    updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : null,
+  };
+}
+
+function formatTokenCount(value: number) {
+  return new Intl.NumberFormat('zh-CN').format(Math.max(0, Math.round(value)));
+}
+
+function formatEstimatedCost(value: number | null) {
+  if (value == null) return '待账单核对';
+  if (value === 0) return '¥0.0000';
+  return `¥${value < 0.01 ? value.toFixed(4) : value.toFixed(2)}`;
+}
+
+function analysisRequestCountLabel(usage: AnalysisUsage) {
+  if (usage.attemptedRequestCount === 0) return '未发起';
+  if (usage.usageComplete) return `${usage.requestCount} 次`;
+  return `${usage.requestCount}/${usage.attemptedRequestCount} 次有回执`;
+}
+
+function analysisRunStatusLabel(status: string) {
+  if (status === 'succeeded') return '完成';
+  if (status === 'failed') return '失败';
+  if (status === 'expired') return '等待超时';
+  if (status === 'cancelled') return '已取消';
+  if (status === 'running' || status === 'claimed') return '分析中';
+  if (status === 'queued') return '排队中';
+  return status || '未知';
 }
 
 function formatTime(value: string | null) {
@@ -424,16 +579,6 @@ function startOfTodayTimestamp() {
   return date.getTime();
 }
 
-function schedulerRunLabel(status: SchedulerRunStatus | undefined) {
-  if (status === 'running') return '正在自动采集';
-  if (status === 'success') return '运行成功';
-  if (status === 'partial') return '部分账号失败';
-  if (status === 'error') return '运行失败';
-  if (status === 'skipped') return '由同期手动采集替代';
-  if (status === 'waiting') return '等待已建档账号';
-  return '尚未运行';
-}
-
 export default function Home() {
   const [apiBase, setApiBase] = useState('http://127.0.0.1:43129');
   const [isHostLocal, setIsHostLocal] = useState(true);
@@ -475,12 +620,14 @@ export default function Home() {
   const [bridgeCapabilities, setBridgeCapabilities] = useState<string[]>([]);
   const [bridgeBusy, setBridgeBusy] = useState(false);
   const [bridgeNeedsReload, setBridgeNeedsReload] = useState(false);
-  const [schedulerState, setSchedulerState] = useState<SchedulerState | null>(null);
   const [collectionTask, setCollectionTask] = useState<CollectionTaskState>(emptyCollectionTask);
   const [isCollecting, setIsCollecting] = useState(false);
   const [todayStart, setTodayStart] = useState(startOfTodayTimestamp);
   const [expandedAnalyses, setExpandedAnalyses] = useState<Set<string>>(new Set());
   const processedResultIds = useRef<Set<string>>(new Set());
+  const accountsRef = useRef<Account[]>([]);
+  const videosRef = useRef<Video[]>([]);
+  const collectionUpdatesRef = useRef<Map<string, { accountName: string; newVideoCount: number }>>(new Map());
 
   useEffect(() => {
     // Keep the server snapshot stable for hydration, then resolve the actual
@@ -507,16 +654,15 @@ export default function Home() {
       : [];
     const nextSnapshots = Array.isArray(envelope.snapshots) ? envelope.snapshots as Snapshot[] : [];
     setAccounts(nextAccounts);
+    accountsRef.current = nextAccounts;
     setVideos(nextVideos);
+    videosRef.current = nextVideos;
     setSnapshots(nextSnapshots);
     setSelectedAccountId((current) => nextAccounts.some((account) => account.id === current)
       ? current
       : nextAccounts.some((account) => account.id === readStored<string>(selectedAccountStoreKey, ''))
         ? readStored<string>(selectedAccountStoreKey, '')
         : nextAccounts[0]?.id || '');
-    if (envelope.schedulerState && typeof envelope.schedulerState === 'object') {
-      setSchedulerState(envelope.schedulerState as SchedulerState);
-    }
     const connectorState = envelope.connector && typeof envelope.connector === 'object'
       ? envelope.connector as Record<string, unknown>
       : envelope;
@@ -716,6 +862,10 @@ export default function Home() {
     if (!loaded) return;
     const applyCollectionResult = (payload: CollectionMessage) => {
       const eventId = payload.eventId || payload.messageId;
+      if (!payload.connectorJobId) {
+        if (eventId) window.postMessage({ source: 'douyin-monitor', type: 'ACK_RESULTS', eventIds: [eventId] }, window.location.origin);
+        return;
+      }
       if (eventId && processedResultIds.current.has(eventId)) {
         window.postMessage({ source: 'douyin-monitor', type: 'ACK_RESULTS', eventIds: [eventId] }, window.location.origin);
         return;
@@ -738,8 +888,30 @@ export default function Home() {
         return;
       }
 
+      const authoritativeAccountId = payload.accountId || collected[0]?.accountId || '';
+      const knownVideoIds = new Set(videosRef.current
+        .filter((video) => video.accountId === authoritativeAccountId)
+        .map((video) => video.id));
+      const persistedResult = accountsRef.current.find((account) => account.id === authoritativeAccountId);
+      const isPersistedReplay = payload.mode === 'latest'
+        && persistedResult?.lastSuccessAt === capturedAt
+        && persistedResult.latestCheckNewVideoCount !== null;
+      const newVideoIds = isPersistedReplay
+        ? persistedResult?.latestCheckNewVideoIds || []
+        : payload.mode === 'latest'
+        ? [...new Set(collected.map((video) => video.id).filter((videoId) => !knownVideoIds.has(videoId)))]
+        : [];
+      const newVideoCount = isPersistedReplay
+        ? persistedResult.latestCheckNewVideoCount as number
+        : newVideoIds.length;
+      if (payload.mode === 'latest' && authoritativeAccountId) {
+        collectionUpdatesRef.current.set(authoritativeAccountId, {
+          accountName: payload.accountName || '当前账号',
+          newVideoCount,
+        });
+      }
+
       setVideos((current) => {
-        const authoritativeAccountId = payload.accountId || collected[0]?.accountId;
         const keyFor = (video: Pick<Video, 'accountId' | 'id'>) => `${video.accountId}:${video.id}`;
         const previousById = new Map(current.map((video) => [keyFor(video), video]));
         const retained = payload.mode === 'initial' && authoritativeAccountId
@@ -752,17 +924,21 @@ export default function Home() {
           byId.set(key, {
             ...incoming,
             firstSeenAt: previous?.firstSeenAt || incoming.firstSeenAt,
-            transcript: previous?.transcript || incoming.transcript,
+            transcript: incoming.transcript || previous?.transcript || null,
             transcriptStatus: previous?.transcriptStatus === 'ready' ? 'ready' : incoming.transcriptStatus,
-            transcriptUpdatedAt: previous?.transcriptUpdatedAt || incoming.transcriptUpdatedAt,
+            transcriptUpdatedAt: (incoming.transcript ? (incoming.transcriptUpdatedAt || previous?.transcriptUpdatedAt) : (previous?.transcriptUpdatedAt || incoming.transcriptUpdatedAt)) || null,
             transcriptError: previous?.transcriptError || incoming.transcriptError,
             analysis: previous?.analysis || incoming.analysis,
+            analysisUsage: incoming.analysisUsage || previous?.analysisUsage || null,
+            analysisRuns: incoming.analysisRuns.length ? incoming.analysisRuns : (previous?.analysisRuns || []),
             analysisStatus: previous?.analysisStatus === 'ready' ? 'ready' : incoming.analysisStatus,
             analysisUpdatedAt: previous?.analysisUpdatedAt || incoming.analysisUpdatedAt,
             analysisError: previous?.analysisError || incoming.analysisError,
           });
         }
-        return [...byId.values()].sort((a, b) => (b.publishedAt || b.lastSeenAt).localeCompare(a.publishedAt || a.lastSeenAt));
+        const nextVideos = [...byId.values()].sort((a, b) => (b.publishedAt || b.lastSeenAt).localeCompare(a.publishedAt || a.lastSeenAt));
+        videosRef.current = nextVideos;
+        return nextVideos;
       });
       setSnapshots((current) => [
         ...(payload.mode === 'initial' && payload.accountId
@@ -778,19 +954,29 @@ export default function Home() {
         capturedAt,
       })),
       ]);
-      setAccounts((current) => current.map((account) => payload.accountId === account.id ? {
-        ...account,
-        name: payload.accountName || account.name,
-        avatarUrl: payload.accountAvatarUrl || account.avatarUrl,
-        lastCheckedAt: capturedAt,
-        lastSuccessAt: capturedAt,
-        status: 'ready',
-        initialSyncStatus: payload.mode === 'initial' ? 'complete' : account.initialSyncStatus,
-        initialSyncCompletedAt: payload.mode === 'initial' ? capturedAt : account.initialSyncCompletedAt,
-        latestVideoIds: collected.slice(0, 3).map((video) => video.id),
-        currentSyncMode: null,
-      } : account));
-      setNotice(payload.warning || `${payload.accountName || '当前账号'}：已更新 ${collected.length} 条视频数据`);
+      setAccounts((current) => {
+        const nextAccounts = current.map((account) => payload.accountId === account.id ? {
+          ...account,
+          name: payload.accountName || account.name,
+          avatarUrl: payload.accountAvatarUrl || account.avatarUrl,
+          lastCheckedAt: capturedAt,
+          lastSuccessAt: capturedAt,
+          status: 'ready' as const,
+          initialSyncStatus: payload.mode === 'initial' ? 'complete' as const : account.initialSyncStatus,
+          initialSyncCompletedAt: payload.mode === 'initial' ? capturedAt : account.initialSyncCompletedAt,
+          latestVideoIds: collected.slice(0, 3).map((video) => video.id),
+          latestCheckNewVideoCount: payload.mode === 'latest' ? newVideoCount : account.latestCheckNewVideoCount,
+          latestCheckNewVideoIds: payload.mode === 'latest' ? newVideoIds : account.latestCheckNewVideoIds,
+          currentSyncMode: null,
+        } : account);
+        accountsRef.current = nextAccounts;
+        return nextAccounts;
+      });
+      setNotice(payload.warning || (payload.mode === 'latest'
+        ? newVideoCount
+          ? `${payload.accountName || '当前账号'}：发现 ${newVideoCount} 条新视频`
+          : `${payload.accountName || '当前账号'}：本次没有发现新视频`
+        : `${payload.accountName || '当前账号'}：已完成近 ${collected.length} 条视频建档`));
 
       if (eventId) {
         processedResultIds.current.add(eventId);
@@ -800,6 +986,10 @@ export default function Home() {
     };
 
     const applyCollectionError = (payload: CollectionMessage) => {
+      if (!payload.connectorJobId) {
+        if (payload.messageId) window.postMessage({ source: 'douyin-monitor', type: 'ACK_RESULTS', messageIds: [payload.messageId] }, window.location.origin);
+        return;
+      }
       const capturedAt = payload.capturedAt || new Date().toISOString();
       setAccounts((current) => current.map((account) => account.id === payload.accountId ? {
         ...account,
@@ -858,17 +1048,11 @@ export default function Home() {
     const receive = (event: MessageEvent) => {
       if (event.source !== window || event.data?.source !== 'douyin-monitor-extension') return;
       if (event.data.type === 'BRIDGE_READY') {
-        if (event.data.schedulerState) {
-          const nextSchedulerState = event.data.schedulerState as SchedulerState;
-          setSchedulerState(nextSchedulerState);
-          if (nextSchedulerState.lastRunStatus === 'running') setIsCollecting(true);
-        }
         if (event.data.extensionVersion) {
           const capabilities = Array.isArray(event.data.capabilities)
             ? event.data.capabilities.filter((value: unknown): value is string => typeof value === 'string')
             : [];
-          const compatible = capabilities.includes(requiredExtensionCapability)
-            || (capabilities.length === 0 && event.data.extensionVersion === requiredExtensionVersion);
+          const compatible = isAnalysisExtensionCompatible(event.data.extensionVersion, capabilities);
           setBridgeReady(true);
           setBridgeVersion(event.data.extensionVersion);
           setBridgeCapabilities(capabilities);
@@ -881,11 +1065,6 @@ export default function Home() {
         setBridgeReady(false);
         setBridgeBusy(false);
       }
-      if (event.data.type === 'SCHEDULER_STATE' && event.data.schedulerState) {
-        const nextSchedulerState = event.data.schedulerState as SchedulerState;
-        setSchedulerState(nextSchedulerState);
-        if (nextSchedulerState.lastRunStatus === 'running') setIsCollecting(true);
-      }
       if (event.data.type === 'SYNC_STATE') {
         const pending = Array.isArray(event.data.pendingResults) ? event.data.pendingResults : [];
         pending.forEach((result: CollectionMessage & { type?: string }) => {
@@ -897,6 +1076,8 @@ export default function Home() {
         });
       }
       if (event.data.type === 'COLLECTION_BATCH_STARTED') {
+        if (!event.data.connectorJobId) return;
+        collectionUpdatesRef.current.clear();
         setIsCollecting(true);
         setCollectionTask({
           ...emptyCollectionTask,
@@ -906,6 +1087,7 @@ export default function Home() {
         });
       }
       if (event.data.type === 'COLLECTION_STARTED') {
+        if (!event.data.connectorJobId) return;
         setIsCollecting(true);
         setCollectionTask((current) => ({
           ...current,
@@ -929,6 +1111,7 @@ export default function Home() {
         }
       }
       if (event.data.type === 'COLLECTION_ACCOUNT_PROGRESS') {
+        if (!event.data.connectorJobId) return;
         setCollectionTask((current) => ({
           ...current,
           runId: event.data.runId || current.runId,
@@ -941,6 +1124,7 @@ export default function Home() {
         }));
       }
       if (event.data.type === 'COLLECTION_BATCH_COMPLETED') {
+        if (!event.data.connectorJobId) return;
         const succeeded = Number(event.data.succeeded) || 0;
         const failed = Number(event.data.failed) || 0;
         const completedAt = event.data.completedAt || new Date().toISOString();
@@ -954,9 +1138,20 @@ export default function Home() {
           failed,
           completedAt,
         });
-        setNotice(`本轮检查完成：${succeeded} 个账号成功，${failed} 个账号失败`);
+        const updateResults = [...collectionUpdatesRef.current.values()];
+        const updatedAccounts = updateResults.filter((result) => result.newVideoCount > 0);
+        const newVideoCount = updatedAccounts.reduce((total, result) => total + result.newVideoCount, 0);
+        setNotice(updateResults.length
+          ? newVideoCount
+            ? `本轮检查完成：${updatedAccounts.length} 个博主共发布 ${newVideoCount} 条新视频`
+            : `本轮检查完成：${succeeded} 个账号均未发现新视频`
+          : `本轮检查完成：${succeeded} 个账号成功，${failed} 个账号失败`);
       }
       if (event.data.type === 'COLLECTION_ERROR') {
+        if (!event.data.connectorJobId) {
+          if (event.data.messageId) window.postMessage({ source: 'douyin-monitor', type: 'ACK_RESULTS', messageIds: [event.data.messageId] }, window.location.origin);
+          return;
+        }
         if (!event.data.accountId) {
           setIsCollecting(false);
           setCollectionTask((current) => ({
@@ -996,8 +1191,7 @@ export default function Home() {
   }, [loaded]);
 
   useEffect(() => {
-    const capabilityReady = bridgeCapabilities.includes(requiredExtensionCapability)
-      || (bridgeCapabilities.length === 0 && bridgeVersion === requiredExtensionVersion);
+    const capabilityReady = isAnalysisExtensionCompatible(bridgeVersion, bridgeCapabilities);
     if (!loaded || !bridgeReady || bridgeNeedsReload || !capabilityReady) return;
     window.postMessage({
       source: 'douyin-monitor',
@@ -1132,6 +1326,8 @@ export default function Home() {
         initialSyncStatus: 'pending',
         initialSyncCompletedAt: null,
         latestVideoIds: [],
+        latestCheckNewVideoCount: null,
+        latestCheckNewVideoIds: [],
         currentSyncMode: null,
       };
       const nextAccounts = [...accounts, account];
@@ -1168,6 +1364,7 @@ export default function Home() {
       return;
     }
     setIsCollecting(true);
+    collectionUpdatesRef.current.clear();
     setAccounts((current) => current.map((account) => initializedAccounts.some((item) => item.id === account.id) ? {
       ...account,
       status: 'checking',
@@ -1228,6 +1425,7 @@ export default function Home() {
       ...item,
       transcriptStatus: item.transcript ? item.transcriptStatus : 'processing',
       transcriptError: null,
+      analysisUsage: null,
       analysisStatus: 'queued',
       analysisError: null,
     } : item));
@@ -1273,12 +1471,17 @@ export default function Home() {
 
   const initializedAccountCount = accounts.filter((account) => account.initialSyncStatus === 'complete').length;
   const pendingAccountCount = accounts.length - initializedAccountCount;
+  const updatedAccountCount = accounts.filter((account) => (account.latestCheckNewVideoCount || 0) > 0).length;
+  const latestNewVideoCount = accounts.reduce((total, account) => total + (account.latestCheckNewVideoCount || 0), 0);
+  const lastAccountCheckAt = accounts.reduce<string | null>((latest, account) => {
+    if (!account.lastCheckedAt) return latest;
+    if (!latest) return account.lastCheckedAt;
+    return Date.parse(account.lastCheckedAt) > Date.parse(latest) ? account.lastCheckedAt : latest;
+  }, null);
   const currentTaskLabel = isCollecting
     ? collectionTask.accountName
       ? `正在处理 ${collectionTask.accountName} · 账号 ${collectionTask.accountIndex || 1}/${collectionTask.totalAccounts || accounts.length}${collectionTask.totalVideos ? ` · 视频 ${collectionTask.completedVideos}/${collectionTask.totalVideos}` : ''}`
-      : schedulerState?.lastRunStatus === 'running'
-        ? '后台自动检查正在运行'
-        : `任务已启动 · 共 ${collectionTask.totalAccounts || accounts.length} 个账号`
+      : `任务已启动 · 共 ${collectionTask.totalAccounts || accounts.length} 个账号`
     : collectionTask.phase === 'completed' && collectionTask.completedAt
       ? `${formatTime(collectionTask.completedAt)} · 成功 ${collectionTask.succeeded} / 失败 ${collectionTask.failed}`
       : '当前空闲';
@@ -1434,13 +1637,13 @@ export default function Home() {
               setActiveNav(label);
               if (label === '总数据分析') setAnalyticsView('details');
             }}>
-              <span className="navIcon">{icon}</span>{label}
+              <span className="navIcon">{icon}</span><span className="navText">{label}</span>
+              {label === '监控账号' && updatedAccountCount > 0 && <span className="navUpdateBadge" title={`${updatedAccountCount} 个博主有更新，共 ${latestNewVideoCount} 条新视频`}>{latestNewVideoCount}</span>}
             </button>
           ))}
         </nav>
         <div className="sidebarFoot">
           <div className={hostConnected ? 'localStatus connected' : 'localStatus'}><i /><span><b>主机采集服务</b><small>{!hostConnected ? '服务已连接 · 等待主机 Chrome 自动连接' : isHostLocal ? bridgeNeedsReload ? `Chrome 组件缺少视频分析能力 · 需更新一次到 v${requiredExtensionVersion}` : bridgeReady ? `Chrome 已连接${bridgeVersion ? ` · v${bridgeVersion}` : ''}` : 'Chrome 后台已连接 · 网页桥接自动恢复中' : '已连接 · 任务由主机 Chrome 执行'}</small></span></div>
-          <div className="scheduleSummary">自动检查：每 6 小时</div>
           <button className="logoutButton" type="button" onClick={logout}>退出当前设备</button>
         </div>
       </aside>
@@ -1451,10 +1654,9 @@ export default function Home() {
             <header className="topbar">
               <div>
                 <h1>{activeNav}</h1>
-                <p className="subtitle">首次建档近 30 条 · 日常只查最新 3 条 · Chrome 运行时每 6 小时检查</p>
+                <p className="subtitle">首次建档近 30 条 · 日常按需检查最新 3 条</p>
               </div>
               <div className="topActions">
-                <div className="nextRun"><span>下次后台检查</span><b>{schedulerState?.nextRunAt ? formatTime(schedulerState.nextRunAt) : '等待组件'}</b></div>
                 {isHostLocal
                   ? <button className={`qwenControl ${qwenConfigured ? 'ready' : ''}`} type="button" onClick={() => setShowQwenConfig(true)}><span>AI 分析</span><b>{qwenConfigured ? 'Qwen 已配置' : '配置 Qwen'}</b></button>
                   : <div className={`qwenControl remote ${qwenConfigured ? 'ready' : ''}`} title="API Key 只能在主机 localhost 页面配置"><span>AI 分析</span><b>{qwenConfigured ? 'Qwen 已配置' : 'Qwen 未配置'}</b></div>}
@@ -1476,15 +1678,15 @@ export default function Home() {
                 </div>
                 <article className="collectionPanel">
                   <div className="collectionHeader">
-                    <div><h2>采集任务</h2><span>{isHostLocal && bridgeNeedsReload ? `当前 Chrome 组件缺少完整视频分析能力，更新一次后会自动连接` : schedulerState?.alarmRegistered ? 'Chrome 后台调度已注册，关闭工作台网页后仍会继续计时' : accounts.some((account) => account.initialSyncStatus !== 'complete') ? '待完成首次建档：每个账号近 30 条非置顶视频' : hostConnected ? '主机正在核验 6 小时后台调度' : '等待主机采集服务连接'}</span></div>
+                    <div><h2>采集任务</h2><span>{isHostLocal && bridgeNeedsReload ? `当前 Chrome 组件缺少完整视频分析能力，更新一次后会自动连接` : accounts.some((account) => account.initialSyncStatus !== 'complete') ? '待完成首次建档：每个账号近 30 条非置顶视频' : hostConnected ? '只在你主动发起时检查，已提交任务可在网页关闭后继续' : '等待主机采集服务连接'}</span></div>
                   </div>
-                  <div className="schedulerStatusGrid">
-                    <span><small>后台调度</small><b className={schedulerState?.alarmRegistered ? 'schedulerHealthy' : ''}>{schedulerState?.alarmRegistered ? '已启用 · 每 6 小时' : '等待 Chrome 核验'}</b></span>
-                    <span><small>自动检查范围</small><b>{schedulerState ? `${schedulerState.monitoredAccountCount} 个已建档账号` : '—'}</b></span>
-                    <span><small>上次自动运行</small><b>{schedulerState?.lastAttemptAt ? `${formatTime(schedulerState.lastAttemptAt)} · ${schedulerRunLabel(schedulerState.lastRunStatus)}` : schedulerRunLabel(schedulerState?.lastRunStatus)}</b></span>
+                  <div className="taskStatusGrid">
+                    <span><small>运行方式</small><b>仅手动发起</b></span>
+                    <span><small>日常检查范围</small><b>{initializedAccountCount ? `${initializedAccountCount} 个已建档账号 · 各最新 3 条` : '等待账号建档'}</b></span>
+                    <span><small>最近一次检查</small><b>{lastAccountCheckAt ? formatTime(lastAccountCheckAt) : '尚未检查'}</b></span>
                     <span><small>当前采集任务</small><b title={currentTaskLabel}>{currentTaskLabel}</b></span>
                   </div>
-                  <p className="schedulerNote">状态由 Chrome 组件直接核验{schedulerState?.checkedAt ? `（${formatTime(schedulerState.checkedAt)}）` : ''}。网页可以关闭；Chrome 完全退出或电脑睡眠时不会被唤醒，恢复后会执行错过周期的单次补跑。</p>
+                  <p className="taskNote">可从本机、手机或其他已授权设备主动发起；系统不会定时自动检查。主机 Chrome 必须保持运行并维持抖音登录状态。</p>
                 </article>
                 <SectionHeading title="账号监控" count={`${accounts.length} 个账号`} />
                 <AccountBoard accounts={accounts} onAdd={() => setShowAddAccount(true)} onRemove={removeAccount} onInitialSync={startInitialSync} isCollecting={isCollecting} />
@@ -1871,7 +2073,7 @@ function AccountBoard({ accounts, onAdd, onRemove, onInitialSync, isCollecting }
   isCollecting: boolean;
 }) {
   if (!accounts.length) {
-    return <section className="emptyBoard"><div className="emptySymbol">＋</div><h3>添加第一个监控账号</h3><p>首次建立近 30 条非置顶视频档案，之后每 6 小时只检查最新 3 条并自动去重。</p><button className="primaryButton" onClick={onAdd}>添加新监控账号</button></section>;
+    return <section className="emptyBoard"><div className="emptySymbol">＋</div><h3>添加第一个监控账号</h3><p>首次建立近 30 条非置顶视频档案，之后按需检查最新 3 条并自动去重。</p><button className="primaryButton" onClick={onAdd}>添加新监控账号</button></section>;
   }
   return <section className="accountGrid">{accounts.map((account, index) => {
     const statusLabel = account.status === 'checking'
@@ -1881,6 +2083,13 @@ function AccountBoard({ accounts, onAdd, onRemove, onInitialSync, isCollecting }
       <div className="accountTop"><div className="accountAvatar">{account.avatarUrl ? <img src={account.avatarUrl} alt={`${account.name}头像`} referrerPolicy="no-referrer" /> : <span>{index + 1}</span>}</div><span className={`statusPill ${account.status}`}>{statusLabel}</span></div>
       <div className="platformBadge">抖音</div>
       <h3>{account.name}</h3><a href={account.url} target="_blank" rel="noreferrer">打开原账号主页 ↗</a>
+      {account.status === 'checking' && account.currentSyncMode === 'latest'
+        ? <div className="accountUpdateNotice checking">正在检查，完成后显示更新数量</div>
+        : account.latestCheckNewVideoCount !== null && <div className={`accountUpdateNotice ${account.latestCheckNewVideoCount > 0 ? 'updated' : 'none'}`}>
+          {account.latestCheckNewVideoCount > 0
+            ? `有新视频 · 新发布 ${account.latestCheckNewVideoCount} 条`
+            : '本次检查未发现新视频'}
+        </div>}
       <div className="accountMeta"><span><small>首次建档</small><b>{account.initialSyncStatus === 'complete' ? formatTime(account.initialSyncCompletedAt) : '待抓取近 30 条'}</b></span><span><small>最近检查</small><b>{account.lastCheckedAt ? formatTime(account.lastCheckedAt) : '尚未检查'}</b></span></div>
       {account.initialSyncStatus !== 'complete' && <button className="initialSyncButton" disabled={isCollecting} onClick={() => onInitialSync(account)}>{account.status === 'checking' ? '正在抓取近 30 条…' : account.initialSyncStatus === 'error' ? '重新抓取近 30 条' : '首次抓取近 30 条'}</button>}
       <button className="dangerLink" onClick={() => onRemove(account.id)}>移除账号</button>
@@ -1906,15 +2115,16 @@ function VideoTable({ videos, jobs, expandedAnalyses, onAnalysis, connectorConne
         .filter((job) => job.type === 'analyze_video' && String(job.payload.videoId || '') === video.id)
         .sort((left, right) => (right.updatedAt || right.createdAt || '').localeCompare(left.updatedAt || left.createdAt || ''))[0];
       const jobStatus = latestJob?.status || '';
-      const analysisStatus: AnalysisStatus = video.analysis
-        ? 'ready'
-        : ['pending', 'queued', 'waiting'].includes(jobStatus)
+      const analysisStatus: AnalysisStatus = ['pending', 'queued', 'waiting'].includes(jobStatus)
           ? 'queued'
           : ['claimed', 'running', 'processing'].includes(jobStatus)
             ? 'processing'
             : ['failed', 'error', 'expired', 'cancelled'].includes(jobStatus)
               ? 'error'
               : video.analysisStatus;
+      const latestRun = video.analysisRuns[0] || null;
+      const latestUsage = video.analysisUsage || latestRun?.usage || null;
+      const previousRuns = video.analysisRuns.slice(1);
       const analysisError = video.analysisError || latestJob?.error || latestJob?.message;
       const queuedLabel = !connectorConnected
         ? '等待 Chrome'
@@ -1982,6 +2192,35 @@ function VideoTable({ videos, jobs, expandedAnalyses, onAnalysis, connectorConne
               <section><small>字幕与画面文字</small><p>{video.analysis.onScreenText || '未识别'}</p></section>
               <section><small>结构与叙事</small><p>{video.analysis.structureNarrative || '未识别'}</p></section>
             </div>}
+            {latestUsage && <section className="analysisUsage" aria-label="最近一次 AI 分析用量与费用">
+              <div className="analysisUsageHeader"><b>最近一次分析用量</b><small>{latestRun?.updatedAt ? formatTime(latestRun.updatedAt) : '已永久保存'}</small></div>
+              <div className="analysisUsageGrid">
+                <span><small>模型请求</small><b>{analysisRequestCountLabel(latestUsage)}</b></span>
+                <span><small>模型</small><b>{latestUsage.requestedModel}</b></span>
+                <span><small>输入 Token</small><b>{formatTokenCount(latestUsage.promptTokens)}</b></span>
+                <span><small>输出 Token</small><b>{formatTokenCount(latestUsage.completionTokens)}</b></span>
+                <span><small>总 Token</small><b>{formatTokenCount(latestUsage.totalTokens)}</b></span>
+                <span><small>官方原价估算</small><b>{formatEstimatedCost(latestUsage.estimatedCostCny)}</b></span>
+              </div>
+              {latestUsage.requestIds.length > 0 && <p className="analysisRequestIds" title={latestUsage.requestIds.join('\n')}>请求 ID：{latestUsage.requestIds.join('、')}</p>}
+              <p className="analysisUsageNote">{latestUsage.billingNote}{latestUsage.pricing?.checkedAt ? ` 单价核对日期：${latestUsage.pricing.checkedAt}。` : ''}</p>
+            </section>}
+            {!latestUsage && latestRun && <p className="analysisUsageUnavailable">{['queued', 'claimed', 'running'].includes(latestRun.status)
+              ? '本次分析尚未结束，用量将在接口返回后永久保存。'
+              : latestRun.status === 'succeeded'
+                ? '这次历史分析完成时尚未记录接口用量，无法从已保存结果倒推精确 Token 与费用。'
+                : '这次分析未保存到接口用量；可能尚未发起模型请求，也可能未收到完整回执，请以百炼账单核对。'}</p>}
+            {!latestRun && video.analysis && !latestUsage && <p className="analysisUsageUnavailable">这条历史分析完成时尚未记录接口用量，无法从已保存结果倒推精确 Token 与费用。</p>}
+            {(video.analysis || latestRun || latestUsage) && <a className="analysisBillingLink" href="https://bailian.console.aliyun.com/?tab=costing-balance" target="_blank" rel="noreferrer">打开百炼模型用量核对实际账单 ↗</a>}
+            {previousRuns.length > 0 && <section className="analysisRunHistory" aria-label="历史 AI 分析费用记录">
+              <div className="analysisUsageHeader"><b>历史分析用量</b><small>每次独立保存</small></div>
+              <div className="analysisRunList">{previousRuns.map((run) => <div className="analysisRunItem" key={run.id}>
+                <span><b>{formatTime(run.updatedAt || run.createdAt)}</b><small>{analysisRunStatusLabel(run.status)}</small></span>
+                {run.usage
+                  ? <span><b>{formatTokenCount(run.usage.totalTokens)} Token · {formatEstimatedCost(run.usage.estimatedCostCny)}</b><small>{analysisRequestCountLabel(run.usage)}</small></span>
+                  : <span><b>无本机用量记录</b><small>{run.status === 'succeeded' ? '旧版本未保存，无法倒推' : '请按时间到百炼账单核对'}</small></span>}
+              </div>)}</div>
+            </section>}
             {!video.analysis && analysisStatus === 'idle' && <p className="analysisEmpty">点击“AI分析”后生成并永久保存。分析只聚焦视频具体内容，不分析钩子、高潮、引导、语气、音乐或环境音。</p>}
           </section>
         </div>}

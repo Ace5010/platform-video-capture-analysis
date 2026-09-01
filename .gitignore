@@ -38,6 +38,21 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+/data/
 /.venv/
 __pycache__/
 *.py[cod]
+
+# sensitive runtime files
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.dpapi
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.wav
+*.mp3

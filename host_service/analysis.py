@@ -90,6 +90,7 @@ class AnalysisManager:
     def _run(self, job_id: str, payload: dict[str, Any]) -> None:
         task_dir = create_task_temp_dir(self.config, job_id)
         transcript: str | None = None
+        qwen: QwenClient | None = None
         try:
             video_url = payload.get("videoUrl")
             if not isinstance(video_url, str) or not video_url:
@@ -156,7 +157,7 @@ class AnalysisManager:
                     maximum_bytes=64 * 1024 * 1024,
                 )
                 analysis = qwen.analyze_segments(segment_paths, transcript, metadata)
-            self.database.save_analysis_success(job_id, transcript, analysis, source_hash)
+            self.database.save_analysis_success(job_id, transcript, analysis, source_hash, qwen.usage_summary())
         except Exception as error:
             # Never include exception detail that could contain a signed URL or
             # API credential.  Expected errors expose their already-safe text.
@@ -164,7 +165,8 @@ class AnalysisManager:
                 message = str(error)
             else:
                 message = "视频分析发生未预期错误"
-            self.database.save_analysis_failure(job_id, message, transcript)
+            usage = qwen.usage_summary() if qwen is not None else None
+            self.database.save_analysis_failure(job_id, message, transcript, usage)
         finally:
             remove_task_dir(task_dir, self.config.temp_dir)
 

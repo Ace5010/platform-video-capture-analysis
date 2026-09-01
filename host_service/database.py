@@ -16,6 +16,7 @@ from typing import Any, Iterator
 
 from local_asr.punctuation import restore_transcript_text
 
+from .compatibility import CONNECTOR_FRESHNESS_SECONDS, semver_at_least
 from .config import HostConfig
 
 
@@ -86,6 +87,26 @@ def _job_dict(row: sqlite3.Row) -> dict[str, Any]:
         "claimedBy": row["claimed_by"],
         "claimToken": row["claim_token"],
         "attemptCount": row["attempt_count"],
+    }
+
+
+def _analysis_run_dict(row: sqlite3.Row) -> dict[str, Any]:
+    usage: dict[str, Any] | None = None
+    if row["usage_json"]:
+        try:
+            candidate = json.loads(row["usage_json"])
+            if isinstance(candidate, dict):
+                usage = candidate
+        except (TypeError, json.JSONDecodeError):
+            usage = None
+    return {
+        "id": row["id"],
+        "jobId": row["job_id"],
+        "status": row["status"],
+        "usage": usage,
+        "error": row["error"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
     }
 
 
@@ -205,13 +226,16 @@ class Database:
                     source_hash TEXT,
                     analysis_version TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    transcript_raw TEXT,
                     transcript TEXT,
                     analysis_json TEXT,
+                    usage_json TEXT,
                     error TEXT,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(video_id, source_hash, analysis_version)
+                    updated_at TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_analysis_runs_video_created
+                    ON analysis_runs(video_id, created_at DESC);
                 """
             )
             connector_columns = {row["name"] for row in connection.execute("PRAGMA table_info(connectors)")}
@@ -227,6 +251,59 @@ class Database:
             job_columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
             if "claim_token" not in job_columns:
                 connection.execute("ALTER TABLE jobs ADD COLUMN claim_token TEXT")
+            analysis_run_columns = {row["name"] for row in connection.execute("PRAGMA table_info(analysis_runs)")}
+            if "transcript_raw" not in analysis_run_columns:
+                connection.execute("ALTER TABLE analysis_runs ADD COLUMN transcript_raw TEXT")
+            if "usage_json" not in analysis_run_columns:
+                connection.execute("ALTER TABLE analysis_runs ADD COLUMN usage_json TEXT")
+            analysis_runs_sql_row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='analysis_runs'"
+            ).fetchone()
+            analysis_runs_sql = str(analysis_runs_sql_row["sql"] or "") if analysis_runs_sql_row else ""
+            if "UNIQUE(video_id, source_hash, analysis_version)" in analysis_runs_sql:
+                # Older builds treated an analysis result as a mutable cache
+                # entry. Rebuild the table so every user-triggered retry can
+                # keep its own permanent run and usage receipt.
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    connection.execute(
+                        """
+                        CREATE TABLE analysis_runs_history_migration (
+                            id TEXT PRIMARY KEY,
+                            job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id) ON DELETE CASCADE,
+                            video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+                            source_hash TEXT,
+                            analysis_version TEXT NOT NULL,
+                            status TEXT NOT NULL,
+                            transcript_raw TEXT,
+                            transcript TEXT,
+                            analysis_json TEXT,
+                            usage_json TEXT,
+                            error TEXT,
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL
+                        )
+                        """
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO analysis_runs_history_migration(
+                            id,job_id,video_id,source_hash,analysis_version,status,transcript_raw,transcript,
+                            analysis_json,usage_json,error,created_at,updated_at
+                        )
+                        SELECT id,job_id,video_id,source_hash,analysis_version,status,transcript_raw,transcript,
+                            analysis_json,usage_json,error,created_at,updated_at FROM analysis_runs
+                        """
+                    )
+                    connection.execute("DROP TABLE analysis_runs")
+                    connection.execute("ALTER TABLE analysis_runs_history_migration RENAME TO analysis_runs")
+                    connection.execute(
+                        "CREATE INDEX idx_analysis_runs_video_created ON analysis_runs(video_id, created_at DESC)"
+                    )
+                    connection.execute("COMMIT")
+                except Exception:
+                    connection.execute("ROLLBACK")
+                    raise
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -416,7 +493,9 @@ class Database:
         if last_seen:
             try:
                 observed = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
-                connected = (datetime.now(timezone.utc) - observed).total_seconds() <= 150
+                connected = (
+                    datetime.now(timezone.utc) - observed
+                ).total_seconds() <= CONNECTOR_FRESHNESS_SECONDS
             except ValueError:
                 connected = False
         return {
@@ -430,12 +509,34 @@ class Database:
             "activeJobId": row["active_job_id"],
         }
 
-    def connector_supports(self, capability: str) -> bool:
+    def connector_supports(
+        self,
+        capability: str,
+        *,
+        min_version: str | None = None,
+        fresh_within_seconds: int | None = None,
+    ) -> bool:
         with closing(self.connect()) as connection:
             rows = connection.execute(
-                "SELECT capabilities_json FROM connectors WHERE revoked_at IS NULL"
+                "SELECT capabilities_json,extension_version,last_seen_at FROM connectors WHERE revoked_at IS NULL"
             ).fetchall()
-        return any(capability in json.loads(row["capabilities_json"] or "[]") for row in rows)
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            if capability not in json.loads(row["capabilities_json"] or "[]"):
+                continue
+            if min_version and not semver_at_least(row["extension_version"], min_version):
+                continue
+            if fresh_within_seconds is not None:
+                try:
+                    observed = datetime.fromisoformat(str(row["last_seen_at"] or "").replace("Z", "+00:00"))
+                except (TypeError, ValueError):
+                    continue
+                if observed.tzinfo is None:
+                    observed = observed.replace(tzinfo=timezone.utc)
+                if (now - observed).total_seconds() > max(0, fresh_within_seconds):
+                    continue
+            return True
+        return False
 
     @staticmethod
     def _upsert_account(connection: sqlite3.Connection, raw: dict[str, Any]) -> dict[str, Any]:
@@ -497,7 +598,7 @@ class Database:
                 merged.pop(removed_metric, None)
             merged.update(video)
             # A collection result must never erase a saved transcript/analysis.
-            for key in ("transcript", "analysis", "analysisStatus", "analysisUpdatedAt", "analysisError"):
+            for key in ("transcript", "analysis", "analysisUsage", "analysisStatus", "analysisUpdatedAt", "analysisError"):
                 if key not in video or video.get(key) is None:
                     if key in json.loads(current["data_json"]):
                         merged[key] = json.loads(current["data_json"])[key]
@@ -553,6 +654,14 @@ class Database:
         with closing(self.connect()) as connection:
             accounts = [json.loads(row["data_json"]) for row in connection.execute("SELECT data_json FROM accounts ORDER BY created_at")]
             videos = [_normalize_video_transcript(json.loads(row["data_json"])) for row in connection.execute("SELECT data_json FROM videos ORDER BY created_at")]
+            runs_by_video: dict[str, list[dict[str, Any]]] = {}
+            for row in connection.execute(
+                "SELECT id,job_id,video_id,status,usage_json,error,created_at,updated_at "
+                "FROM analysis_runs ORDER BY created_at DESC,id DESC"
+            ):
+                runs_by_video.setdefault(str(row["video_id"]), []).append(_analysis_run_dict(row))
+            for video in videos:
+                video["analysisRuns"] = runs_by_video.get(str(video.get("id") or ""), [])
             snapshots = [json.loads(row["data_json"]) for row in connection.execute("SELECT data_json FROM snapshots ORDER BY captured_at")]
         return {
             "accounts": accounts,
@@ -565,18 +674,70 @@ class Database:
         video_id = _identifier(video_id, "videoId")
         with closing(self.connect()) as connection:
             row = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
-        return _normalize_video_transcript(json.loads(row["data_json"])) if row else None
+            if not row:
+                return None
+            video = _normalize_video_transcript(json.loads(row["data_json"]))
+            run_rows = connection.execute(
+                "SELECT id,job_id,video_id,status,usage_json,error,created_at,updated_at "
+                "FROM analysis_runs WHERE video_id=? ORDER BY created_at DESC,id DESC",
+                (video_id,),
+            ).fetchall()
+            video["analysisRuns"] = [_analysis_run_dict(run) for run in run_rows]
+        return video
 
     def normalize_saved_transcripts(self) -> int:
         """Persist punctuation on transcripts created before restoration was enabled."""
 
         changed = 0
         with self.transaction() as connection:
+            # The original job result predates transcript migration and still
+            # holds the recognizer's exact wording. Prefer it as the clean
+            # source so improved punctuation rules can replace older heuristic
+            # marks instead of stacking more punctuation on top of them.
+            normalized_by_video: dict[str, str] = {}
+            runs = connection.execute(
+                "SELECT analysis_runs.id,analysis_runs.video_id,analysis_runs.status,analysis_runs.transcript_raw,analysis_runs.transcript,"
+                "analysis_runs.job_id,jobs.result_json FROM analysis_runs "
+                "LEFT JOIN jobs ON jobs.id=analysis_runs.job_id ORDER BY analysis_runs.updated_at"
+            ).fetchall()
+            for row in runs:
+                source = row["transcript_raw"] or row["transcript"]
+                result: dict[str, Any] | None = None
+                if row["result_json"]:
+                    try:
+                        candidate = json.loads(row["result_json"])
+                        result = candidate if isinstance(candidate, dict) else None
+                    except json.JSONDecodeError:
+                        result = None
+                    raw_transcript = (result.get("transcriptRaw") or result.get("transcript")) if result else None
+                    if isinstance(raw_transcript, str) and raw_transcript.strip():
+                        source = raw_transcript
+                normalized = restore_transcript_text(source)
+                if normalized != row["transcript"] or not row["transcript_raw"]:
+                    connection.execute(
+                        "UPDATE analysis_runs SET transcript_raw=COALESCE(transcript_raw,?),transcript=?,updated_at=? WHERE id=?",
+                        (source, normalized, utc_now(), row["id"]),
+                    )
+                if result is not None and (result.get("transcript") != normalized or not result.get("transcriptRaw")):
+                    if not result.get("transcriptRaw"):
+                        result["transcriptRaw"] = source
+                    result["transcript"] = normalized
+                    connection.execute(
+                        "UPDATE jobs SET result_json=?,updated_at=? WHERE id=?",
+                        (_compact_json(result), utc_now(), row["job_id"]),
+                    )
+                if row["status"] == "succeeded" and normalized:
+                    normalized_by_video[row["video_id"]] = normalized
+
             rows = connection.execute("SELECT id,data_json FROM videos").fetchall()
             for row in rows:
                 video = json.loads(row["data_json"])
                 before = video.get("transcript")
-                _normalize_video_transcript(video)
+                source = normalized_by_video.get(row["id"])
+                if source:
+                    video["transcript"] = source
+                else:
+                    _normalize_video_transcript(video)
                 if video.get("transcript") == before:
                     continue
                 connection.execute(
@@ -584,16 +745,6 @@ class Database:
                     (_compact_json(video), utc_now(), row["id"]),
                 )
                 changed += 1
-
-            runs = connection.execute("SELECT id,transcript FROM analysis_runs WHERE transcript IS NOT NULL").fetchall()
-            for row in runs:
-                normalized = restore_transcript_text(row["transcript"])
-                if normalized == row["transcript"]:
-                    continue
-                connection.execute(
-                    "UPDATE analysis_runs SET transcript=?,updated_at=? WHERE id=?",
-                    (normalized, utc_now(), row["id"]),
-                )
         return changed
 
     @staticmethod
@@ -620,11 +771,34 @@ class Database:
             row = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
             if row:
                 video = json.loads(row["data_json"])
-                video.update({"analysisStatus": "queued", "analysisError": None})
+                video.update({"analysisStatus": "queued", "analysisError": None, "analysisUsage": None})
                 connection.execute(
                     "UPDATE videos SET data_json=?,updated_at=? WHERE id=?",
                     (_compact_json(video), utc_now(), video_id),
                 )
+
+    @staticmethod
+    def _ensure_analysis_run(
+        connection: sqlite3.Connection,
+        job_id: str,
+        payload: dict[str, Any],
+        status: str = "queued",
+    ) -> None:
+        now = utc_now()
+        connection.execute(
+            "INSERT INTO analysis_runs(id,job_id,video_id,source_hash,analysis_version,status,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO NOTHING",
+            (
+                str(uuid.uuid4()),
+                job_id,
+                _identifier(payload.get("videoId"), "videoId"),
+                str(payload.get("sourceHash") or "") or None,
+                str(payload.get("analysisVersion") or "v1")[:64],
+                status,
+                now,
+                now,
+            ),
+        )
 
     @staticmethod
     def _idempotency_key(job_type: str, payload: dict[str, Any]) -> str:
@@ -650,6 +824,23 @@ class Database:
             basis = f"{job_type}|{_compact_json(payload.get('accountIds') or payload.get('accountId') or 'all')}|{minute_bucket}"
         return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
+    def _latest_analysis_job(
+        self,
+        connection: sqlite3.Connection,
+        base_key: str,
+    ) -> sqlite3.Row | None:
+        rows = connection.execute(
+            "SELECT * FROM jobs WHERE type='analyze_video' ORDER BY created_epoch DESC,created_at DESC,id DESC"
+        ).fetchall()
+        for row in rows:
+            try:
+                candidate_payload = json.loads(row["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(candidate_payload, dict) and self._idempotency_key("analyze_video", candidate_payload) == base_key:
+                return row
+        return None
+
     def create_job(self, requested_type: str, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         job_type = CANONICAL_JOB_TYPES.get(requested_type)
         if not job_type:
@@ -669,26 +860,20 @@ class Database:
         now = utc_now()
         job_ttl = self.config.analysis_job_expiry_seconds if job_type == "analyze_video" else self.config.job_expiry_seconds
         with self.transaction() as connection:
+            self.expire_and_requeue(connection)
             if job_type == "archive_account" and isinstance(payload.get("account"), dict):
                 self._upsert_account(connection, payload["account"])
             existing = connection.execute("SELECT * FROM jobs WHERE idempotency_key=?", (key,)).fetchone()
-            if existing:
-                if bool(payload.get("retry")) and existing["status"] in ("failed", "expired", "cancelled"):
-                    connection.execute(
-                        "UPDATE jobs SET payload_json=?,status='queued',result_json=NULL,progress_json=NULL,error=NULL,"
-                        "updated_at=?,created_epoch=?,expires_at=?,claimed_by=NULL,claim_until=NULL,claim_token=NULL,"
-                        "attempt_count=0 WHERE id=?",
-                        (
-                            _compact_json(payload),
-                            now,
-                            now_epoch,
-                            now_epoch + job_ttl,
-                            existing["id"],
-                        ),
-                    )
-                    self._mark_job_subject_queued(connection, job_type, payload)
-                    reset = connection.execute("SELECT * FROM jobs WHERE id=?", (existing["id"],)).fetchone()
-                    return _job_dict(reset), True
+            if job_type == "analyze_video" and bool(payload.get("retry")):
+                latest = self._latest_analysis_job(connection, key)
+                if latest and latest["status"] in ACTIVE_JOB_STATUSES:
+                    return _job_dict(latest), False
+                if latest:
+                    key = hashlib.sha256(f"{key}|retry-of|{latest['id']}".encode("utf-8")).hexdigest()
+                    repeated = connection.execute("SELECT * FROM jobs WHERE idempotency_key=?", (key,)).fetchone()
+                    if repeated:
+                        return _job_dict(repeated), False
+            elif existing:
                 return _job_dict(existing), False
             job_id = str(uuid.uuid4())
             connection.execute(
@@ -705,6 +890,8 @@ class Database:
                     now_epoch + job_ttl,
                 ),
             )
+            if job_type == "analyze_video":
+                self._ensure_analysis_run(connection, job_id, payload)
             self._mark_job_subject_queued(connection, job_type, payload)
             row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return _job_dict(row), True
@@ -712,6 +899,10 @@ class Database:
     def expire_and_requeue(self, connection: sqlite3.Connection) -> None:
         now_epoch = int(time.time())
         now = utc_now()
+        expired_analysis_jobs = connection.execute(
+            "SELECT id,payload_json FROM jobs WHERE status='queued' AND type='analyze_video' AND expires_at<=?",
+            (now_epoch,),
+        ).fetchall()
         connection.execute(
             "UPDATE jobs SET status='expired',error='AI 分析任务等待主机 Chrome 超时',updated_at=? "
             "WHERE status='queued' AND type='analyze_video' AND expires_at<=?",
@@ -727,6 +918,25 @@ class Database:
             "error=NULL,updated_at=? WHERE status IN ('claimed','running') AND claimed_by IS NOT NULL AND claim_until<=?",
             (now, now_epoch),
         )
+        for job in expired_analysis_jobs:
+            message = "AI 分析任务等待主机 Chrome 超时"
+            connection.execute(
+                "UPDATE analysis_runs SET status='expired',error=?,updated_at=? WHERE job_id=? AND status='queued'",
+                (message, now, job["id"]),
+            )
+            try:
+                video_id = str(json.loads(job["payload_json"]).get("videoId") or "")
+            except (TypeError, json.JSONDecodeError):
+                video_id = ""
+            video_row = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
+            if video_row:
+                video = json.loads(video_row["data_json"])
+                if video.get("analysisStatus") == "queued":
+                    video.update({"analysisStatus": "error", "analysisError": message, "analysisUsage": None})
+                    connection.execute(
+                        "UPDATE videos SET data_json=?,updated_at=? WHERE id=?",
+                        (_compact_json(video), now, video_id),
+                    )
 
     def list_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
         limit = max(1, min(500, int(limit)))
@@ -841,6 +1051,17 @@ class Database:
                 (connector_id, event_id, job_id, utc_now()),
             )
 
+            # Manual collection is now queue-only. A pre-v0.8 extension may
+            # still replay an old six-hour alarm without a host job. Acknowledge
+            # and discard that legacy event so it cannot mutate saved data or
+            # remain stuck in the connector outbox.
+            if job is None:
+                return False, {
+                    "id": None,
+                    "status": "ignored",
+                    "ignoredReason": "unsolicited_collection_disabled",
+                }
+
             status = job["status"] if job else "running"
             if event_type in ("started", "progress"):
                 status = "running"
@@ -852,17 +1073,34 @@ class Database:
                 account_values = payload.get("accounts") or ([payload["account"]] if isinstance(payload.get("account"), dict) else [])
                 for account in account_values:
                     normalized = dict(_object(account, "account"))
+                    account_id = _identifier(normalized.get("id"), "account.id")
                     completed_at = str(payload.get("completedAt") or utc_now())
                     normalized["lastCheckedAt"] = completed_at
                     normalized["lastSuccessAt"] = completed_at
                     normalized["status"] = "ready"
                     normalized["currentSyncMode"] = None
-                    video_ids = [str(video.get("id")) for video in payload.get("videos") or [] if video.get("id")]
+                    account_videos = [
+                        video for video in payload.get("videos") or []
+                        if str(video.get("accountId") or payload.get("accountId") or "") == account_id
+                    ]
+                    video_ids = list(dict.fromkeys(str(video.get("id")) for video in account_videos if video.get("id")))
                     if video_ids:
                         normalized["latestVideoIds"] = video_ids[:3]
                     if payload.get("mode") in ("initial", "archive", "archive30"):
                         normalized["initialSyncStatus"] = "complete"
                         normalized["initialSyncCompletedAt"] = completed_at
+                    elif payload.get("mode") == "latest":
+                        placeholders = ",".join("?" for _ in video_ids)
+                        existing_video_ids = {
+                            str(row["id"])
+                            for row in connection.execute(
+                                f"SELECT id FROM videos WHERE account_id=? AND id IN ({placeholders})",
+                                (account_id, *video_ids),
+                            )
+                        } if video_ids else set()
+                        new_video_ids = [video_id for video_id in video_ids if video_id not in existing_video_ids]
+                        normalized["latestCheckNewVideoCount"] = len(new_video_ids)
+                        normalized["latestCheckNewVideoIds"] = new_video_ids
                     self._upsert_account(connection, normalized)
                 for video in payload.get("videos") or []:
                     self._upsert_video(connection, _object(video, "video"))
@@ -920,13 +1158,18 @@ class Database:
                     video_row = connection.execute("SELECT data_json FROM videos WHERE id=?", (failed_video_id,)).fetchone()
                     if video_row:
                         video = json.loads(video_row["data_json"])
-                        video.update({"analysisStatus": "error", "analysisError": message})
+                        video.update({"analysisStatus": "error", "analysisError": message, "analysisUsage": None})
                         if not video.get("transcript"):
                             video.update({"transcriptStatus": "idle", "transcriptError": None})
                         connection.execute(
                             "UPDATE videos SET data_json=?,updated_at=? WHERE id=?",
                             (_compact_json(video), utc_now(), failed_video_id),
                         )
+                    connection.execute(
+                        "UPDATE analysis_runs SET status='failed',usage_json=NULL,error=?,updated_at=? "
+                        "WHERE job_id=? AND status NOT IN ('succeeded','failed','expired','cancelled')",
+                        (message, utc_now(), job_id),
+                    )
                 if job_id:
                     connection.execute(
                         "UPDATE jobs SET status='failed',error=?,progress_json=NULL,claimed_by=NULL,claim_until=NULL,"
@@ -961,7 +1204,7 @@ class Database:
                 video_row = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
                 if video_row:
                     video = json.loads(video_row["data_json"])
-                    video.update({"analysisStatus": "processing", "analysisError": None})
+                    video.update({"analysisStatus": "processing", "analysisError": None, "analysisUsage": None})
                     if not video.get("transcript"):
                         video.update({"transcriptStatus": "processing", "transcriptError": None})
                     connection.execute(
@@ -979,7 +1222,9 @@ class Database:
         transcript: str,
         analysis: dict[str, Any],
         source_hash: str,
+        usage: dict[str, Any],
     ) -> None:
+        raw_transcript = str(transcript or "").strip()
         transcript = restore_transcript_text(transcript)
         with self.transaction() as connection:
             job = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -987,6 +1232,7 @@ class Database:
                 raise ValueError("任务不存在")
             payload = json.loads(job["payload_json"])
             video_id = _identifier(payload.get("videoId"), "videoId")
+            self._ensure_analysis_run(connection, job_id, payload, status="running")
             video_row = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
             if not video_row:
                 raise ValueError("分析目标视频不存在")
@@ -999,6 +1245,7 @@ class Database:
                     "transcriptUpdatedAt": updated_at,
                     "transcriptError": None,
                     "analysis": analysis,
+                    "analysisUsage": usage,
                     "analysisStatus": "ready",
                     "analysisUpdatedAt": updated_at,
                     "analysisError": None,
@@ -1010,17 +1257,24 @@ class Database:
                 (source_hash, _compact_json(video), updated_at, video_id),
             )
             connection.execute(
-                "UPDATE analysis_runs SET source_hash=?,status='succeeded',transcript=?,analysis_json=?,error=NULL,updated_at=? WHERE job_id=?",
-                (source_hash, transcript, _compact_json(analysis), updated_at, job_id),
+                "UPDATE analysis_runs SET source_hash=?,status='succeeded',transcript_raw=?,transcript=?,analysis_json=?,usage_json=?,error=NULL,updated_at=? WHERE job_id=?",
+                (source_hash, raw_transcript, transcript, _compact_json(analysis), _compact_json(usage), updated_at, job_id),
             )
-            result = {"videoId": video_id, "transcript": transcript, "analysis": analysis, "sourceHash": source_hash}
+            result = {"videoId": video_id, "transcriptRaw": raw_transcript, "transcript": transcript, "analysis": analysis, "analysisUsage": usage, "sourceHash": source_hash}
             connection.execute(
                 "UPDATE jobs SET status='succeeded',result_json=?,progress_json=NULL,error=NULL,updated_at=? WHERE id=?",
                 (_compact_json(result), updated_at, job_id),
             )
 
-    def save_analysis_failure(self, job_id: str, message: str, transcript: str | None = None) -> None:
+    def save_analysis_failure(
+        self,
+        job_id: str,
+        message: str,
+        transcript: str | None = None,
+        usage: dict[str, Any] | None = None,
+    ) -> None:
         safe_message = message[:2000]
+        raw_transcript = str(transcript).strip() if transcript is not None else None
         if transcript is not None:
             transcript = restore_transcript_text(transcript)
         with self.transaction() as connection:
@@ -1029,6 +1283,7 @@ class Database:
                 return
             payload = json.loads(job["payload_json"])
             video_id = str(payload.get("videoId") or "")
+            self._ensure_analysis_run(connection, job_id, payload, status="running")
             video_row = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
             if video_row:
                 video = json.loads(video_row["data_json"])
@@ -1041,14 +1296,15 @@ class Database:
                             "transcriptError": None,
                         }
                     )
-                video.update({"analysisStatus": "error", "analysisError": safe_message})
+                video.update({"analysisStatus": "error", "analysisError": safe_message, "analysisUsage": usage})
                 connection.execute(
                     "UPDATE videos SET data_json=?,updated_at=? WHERE id=?",
                     (_compact_json(video), utc_now(), video_id),
                 )
             connection.execute(
-                "UPDATE analysis_runs SET status='failed',transcript=COALESCE(?,transcript),error=?,updated_at=? WHERE job_id=?",
-                (transcript, safe_message, utc_now(), job_id),
+                "UPDATE analysis_runs SET status='failed',transcript_raw=COALESCE(?,transcript_raw),"
+                "transcript=COALESCE(?,transcript),usage_json=?,error=?,updated_at=? WHERE job_id=?",
+                (raw_transcript, transcript, _compact_json(usage) if usage is not None else None, safe_message, utc_now(), job_id),
             )
             connection.execute(
                 "UPDATE jobs SET status='failed',error=?,progress_json=NULL,updated_at=? WHERE id=?",
@@ -1066,16 +1322,38 @@ class Database:
         """Recover tasks interrupted by a service or machine restart."""
         with self.transaction() as connection:
             rows = connection.execute(
-                "SELECT job_id FROM analysis_runs WHERE status='running'"
+                "SELECT analysis_runs.job_id,analysis_runs.usage_json,jobs.payload_json FROM analysis_runs "
+                "LEFT JOIN jobs ON jobs.id=analysis_runs.job_id WHERE analysis_runs.status='running'"
             ).fetchall()
             now = utc_now()
             for row in rows:
+                message = "主机服务在分析过程中重启，请重新发起分析"
                 connection.execute(
-                    "UPDATE analysis_runs SET status='failed',error='主机服务在分析过程中重启，请重新发起分析',updated_at=? WHERE job_id=?",
-                    (now, row["job_id"]),
+                    "UPDATE analysis_runs SET status='failed',error=?,updated_at=? WHERE job_id=?",
+                    (message, now, row["job_id"]),
                 )
                 connection.execute(
-                    "UPDATE jobs SET status='failed',error='主机服务在分析过程中重启，请重新发起分析',updated_at=? WHERE id=?",
-                    (now, row["job_id"]),
+                    "UPDATE jobs SET status='failed',error=?,updated_at=? WHERE id=?",
+                    (message, now, row["job_id"]),
                 )
+                try:
+                    payload = json.loads(row["payload_json"] or "{}")
+                    video_id = str(payload.get("videoId") or "") if isinstance(payload, dict) else ""
+                except json.JSONDecodeError:
+                    video_id = ""
+                video_row = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
+                if video_row:
+                    usage = None
+                    if row["usage_json"]:
+                        try:
+                            usage_candidate = json.loads(row["usage_json"])
+                            usage = usage_candidate if isinstance(usage_candidate, dict) else None
+                        except json.JSONDecodeError:
+                            usage = None
+                    video = json.loads(video_row["data_json"])
+                    video.update({"analysisStatus": "error", "analysisError": message, "analysisUsage": usage})
+                    connection.execute(
+                        "UPDATE videos SET data_json=?,updated_at=? WHERE id=?",
+                        (_compact_json(video), now, video_id),
+                    )
         return len(rows)
