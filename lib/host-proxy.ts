@@ -9,8 +9,8 @@ const MAX_BODY_BYTES = 64 * 1024;
 const GET_PATHS = new Set(['/health', '/api/auth/status', '/api/state', '/api/jobs', '/api/qwen', '/api/qwen/status']);
 const POST_PATHS = new Set(['/api/auth/login', '/api/auth/logout', '/api/accounts/upsert', '/api/accounts/remove', '/api/accounts/ack-updates', '/api/video-links/analyze', '/api/jobs']);
 
-function errorResponse(status: number, error: string): Response {
-  return Response.json({ ok: false, error }, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
+function errorResponse(status: number, error: string, upstreamStatus?: number): Response {
+  return Response.json({ ok: false, error, ...(upstreamStatus ? { upstreamStatus } : {}) }, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
 }
 
 export async function proxyHostRequest(request: Request, env: HostProxyEnvironment): Promise<Response> {
@@ -92,6 +92,7 @@ export async function proxyHostRequest(request: Request, env: HostProxyEnvironme
     const upstream = await env.HOST_SERVICE.fetch(new Request(target, { method: request.method, headers, body, redirect: 'manual', signal }));
     if ((upstream.status >= 300 && upstream.status < 400) || !upstream.headers.get('Content-Type')?.includes('application/json')) {
       await upstream.body?.cancel();
+      if (upstream.status >= 500) return errorResponse(503, '电脑连接通道暂时不可用，请确认电脑工作台和隧道正在运行。', upstream.status);
       return errorResponse(502, '电脑连接通道返回了无效响应，请检查后台与隧道状态');
     }
     const responseHeaders = new Headers({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });

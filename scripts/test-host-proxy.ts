@@ -66,5 +66,7 @@ respond = async () => new Response('moved', { status: 302, headers: { Location: 
 assert.equal((await proxyHostRequest(request('/api/state'), env)).status, 502);
 assert.equal(requests.at(-1)?.redirect, 'manual');
 respond = async () => new Response('tunnel error', { status: 502 });
-assert.equal((await proxyHostRequest(request('/api/state'), env)).status, 502);
+const offline = await proxyHostRequest(request('/api/state'), env);
+assert.equal(offline.status, 503);
+assert.equal((await offline.json() as { upstreamStatus: number }).upstreamStatus, 502);
 console.log('HTTPS 主机网关检查通过：来源、白名单、Cookie、凭据隔离、请求限制与失败不重发。');
