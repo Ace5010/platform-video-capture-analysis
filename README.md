@@ -108,6 +108,7 @@ npm run dev
 - Cloudflare 隧道健康后，手机在关闭 VPN 的移动网络下打开正式网址并登录，检查已有分析、手动采集和重连。模型分析仍由主动点击触发并按百炼规则计费；常规连接验收不用真实付费模型。
 - 关机或休眠后后台无法提供数据或执行任务；重新联网启动后再连接。云端没有复制一份数据库，已有结果仍留在电脑中。连接失败不会清空历史数据。
 - 隧道异常的最近记录在 `data/host-service/remote-tunnel.log`，内容经过脱敏并限制大小。远程通道配置失败不会阻止原有本机服务启动。开发模式继续直连本机后台，不要求 Cloudflare 登录。
+- Windows 上，隧道会读取已联网实体网卡的 IPv4 地址，并仅为 cloudflared 绑定该出口；通过 Cloudflare 官方接入域名的 A 记录选择节点，兼容拒绝 SRV 查询或无法承载 QUIC 的 TUN 代理。不会关闭 VPN，也不会修改系统 DNS、路由或代理设置。没有合适实体网卡或查询超时则保留客户端默认连接方式。该兼容路径使用官方客户端的 `--edge` 诊断参数，已验证版本为 `2026.9.1`；升级客户端后应复测。TLS 证书校验、QUIC、私有 VPC 和访问密码均保留。
 
 官方参考：[Workers VPC 配置](https://developers.cloudflare.com/workers-vpc/get-started/)、[Tunnel 与 QUIC 要求](https://developers.cloudflare.com/workers-vpc/configuration/tunnel/)、[公开测试期价格](https://developers.cloudflare.com/workers-vpc/platform/pricing/)。
 

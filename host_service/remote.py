@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ipaddress
+import json
 import os
 import re
 import shutil
@@ -17,6 +19,58 @@ from .recovery import safe_error
 
 
 GATEWAY_PORT = 43130  # Loopback only; never add this to the LAN firewall rules.
+
+# Only this connector chooses a source interface. Do not change Windows routes,
+# DNS, proxy settings, or the user's VPN. Some TUN proxies reject SRV queries
+# and cannot carry cloudflared's QUIC traffic even when ordinary HTTPS works.
+_DIRECT_NETWORK_QUERY = r"""
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new()
+$ErrorActionPreference = 'Stop'
+$interfaces = @(Get-NetIPConfiguration | Where-Object {
+    $_.NetAdapter.HardwareInterface -and $_.NetAdapter.Status -eq 'Up' -and $_.IPv4DefaultGateway
+} | Sort-Object { $_.IPv4Interface.InterfaceMetric })
+if ($interfaces.Count -eq 0) { exit 1 }
+$bindAddress = $interfaces[0].IPv4Address.IPAddress | Select-Object -First 1
+$edges = @('region1.v2.argotunnel.com', 'region2.v2.argotunnel.com') | ForEach-Object {
+    @(Resolve-DnsName -Name $_ -Type A -DnsOnly -QuickTimeout |
+        Where-Object Type -eq 'A' | Select-Object -ExpandProperty IPAddress -Unique) |
+        Select-Object -First 2
+}
+@{ bindAddress = $bindAddress; edges = @($edges) } | ConvertTo-Json -Compress
+"""
+
+
+def direct_tunnel_arguments() -> list[str]:
+    """Read a physical route and official edge A records; change no OS state.
+
+    cloudflared 2026.9.1 accepts static edges without changing its certificate
+    checks. The --edge switch is a diagnostic/compatibility interface, so keep
+    its use here and recheck it when upgrading the installed local client.
+    """
+    if os.name != "nt":
+        return []
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", _DIRECT_NETWORK_QUERY],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15, check=True, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        details = json.loads(result.stdout)
+        bind = ipaddress.IPv4Address(details["bindAddress"])
+        if bind.is_loopback or bind.is_link_local or bind.is_multicast or bind.is_unspecified:
+            return []
+        edges = list(dict.fromkeys(str(ipaddress.IPv4Address(value)) for value in details["edges"]))
+        if len(edges) < 2 or len(edges) > 4 or any(
+            not ipaddress.ip_address(value).is_global or ipaddress.ip_address(value).is_multicast for value in edges
+        ):
+            return []
+        arguments = ["--edge-bind-address", str(bind)]
+        for edge in edges:
+            arguments.extend(["--edge", f"{edge}:7844"])
+        return arguments
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError):
+        # Standard cloudflared discovery remains available on other networks.
+        return []
 
 
 @dataclass(frozen=True, repr=False)
@@ -85,8 +139,11 @@ class TunnelProcess:
             if self.stopped.wait(0 if attempt == 0 else 5 * attempt):
                 return
             try:
+                network_arguments = [] if self.config.testing else direct_tunnel_arguments()
+                if self.stopped.is_set():
+                    return
                 self.process = subprocess.Popen(
-                    [executable, "tunnel", "--no-autoupdate", "--protocol", "quic", "--loglevel", "warn", "run"],
+                    [executable, "tunnel", "--no-autoupdate", "--protocol", "quic", "--loglevel", "warn", *network_arguments, "run"],
                     env=environment, stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                     text=True, encoding="utf-8", errors="replace",

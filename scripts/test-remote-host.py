@@ -7,12 +7,13 @@ import json
 import runpy
 import tempfile
 import threading
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 # Reuse the existing host fixture configuration, not production configuration.
 helpers = runpy.run_path(str(Path(__file__).with_name("test-host-service.py")))
-from host_service.remote import RemoteConnection, TunnelProcess  # noqa: E402
+from host_service.remote import RemoteConnection, TunnelProcess, direct_tunnel_arguments  # noqa: E402
 from host_service.security import SecretStore  # noqa: E402
 from host_service.server import create_remote_gateway, create_server  # noqa: E402
 
@@ -21,6 +22,34 @@ TUNNEL_TOKEN = "t" * 60
 
 
 def run() -> None:
+    # Read-only adapter selection and A-record compatibility, with no real DNS.
+    import subprocess
+    valid_network = {"bindAddress": "192.168.31.188", "edges": ["198.41.192.7", "198.41.192.27", "198.41.200.13", "198.41.200.23"]}
+    with patch("host_service.remote.os.name", "nt"), patch("host_service.remote.subprocess.run") as network_query:
+        network_query.return_value = Mock(stdout=json.dumps(valid_network))
+        network_args = direct_tunnel_arguments()
+        assert network_args[:2] == ["--edge-bind-address", "192.168.31.188"]
+        assert network_args.count("--edge") == 4
+        assert "198.41.192.7:7844" in network_args
+        assert network_query.call_args.kwargs["timeout"] == 15
+        command = network_query.call_args.args[0][-1]
+        assert "Get-NetIPConfiguration" in command and "Resolve-DnsName" in command
+        assert not any(word in command for word in ("Set-", "Remove-", "New-Net", "Disable-", "Stop-"))
+        for invalid in (
+            {**valid_network, "bindAddress": "127.0.0.1"},
+            {**valid_network, "bindAddress": "169.254.1.2"},
+            {**valid_network, "edges": ["127.0.0.1", "198.41.192.7"]},
+            {**valid_network, "edges": ["224.0.0.1", "198.41.192.7"]},
+            {**valid_network, "edges": ["198.41.192.7"]},
+            {**valid_network, "edges": ["198.41.192.7", "198.41.192.7"]},
+            {},
+        ):
+            network_query.return_value = Mock(stdout=json.dumps(invalid))
+            assert direct_tunnel_arguments() == []
+        network_query.return_value = Mock(stdout="not json")
+        assert direct_tunnel_arguments() == []
+        network_query.side_effect = subprocess.TimeoutExpired("powershell", 15)
+        assert direct_tunnel_arguments() == []
     with tempfile.TemporaryDirectory(prefix="douyin-remote-check-") as temporary:
         config = helpers["create_test_config"](Path(temporary))
         assert RemoteConnection.load(config) is None
@@ -113,7 +142,7 @@ def run() -> None:
         child.poll.return_value = None
         with patch("host_service.remote.shutil.which", return_value="test-cloudflared"), patch("host_service.remote.subprocess.Popen", return_value=child) as popen:
             with patch.object(tunnel.stopped, "wait", side_effect=[False, True]):
-                with patch.object(tunnel.stopped, "is_set", return_value=True):
+                with patch.object(tunnel.stopped, "is_set", side_effect=[False, True]):
                     tunnel._run()
             args, kwargs = popen.call_args
             assert TUNNEL_TOKEN not in " ".join(args[0])
@@ -124,6 +153,20 @@ def run() -> None:
         tunnel = TunnelProcess(config, connection)
         tunnel.stopped.set()
         with patch("host_service.remote.shutil.which", return_value="test-cloudflared"), patch("host_service.remote.subprocess.Popen") as popen:
+            tunnel._run()
+            popen.assert_not_called()
+        tunnel = TunnelProcess(replace(config, testing=False), connection)
+        child = Mock(stderr=iter([]))
+        with patch("host_service.remote.direct_tunnel_arguments", return_value=network_args), patch("host_service.remote.subprocess.Popen", return_value=child) as popen:
+            with patch.object(tunnel.stopped, "wait", side_effect=[False, True]), patch.object(tunnel.stopped, "is_set", side_effect=[False, True]):
+                tunnel._run()
+            command = popen.call_args.args[0]
+            assert command[-1] == "run" and "quic" in command
+            assert all(argument in command for argument in network_args)
+            assert "--no-tls-verify" not in command
+            assert TUNNEL_TOKEN not in " ".join(command)
+        tunnel = TunnelProcess(replace(config, testing=False), connection)
+        with patch("host_service.remote.direct_tunnel_arguments", side_effect=lambda: (tunnel.stopped.set() or [])), patch("host_service.remote.subprocess.Popen") as popen:
             tunnel._run()
             popen.assert_not_called()
         log_child = Mock(stderr=iter([f'ERR connection token={TUNNEL_TOKEN}\n', 'ERR DNS operation refused\n']))
