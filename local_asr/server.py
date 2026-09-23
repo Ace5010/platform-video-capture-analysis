@@ -11,12 +11,13 @@ import socket
 import ssl
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 from .punctuation import restore_punctuation
 
@@ -109,6 +110,27 @@ def _is_allowed_cdn_hostname(hostname: str) -> bool:
     )
 
 
+def _is_verified_douyin_play_url(url: str, expected_video_id: str | None) -> bool:
+    if not expected_video_id or not VIDEO_ID_PATTERN.fullmatch(expected_video_id):
+        return False
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.hostname is None
+        or parsed.hostname.lower() != "www.douyin.com"
+        or parsed.path != "/aweme/v1/play/"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+    ):
+        return False
+    return parse_qs(parsed.query).get("__vid", []) == [expected_video_id]
+
+
 def _is_public_address(value: str) -> bool:
     try:
         address = ipaddress.ip_address(value.split("%", 1)[0])
@@ -117,7 +139,7 @@ def _is_public_address(value: str) -> bool:
     return address.is_global
 
 
-def _validate_download_target(url: str) -> DownloadTarget:
+def _validate_download_target(url: str, *, expected_video_id: str | None = None) -> DownloadTarget:
     if not url or len(url) > MAX_URL_LENGTH:
         raise ApiError(HTTPStatus.BAD_REQUEST, "audioUrl 为空或过长")
     if any(ord(character) < 32 or ord(character) == 127 for character in url):
@@ -147,7 +169,10 @@ def _validate_download_target(url: str) -> DownloadTarget:
         hostname.endswith(".")
         or not HOST_PATTERN.fullmatch(hostname)
         or ".." in hostname
-        or not _is_allowed_cdn_hostname(hostname)
+        or not (
+            _is_allowed_cdn_hostname(hostname)
+            or _is_verified_douyin_play_url(url, expected_video_id)
+        )
     ):
         raise ApiError(HTTPStatus.BAD_REQUEST, "audioUrl 不是允许的抖音音频 CDN 地址")
 
@@ -191,13 +216,19 @@ def _validate_download_target(url: str) -> DownloadTarget:
     )
 
 
-def _open_download(target: DownloadTarget) -> tuple[PinnedHTTPSConnection, http.client.HTTPResponse]:
+def _open_download(target: DownloadTarget, *, deadline: float | None = None, check_cancelled=None) -> tuple[PinnedHTTPSConnection, http.client.HTTPResponse]:
     for address in target.addresses:
+        if check_cancelled is not None:
+            check_cancelled()
+        remaining = deadline - time.monotonic() if deadline is not None else DOWNLOAD_TIMEOUT_SECONDS
+        if remaining <= 0:
+            raise ApiError(HTTPStatus.GATEWAY_TIMEOUT, "完整媒体连接超过本次获取时限")
         connection = PinnedHTTPSConnection(
             target.hostname,
             target.port,
             address,
         )
+        connection.timeout = min(DOWNLOAD_TIMEOUT_SECONDS, remaining)
         try:
             connection.request(
                 "GET",

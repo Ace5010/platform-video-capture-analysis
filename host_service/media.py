@@ -12,18 +12,37 @@ import time
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
+from collections.abc import Callable
 
 from local_asr.server import ApiError, _open_download, _validate_download_target
 
 
-def download_media(url: str, destination: Path, max_bytes: int, media_name: str = "视频") -> int:
+def download_media(
+    url: str,
+    destination: Path,
+    max_bytes: int,
+    media_name: str = "视频",
+    *,
+    expected_video_id: str | None = None,
+    deadline: float | None = None,
+    check_cancelled: Callable[[], None] | None = None,
+) -> int:
     """Download one already-validated Douyin CDN URL without following unsafe redirects."""
     from urllib.parse import urljoin
 
     current_url = url
+    deadline = deadline or (time.monotonic() + 300)
+
+    def check() -> None:
+        if check_cancelled is not None:
+            check_cancelled()
+        if time.monotonic() >= deadline:
+            raise ApiError(HTTPStatus.GATEWAY_TIMEOUT, f"{media_name}下载超过本次获取时限")
+
     for redirect_index in range(5):
-        target = _validate_download_target(current_url)
-        connection, response = _open_download(target)
+        check()
+        target = _validate_download_target(current_url, expected_video_id=expected_video_id)
+        connection, response = _open_download(target, deadline=deadline, check_cancelled=check_cancelled)
         try:
             if response.status in (301, 302, 303, 307, 308):
                 if redirect_index >= 4:
@@ -57,9 +76,15 @@ def download_media(url: str, destination: Path, max_bytes: int, media_name: str 
             ):
                 raise ApiError(HTTPStatus.BAD_GATEWAY, f"CDN 未返回可识别的{media_name}文件")
             total = 0
+            read = getattr(response, "read1", response.read)
             with destination.open("xb") as output:
                 while True:
-                    chunk = response.read(256 * 1024)
+                    check()
+                    sock = getattr(connection, "sock", None)
+                    if sock is not None:
+                        sock.settimeout(max(0.1, min(30, deadline - time.monotonic())))
+                    chunk = read(64 * 1024)
+                    check()
                     if not chunk:
                         break
                     total += len(chunk)
@@ -68,6 +93,8 @@ def download_media(url: str, destination: Path, max_bytes: int, media_name: str 
                     output.write(chunk)
             if total == 0:
                 raise ApiError(HTTPStatus.BAD_GATEWAY, f"{media_name}文件为空")
+            if declared and total != declared_size:
+                raise ApiError(HTTPStatus.BAD_GATEWAY, f"{media_name}文件不完整：实际下载大小与声明不一致")
             return total
         except ApiError:
             destination.unlink(missing_ok=True)
@@ -88,14 +115,14 @@ def _tool_path(name: str) -> str:
     raise RuntimeError(f"缺少 {name}，请先安装 FFmpeg")
 
 
-def probe_media(path: Path) -> dict[str, Any]:
+def probe_media(path: Path, *, timeout: float = 60) -> dict[str, Any]:
     result = subprocess.run(
         [
             _tool_path("ffprobe"),
             "-v",
             "error",
             "-show_entries",
-            "format=duration,format_name:stream=index,codec_type,codec_name,width,height",
+            "format=duration,format_name:stream=index,codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate",
             "-of",
             "json",
             str(path),
@@ -104,7 +131,7 @@ def probe_media(path: Path) -> dict[str, Any]:
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=60,
+        timeout=max(0.1, min(60, timeout)),
         check=False,
     )
     if result.returncode != 0:
@@ -123,6 +150,25 @@ def has_audio_stream(probe: dict[str, Any]) -> bool:
     return any(stream.get("codec_type") == "audio" for stream in probe.get("streams") or [])
 
 
+def prepare_cloud_audio(path: Path, probe: dict[str, Any], destination: Path) -> Path | None:
+    """Copy the complete AAC track for smaller uploads; keep other codecs intact."""
+    audio = next((stream for stream in probe.get("streams") or [] if stream.get("codec_type") == "audio"), None)
+    if audio is None:
+        return None
+    if audio.get("codec_name") not in {"aac", "alac"}:
+        return path
+    result = subprocess.run(
+        [_tool_path("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error",
+         "-i", str(path), "-map", "0:a:0", "-c:a", "copy", "-vn",
+         "-movflags", "+faststart", "-y", str(destination)],
+        capture_output=True, timeout=120, check=False,
+    )
+    if result.returncode != 0 or not destination.exists() or destination.stat().st_size == 0:
+        destination.unlink(missing_ok=True)
+        raise RuntimeError("完整音轨无损提取失败")
+    return destination
+
+
 def media_duration_seconds(probe: dict[str, Any]) -> float | None:
     try:
         duration = float((probe.get("format") or {}).get("duration"))
@@ -131,7 +177,7 @@ def media_duration_seconds(probe: dict[str, Any]) -> float | None:
     return duration if duration > 0 else None
 
 
-def mux_original_streams(video_path: Path, audio_path: Path, output_path: Path) -> None:
+def mux_original_streams(video_path: Path, audio_path: Path, output_path: Path, *, timeout: float = 300) -> None:
     """Combine original encoded streams.  `-c copy` forbids quality loss."""
     result = subprocess.run(
         [
@@ -156,7 +202,7 @@ def mux_original_streams(video_path: Path, audio_path: Path, output_path: Path) 
             str(output_path),
         ],
         capture_output=True,
-        timeout=300,
+        timeout=max(0.1, min(300, timeout)),
         check=False,
     )
     if result.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
@@ -193,7 +239,7 @@ def lossless_segments(path: Path, destination: Path, segment_seconds: int = 600)
         check=False,
     )
     segments = sorted(destination.glob("segment-*.mp4"))
-    if result.returncode != 0 or len(segments) < 2 or any(item.stat().st_size == 0 for item in segments):
+    if result.returncode != 0 or not segments or any(item.stat().st_size == 0 for item in segments):
         raise RuntimeError("视频超过模型预算，但无损连续分段失败")
     return segments
 
@@ -206,15 +252,22 @@ def lossless_segments_below_limit(
 ) -> list[Path]:
     """Split by stream copy until every continuous segment fits the upload cap."""
     seconds = 600
-    for attempt in range(6):
+    # A short source (or a long GOP) can yield one valid, still-oversized
+    # segment. Keep shortening instead of treating that first pass as an
+    # FFmpeg failure. Eleven passes reach one second without unbounded retries.
+    for attempt in range(11):
         attempt_dir = destination / f"attempt-{attempt}"
-        segments = lossless_segments(path, attempt_dir, seconds)
-        if len(segments) <= maximum_segments and all(item.stat().st_size <= maximum_bytes for item in segments):
+        try:
+            segments = lossless_segments(path, attempt_dir, seconds)
+        except Exception:
+            shutil.rmtree(attempt_dir, ignore_errors=True)
+            raise
+        if 2 <= len(segments) <= maximum_segments and all(item.stat().st_size <= maximum_bytes for item in segments):
             return segments
         shutil.rmtree(attempt_dir, ignore_errors=True)
-        seconds //= 2
-        if seconds < 30:
+        if len(segments) > maximum_segments or seconds == 1:
             break
+        seconds = max(1, seconds // 2)
     raise RuntimeError("视频超过临时上传上限，无法在 64 段内完成无损连续分段")
 
 

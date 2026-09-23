@@ -4,6 +4,7 @@ import {
   analyticsMetricValue,
   calculateDelta,
   metricRank,
+  metricTrendSegments,
   orderVideosOldestFirst,
   previousPublishedVideo,
   snapshotMetricChange,
@@ -47,6 +48,23 @@ assert.equal(analyticsMetricValue(null), null);
 assert.equal(analyticsMetricValue(''), null);
 assert.equal(analyticsMetricValue(-1), null);
 assert.equal(analyticsMetricValue(0), 0);
+
+const gappedVideos = [
+  { ...video('missing-start', null, 1), likeCount: null },
+  video('zero', null, 0),
+  video('valid', null, 20),
+  { ...video('missing-middle', null, 1), likeCount: null },
+  video('isolated', null, 15),
+  { ...video('missing-end', null, 1), likeCount: null },
+];
+assert.deepEqual(metricTrendSegments(gappedVideos, 'likeCount'), [
+  [{ index: 1, value: 0 }, { index: 2, value: 20 }],
+  [{ index: 4, value: 15 }],
+]);
+assert.deepEqual(metricTrendSegments([], 'likeCount'), []);
+assert.deepEqual(metricTrendSegments(gappedVideos.filter((item) => item.likeCount === null), 'likeCount'), []);
+assert.deepEqual(metricTrendSegments([video('single-zero', null, 0)], 'likeCount'), [[{ index: 0, value: 0 }]]);
+assert.deepEqual(metricTrendSegments([{ ...video('other-metric', null, 99), commentCount: 0 }], 'commentCount'), [[{ index: 0, value: 0 }]]);
 
 const snapshots: AnalyticsSnapshotLike[] = [
   { accountId: 'account-a', videoId: 'v1', capturedAt: '2026-08-01T12:00:00Z', likeCount: 100, commentCount: 10, favoriteCount: 20, shareCount: 5 },
@@ -97,4 +115,4 @@ const mixedAccounts = [
 ];
 assert.equal(previousPublishedVideo(mixedAccounts[2], mixedAccounts)?.id, 'a-old');
 
-console.log('Video analytics validation passed: chronology, snapshot growth, account isolation, zero baseline, correction, median, recent comparison, and ranking.');
+console.log('Video analytics validation passed: chronology, missing-value trend gaps, real zero points, snapshot growth, account isolation, zero baseline, correction, median, recent comparison, and ranking.');

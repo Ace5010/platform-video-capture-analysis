@@ -1,4 +1,4 @@
-export const MINIMUM_ANALYSIS_EXTENSION_VERSION = '0.8.0';
+export const MINIMUM_ANALYSIS_EXTENSION_VERSION = '0.9.7';
 export const REQUIRED_ANALYSIS_EXTENSION_CAPABILITY = 'analyze_video';
 
 type ParsedSemver = {

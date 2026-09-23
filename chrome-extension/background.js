@@ -22,9 +22,10 @@ const DETAIL_DOM_WAIT_MS = 15_000;
 const MEDIA_CAPTURE_WAIT_MS = 22_000;
 const TRANSCRIBE_TIMEOUT_MS = 180_000;
 const INITIAL_HISTORY_VIDEOS = 30;
-const LATEST_CHECK_VIDEOS = 3;
+const LATEST_CHECK_VIDEOS = 5;
 const DASHBOARD_URL_PATTERNS = ['http://localhost/*', 'http://127.0.0.1/*'];
 const MEDIA_URL_PATTERNS = [
+  'https://www.douyin.com/aweme/v1/play/*',
   'https://*.douyinvod.com/*',
   'https://*.douyinstatic.com/*',
   'https://*.douyinpic.com/*',
@@ -58,7 +59,10 @@ chrome.runtime.onStartup.addListener(() => {
   void disableLegacyScheduledCollection().catch(() => undefined).then(() => initializeConnector());
 });
 
-void disableLegacyScheduledCollection().catch(() => undefined).then(() => initializeConnector());
+// The host reuses the extraction functions without starting the extension gateway.
+if (!globalThis.__DOUYIN_HOST_BROWSER__) {
+  void disableLegacyScheduledCollection().catch(() => undefined).then(() => initializeConnector());
+}
 
 async function disableLegacyScheduledCollection() {
   await chrome.alarms.clear(LEGACY_SCHEDULE_ALARM_NAME);
@@ -822,6 +826,8 @@ async function executeConnectorJob(job) {
         videoId,
         accountId: typeof payload.accountId === 'string' ? payload.accountId : null,
         videoUrl: normalizeVideoUrl(payload.videoUrl || payload.url, videoId),
+        requireCompleteMetadata: payload.sourceKind === 'video_link',
+        savedVideoMetadata: payload.savedVideoMetadata,
       }),
       lockToken,
     );
@@ -837,8 +843,10 @@ async function executeConnectorJob(job) {
           audioUrl: media.audio?.url || null,
           videoId,
           accountId: typeof payload.accountId === 'string' ? payload.accountId : null,
-          title: typeof payload.title === 'string' ? payload.title : null,
-          description: typeof payload.description === 'string' ? payload.description : null,
+          title: media.videoMetadata?.title || media.videoMetadata?.description || (typeof payload.title === 'string' ? payload.title : null),
+          description: media.videoMetadata?.description || (typeof payload.description === 'string' ? payload.description : null),
+          authorName: media.videoMetadata?.authorName || (typeof payload.authorName === 'string' ? payload.authorName : null),
+          videoMetadata: media.videoMetadata || null,
           sourceVideoUrl: media.sourceVideoUrl,
           mediaMeta: {
             video: media.video.metadata,
@@ -1053,12 +1061,16 @@ async function collectAccount(account, mode, onProgress) {
       throw new Error(`账号仍有更多作品，但本轮只完整读取到 ${accountPage.videos.length}/${targetCount} 条，已停止写入半成品`);
     }
 
+    const pending = Array.isArray(account.pendingVideos) ? account.pendingVideos : [];
+    const freshIds = new Set(accountPage.videos.map((item) => String(item.id)));
+    accountPage.videos = [...new Map([...accountPage.videos, ...pending.filter((item) => item?.id && !freshIds.has(String(item.id)) && videoIdFromUrl(item.url) === String(item.id))]
+      .map((item) => [String(item.id), item])).values()];
     const enrichedVideos = [];
     const total = accountPage.videos.length;
     for (let index = 0; index < total; index += 1) {
       const video = accountPage.videos[index];
       await onProgress({ stage: 'video-detail', completed: index, total });
-      if (video.dataComplete === true) {
+      if (hasCompletePublicData(video)) {
         enrichedVideos.push({
           ...video,
           accountId: account.id,
@@ -1068,38 +1080,45 @@ async function collectAccount(account, mode, onProgress) {
         await onProgress({ stage: 'video-detail', completed: index + 1, total });
         continue;
       }
-      try {
-        const details = await collectVideoDetails(video.url);
-        enrichedVideos.push(mergeVideoDetails(video, details, account.id));
-      } catch (error) {
-        enrichedVideos.push({
-          ...video,
-          accountId: account.id,
-          transcript: null,
-          detailError: errorMessage(error),
-        });
-      }
+      enrichedVideos.push(await collectVideoWithRetries(video, account.id));
       await onProgress({ stage: 'video-detail', completed: index + 1, total });
-    }
-
-    const incompleteVideos = enrichedVideos.filter((video) => !hasCompletePublicData(video));
-    if (incompleteVideos.length > 0) {
-      throw new Error(`${incompleteVideos.length} 条视频仍缺少封面、文案或公开互动数据，已停止整批写入`);
     }
 
     return {
       accountName: accountPage.accountName || account.name || '抖音账号',
       accountAvatarUrl: accountPage.accountAvatarUrl || account.avatarUrl || null,
       videos: enrichedVideos,
-      warning: null,
     };
   } finally {
     await chrome.tabs.remove(tab.id).catch(() => {});
   }
 }
 
-async function collectVideoDetails(videoUrl) {
-  const tab = await chrome.tabs.create({ url: videoUrl, active: false });
+async function collectVideoWithRetries(video, accountId) {
+  let result = { ...video, accountId };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const details = await collectVideoDetails(video.url, attempt > 0);
+      result = mergeVideoDetails(result, details, accountId);
+      if (hasCompletePublicData(result)) return result;
+    } catch (error) {
+      result.detailError = errorMessage(error);
+      if (/跳转到其他视频|目标视频校验失败/.test(result.detailError)) break;
+    }
+  }
+  throw new Error(`视频 ${video.id} 自动恢复后仍未完整读取：缺少${missingPublicFields(result).join('、')}；${result.detailError || '字段未加载'}`);
+}
+
+function missingPublicFields(video) {
+  return [['title', '标题'], ['description', '文案'], ['coverUrl', '封面'], ['publishedAt', '发布时间'],
+    ['durationSeconds', '时长'], ['likeCount', '点赞数'], ['commentCount', '评论数'],
+    ['favoriteCount', '收藏数'], ['shareCount', '分享数']]
+    .filter(([key]) => video[key] === null || video[key] === undefined || video[key] === '')
+    .map(([, label]) => label);
+}
+
+async function collectVideoDetails(videoUrl, active = false) {
+  const tab = await chrome.tabs.create({ url: videoUrl, active });
   if (!tab.id) throw new Error('无法创建视频详情标签页');
 
   try {
@@ -1120,8 +1139,18 @@ async function collectVideoDetails(videoUrl) {
     if (expectedVideoId && observedVideoId !== expectedVideoId) {
       throw new Error(`详情页已跳转到其他视频（${observedVideoId}），已停止写入`);
     }
-    const details = await executeInTab(tab.id, extractVideoDetailPage);
-    if (!details) throw new Error('视频详情页没有返回数据');
+    let details = await executeInTab(tab.id, extractVideoDetailPage, [expectedVideoId]);
+    if (!details) throw new Error('目标视频校验失败，已停止写入');
+    // Text can render before the media has loaded. Keep this page alive,
+    // activate the verified player and poll actual fields, not just DOM nodes.
+    if (!hasCompletePublicData({ ...details, title: details.description })) {
+      await chrome.tabs.update(tab.id, { active: true });
+      const playback = await executeInTab(tab.id, activateVerifiedVideoPlayback, [expectedVideoId]);
+      if (!playback?.targetMatches) throw new Error('目标视频校验失败，已停止写入');
+      details = await executeUntilPageCondition(tab.id, extractVideoDetailPage, [expectedVideoId],
+        'ISOLATED', 30_000, (value) => hasCompletePublicData({ ...value, title: value?.description }));
+      if (!details) throw new Error('目标视频校验失败，已停止写入');
+    }
     return details;
   } finally {
     await chrome.tabs.remove(tab.id).catch(() => {});
@@ -1331,18 +1360,38 @@ function scoreMediaCandidate(urlValue, requestType, contentTypeValue) {
   return 0;
 }
 
-function extractVerifiedVideoMediaSources(expectedVideoId) {
+function extractVerifiedVideoMediaSources(expectedVideoId, receivedMediaRoots = []) {
   const targetId = String(expectedVideoId || '');
   const videoCandidates = new Map();
   const audioCandidates = new Map();
   if (!/^\d+$/.test(targetId)) return { videoCandidates: [], audioCandidates: [] };
 
+  // Page stores can reference DOM nodes, windows and throwing getters. Only
+  // inspect own data properties; unrelated browser objects are not video data.
+  const dataProperties = (value) => {
+    try {
+      if ((typeof Window !== 'undefined' && value instanceof Window)
+        || (typeof Node !== 'undefined' && value instanceof Node)) return {};
+      return Object.fromEntries(Object.entries(Object.getOwnPropertyDescriptors(value))
+        .filter(([, descriptor]) => Object.hasOwn(descriptor, 'value'))
+        .map(([key, descriptor]) => [key, descriptor.value]));
+    } catch { return {}; } // Cross-origin WindowProxy or inaccessible proxy.
+  };
+
   const numberOrNull = (...values) => {
     for (const value of values) {
+      if (typeof value !== 'number' && typeof value !== 'string') continue;
       const number = Number(value);
       if (Number.isFinite(number) && number > 0) return number;
     }
     return null;
+  };
+  const scalarText = (...values) => {
+    for (const value of values) {
+      if (typeof value === 'string' && value) return value;
+      if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    }
+    return '';
   };
   const normalizedMediaUrl = (value) => {
     if (typeof value !== 'string' || !value || value.length > 8192) return null;
@@ -1370,8 +1419,8 @@ function extractVerifiedVideoMediaSources(expectedVideoId) {
       height: numberOrNull(value.height, value.video_height, value.videoHeight, inherited.height),
       bitrate: numberOrNull(value.bit_rate, value.bitRate, value.bitrate, value.bandwidth, inherited.bitrate),
       contentLength: numberOrNull(value.data_size, value.dataSize, value.file_size, value.fileSize, inherited.contentLength),
-      quality: String(value.gear_name || value.gearName || value.quality_type || value.qualityType || value.quality || inherited.quality || ''),
-      codec: String(value.codec_type || value.codecType || value.codec || inherited.codec || '') || null,
+      quality: scalarText(value.gear_name, value.gearName, value.quality_type, value.qualityType, value.quality, inherited.quality),
+      codec: scalarText(value.codec_type, value.codecType, value.codec, inherited.codec) || null,
     };
   };
   const addCandidate = (kind, rawUrl, metadata) => {
@@ -1385,15 +1434,36 @@ function extractVerifiedVideoMediaSources(expectedVideoId) {
     const previous = destination.get(url);
     if (!previous || score >= previous.score) destination.set(url, { ...candidate, score });
   };
-  const urlsFrom = (value) => {
-    if (typeof value === 'string') return [value];
-    if (Array.isArray(value)) return value.flatMap((item) => urlsFrom(item)).slice(0, 64);
-    if (!value || typeof value !== 'object') return [];
+  const urlsFrom = (root) => {
+    const queue = [root];
+    const seen = new WeakSet();
     const values = [];
-    for (const key of ['url_list', 'urlList', 'urls', 'url', 'src', 'main_url', 'mainUrl']) {
-      if (Object.hasOwn(value, key)) values.push(...urlsFrom(value[key]));
+    for (let cursor = 0; cursor < queue.length && cursor < 4096 && values.length < 64; cursor += 1) {
+      const value = queue[cursor];
+      if (typeof value === 'string') { values.push(value); continue; }
+      if (!value || typeof value !== 'object' || seen.has(value)) continue;
+      seen.add(value);
+      const properties = dataProperties(value);
+      if (belongsToOtherVideo(properties)) continue;
+      let isArray;
+      try { isArray = Array.isArray(value); } catch { continue; }
+      const keys = isArray ? Object.keys(properties).filter((key) => /^(?:0|[1-9]\d*)$/.test(key))
+        : ['url_list', 'urlList', 'urls', 'url', 'src', 'main_url', 'mainUrl'];
+      for (const key of keys) {
+        if (Object.hasOwn(properties, key)) queue.push(properties[key]);
+      }
     }
-    return values.slice(0, 64);
+    return values;
+  };
+  const belongsToOtherVideo = (value) => {
+    const identityKeys = ['aweme_id', 'awemeId', 'item_id', 'itemId', 'video_id', 'videoId', 'group_id', 'groupId'];
+    // Generic IDs also identify authors, music and encodings. Treat one as a
+    // work ID only on a video record, preserving the target's media children.
+    if (Object.hasOwn(value, 'video')) identityKeys.push('id');
+    return identityKeys.some((key) => {
+      const id = scalarText(value[key]);
+      return /^\d+$/.test(id) && id !== targetId;
+    });
   };
   const collectMediaTree = (root) => {
     const queue = [{ value: root, path: '', metadata: {} }];
@@ -1402,14 +1472,16 @@ function extractVerifiedVideoMediaSources(expectedVideoId) {
     let cursor = 0;
     while (cursor < queue.length && visited < 60_000) {
       const current = queue[cursor++];
-      const value = current.value;
-      if (!value || typeof value !== 'object') continue;
-      if (seen.has(value)) continue;
-      seen.add(value);
+      const original = current.value;
+      if (!original || typeof original !== 'object') continue;
+      if (seen.has(original)) continue;
+      seen.add(original);
+      const value = dataProperties(original);
       visited += 1;
+      if (belongsToOtherVideo(value)) continue;
       const metadata = metadataFrom(value, current.metadata);
       const path = current.path.toLowerCase();
-      const mime = String(value.mime_type || value.mimeType || value.format || '').toLowerCase();
+      const mime = scalarText(value.mime_type, value.mimeType, value.format).toLowerCase();
       const imagePath = /(?:cover|avatar|poster|thumb|image|logo|sticker)/.test(path);
       const audioPath = /(?:^|\.)(?:audio|music|sound)(?:\.|$)/.test(path) || mime.startsWith('audio/');
       const videoPath = /(?:^|\.)(?:video|bit_rate|bitrate)(?:\.|$)/.test(path) || mime.startsWith('video/');
@@ -1440,7 +1512,7 @@ function extractVerifiedVideoMediaSources(expectedVideoId) {
     if (String(keyHint || '') === targetId) return true;
     if (!value || typeof value !== 'object') return false;
     for (const key of ['aweme_id', 'awemeId', 'item_id', 'itemId', 'video_id', 'videoId', 'group_id', 'groupId', 'id']) {
-      if (Object.hasOwn(value, key) && String(value[key] || '') === targetId) return true;
+      if (Object.hasOwn(value, key) && scalarText(value[key]) === targetId) return true;
     }
     return false;
   };
@@ -1455,11 +1527,12 @@ function extractVerifiedVideoMediaSources(expectedVideoId) {
       if (!value || typeof value !== 'object' || seen.has(value)) continue;
       seen.add(value);
       visited += 1;
-      if (objectMatchesTarget(value, key)) {
+      const properties = dataProperties(value);
+      if (objectMatchesTarget(properties, key)) {
         collectMediaTree(value);
         matches += 1;
       }
-      for (const [childKey, child] of Object.entries(value)) {
+      for (const [childKey, child] of Object.entries(properties)) {
         if (child && typeof child === 'object') queue.push({ value: child, key: childKey });
       }
     }
@@ -1477,7 +1550,7 @@ function extractVerifiedVideoMediaSources(expectedVideoId) {
     return null;
   };
 
-  const roots = [];
+  const roots = Array.isArray(receivedMediaRoots) ? receivedMediaRoots.slice(0, 4) : [];
   for (const key of ['_ROUTER_DATA', '__INITIAL_STATE__', '__SSR_DATA__', '__NEXT_DATA__', '__NUXT__', 'RENDER_DATA']) {
     try {
       const value = window[key];
@@ -1530,6 +1603,27 @@ function allowedMediaUrl(urlValue) {
   }
 }
 
+function isVerifiedDouyinPlayUrl(urlValue, expectedVideoId) {
+  if (typeof urlValue !== 'string' || !urlValue || urlValue.length > 8192) return false;
+  const targetId = String(expectedVideoId || '');
+  if (!/^\d+$/.test(targetId)) return false;
+  try {
+    const parsed = new URL(urlValue);
+    if (
+      parsed.protocol !== 'https:'
+      || parsed.hostname.toLowerCase() !== 'www.douyin.com'
+      || parsed.pathname !== '/aweme/v1/play/'
+      || parsed.username
+      || parsed.password
+      || (parsed.port && parsed.port !== '443')
+    ) return false;
+    const boundVideoIds = parsed.searchParams.getAll('__vid');
+    return boundVideoIds.length === 1 && boundVideoIds[0] === targetId;
+  } catch {
+    return false;
+  }
+}
+
 function positiveNumber(...values) {
   for (const value of values) {
     const number = Number(value);
@@ -1555,8 +1649,16 @@ function responseHeaderValue(headers, name) {
   return headers.find((header) => header?.name?.toLowerCase() === target)?.value || '';
 }
 
-function fullMediaCandidate(urlValue, requestType, contentTypeValue = '', responseHeaders = [], pageMetadata = null) {
-  if (!allowedMediaUrl(urlValue)) return null;
+function fullMediaCandidate(
+  urlValue,
+  requestType,
+  contentTypeValue = '',
+  responseHeaders = [],
+  pageMetadata = null,
+  expectedVideoId = null,
+) {
+  const verifiedDouyinPlayUrl = isVerifiedDouyinPlayUrl(urlValue, expectedVideoId);
+  if (!allowedMediaUrl(urlValue) && !verifiedDouyinPlayUrl) return null;
   let parsed;
   try { parsed = new URL(urlValue); } catch { return null; }
   const loweredUrl = urlValue.toLowerCase();
@@ -1566,6 +1668,7 @@ function fullMediaCandidate(urlValue, requestType, contentTypeValue = '', respon
     || /\.(?:mp3|m4a|aac|wav|ogg)(?:\?|$)/.test(loweredUrl);
   const videoMarker = contentType.startsWith('video/')
     || /(?:mime_type=video|\bvideo\b|\.mp4(?:\?|$)|\.m4v(?:\?|$))/.test(loweredUrl)
+    || verifiedDouyinPlayUrl
     || requestType === 'media';
   if (!audioMarker && !videoMarker) return null;
 
@@ -1621,19 +1724,30 @@ function fullMediaCandidate(urlValue, requestType, contentTypeValue = '', respon
   };
 }
 
-function createFullVideoCapture(tabId, timeoutMs) {
+function createFullVideoCapture(tabId, timeoutMs, expectedVideoId = null) {
   const videoCandidates = new Map();
   const audioCandidates = new Map();
   let targetActivated = false;
   let settled = false;
+  let timer = null;
+  let consideredMediaUrls = 0;
+  let rejectedMediaUrls = 0;
   let resolvePromise;
   const promise = new Promise((resolve) => { resolvePromise = resolve; });
 
   const consider = (details, contentType = '', pageMetadata = null) => {
-    if (details.tabId !== tabId) return;
+    if (settled || details.tabId !== tabId) return;
+    consideredMediaUrls += 1;
+    let boundIds;
+    try { boundIds = new URL(details.url).searchParams.getAll('__vid'); } catch { return; }
+    if (expectedVideoId && boundIds.length && (boundIds.length !== 1 || boundIds[0] !== expectedVideoId)) {
+      rejectedMediaUrls += 1;
+      return;
+    }
+    const urlTargetsVideo = Boolean(expectedVideoId && boundIds.length === 1 && boundIds[0] === expectedVideoId);
     const candidateMetadata = pageMetadata || {
-      targetBound: targetActivated,
-      sourceKind: targetActivated ? 'target-network' : 'preload-network',
+      targetBound: urlTargetsVideo,
+      sourceKind: urlTargetsVideo ? 'target-network' : 'preload-network',
     };
     const candidate = fullMediaCandidate(
       details.url,
@@ -1641,13 +1755,31 @@ function createFullVideoCapture(tabId, timeoutMs) {
       contentType,
       details.responseHeaders,
       candidateMetadata,
+      expectedVideoId,
     );
-    if (!candidate) return;
-    videoCandidates.delete(candidate.url);
-    audioCandidates.delete(candidate.url);
+    if (!candidate) {
+      rejectedMediaUrls += 1;
+      return;
+    }
     const destination = candidate.kind === 'video' ? videoCandidates : audioCandidates;
     const previous = destination.get(candidate.url);
-    if (!previous || candidate.score >= previous.score) destination.set(candidate.url, candidate);
+    const otherKind = candidate.kind === 'video' ? audioCandidates : videoCandidates;
+    if (previous) {
+      const authority = (item) => item.metadata.sourceKind === 'structured' ? 3
+        : item.metadata.sourceKind === 'current-source' ? 2 : item.metadata.targetBound ? 1 : 0;
+      const keepPrevious = authority(previous) > authority(candidate)
+        || (authority(previous) === authority(candidate) && previous.score >= candidate.score);
+      const retained = keepPrevious ? previous : candidate;
+      const supplemental = keepPrevious ? candidate : previous;
+      const metadata = { ...retained.metadata, targetBound: previous.metadata.targetBound || candidate.metadata.targetBound };
+      for (const [key, value] of Object.entries(supplemental.metadata)) {
+        if (metadata[key] === null || metadata[key] === undefined) metadata[key] = value;
+      }
+      destination.set(candidate.url, { ...retained, metadata, score: Math.max(previous.score, candidate.score) });
+    } else {
+      destination.set(candidate.url, candidate);
+    }
+    otherKind.delete(candidate.url);
   };
   const onBeforeRequest = (details) => consider(details);
   const onHeadersReceived = (details) => consider(
@@ -1663,18 +1795,39 @@ function createFullVideoCapture(tabId, timeoutMs) {
     }
   };
   const best = (candidates) => {
-    const values = [...candidates.values()];
+    const values = [...candidates.values()].filter((candidate) => candidate.metadata.targetBound === true);
+    if (candidates === videoCandidates) {
+      const measured = values.filter(({ metadata }) => metadata.width > 0 && metadata.height > 0);
+      const pixels = ({ metadata }) => metadata.width * metadata.height;
+      const within1080p = measured.filter((candidate) => pixels(candidate) <= 1920 * 1080
+        && Math.min(candidate.metadata.width, candidate.metadata.height) <= 1080);
+      const eligible = within1080p.length ? within1080p : measured;
+      if (eligible.length) {
+        const authority = (candidate) => candidate.metadata.sourceKind === 'structured' ? 3
+          : candidate.metadata.sourceKind === 'current-source' ? 2 : 1;
+        // Use the best complete source within 1080p, in either orientation.
+        // If every known source is larger, use the smallest available one.
+        return eligible.sort((left, right) => (
+          within1080p.length ? pixels(right) - pixels(left) : pixels(left) - pixels(right)
+        ) || (right.metadata.bitrate || 0) - (left.metadata.bitrate || 0)
+          || authority(right) - authority(left)
+          || (right.metadata.contentLength || 0) - (left.metadata.contentLength || 0))[0];
+      }
+    }
     const structured = values.filter((candidate) => candidate.metadata.sourceKind === 'structured');
-    const targetBound = values.filter((candidate) => candidate.metadata.targetBound === true);
-    const eligible = structured.length ? structured : targetBound.length ? targetBound : values;
+    const eligible = structured.length ? structured : values;
     return eligible.sort((left, right) => right.score - left.score)[0] || null;
   };
   const finish = () => {
     if (settled) return;
     settled = true;
-    clearTimeout(timer);
+    if (timer !== null) clearTimeout(timer);
     removeListeners();
     resolvePromise({ video: best(videoCandidates), audio: best(audioCandidates) });
+  };
+  const startTargetCaptureWindow = () => {
+    if (settled || timer !== null) return;
+    timer = setTimeout(finish, timeoutMs);
   };
 
   chrome.webRequest.onBeforeRequest.addListener(
@@ -1686,12 +1839,25 @@ function createFullVideoCapture(tabId, timeoutMs) {
     { urls: MEDIA_URL_PATTERNS, types: ['media', 'xmlhttprequest', 'other'] },
     ['responseHeaders'],
   );
-  const timer = setTimeout(finish, timeoutMs);
   return {
     promise,
     stop: finish,
     markTargetActivated() {
       targetActivated = true;
+      startTargetCaptureWindow();
+    },
+    hasVideoCandidate() {
+      return Boolean(best(videoCandidates));
+    },
+    diagnostics() {
+      return {
+        videoCandidates: videoCandidates.size,
+        audioCandidates: audioCandidates.size,
+        consideredMediaUrls,
+        rejectedMediaUrls,
+        targetActivated,
+        settled,
+      };
     },
     considerCurrentSource(url, pageMetadata) {
       if (typeof url !== 'string' || !url) return;
@@ -1720,59 +1886,114 @@ function createFullVideoCapture(tabId, timeoutMs) {
   };
 }
 
-async function captureFullVideoForAnalysis({ videoId, accountId, videoUrl }) {
+async function captureFullVideoForAnalysis({
+  videoId,
+  accountId,
+  videoUrl,
+  requireCompleteMetadata = false,
+  savedVideoMetadata = null,
+}) {
   let tab;
   let capture;
   try {
     tab = await chrome.tabs.create({ url: 'about:blank', active: false });
     if (!tab.id) throw new Error('无法创建完整视频采集标签页');
-    capture = createFullVideoCapture(tab.id, MEDIA_CAPTURE_WAIT_MS);
+    capture = createFullVideoCapture(tab.id, MEDIA_CAPTURE_WAIT_MS, videoId);
     await chrome.tabs.update(tab.id, { url: videoUrl });
     await waitForTab(tab.id);
-    const readiness = await executeUntilPageCondition(
-      tab.id,
-      waitForVideoDetailDom,
-      [],
-      'ISOLATED',
-      DETAIL_DOM_WAIT_MS,
-      (result) => result?.ready === true,
-    );
+    const readiness = await waitForAnalysisVideoReady(tab.id, videoId);
+    if (readiness?.blockingReason) throw new Error(readiness.blockingReason);
     const observedFromReady = videoIdFromUrl(readiness?.url);
-    if (!readiness?.ready) throw new Error('目标视频详情页没有完成加载');
     if (observedFromReady !== videoId) {
       throw new Error(`目标视频校验失败，页面实际打开的是 ${observedFromReady || '未知视频'}`);
     }
-    capture.markTargetActivated();
+    if (!readiness?.ready) throw new Error('目标视频播放器未加载，请在 Chrome 打开原视频确认可播放，并检查是否需要登录或验证');
     const structuredSources = await executeInTab(
       tab.id,
       extractVerifiedVideoMediaSources,
       [videoId],
       'MAIN',
     );
-    capture.considerStructuredSources(structuredSources);
-
     const page = await executeUntilPageCondition(
       tab.id,
       activateVerifiedVideoPlayback,
       [videoId],
       'ISOLATED',
       10_000,
-      (result) => result?.targetMatches === false || result?.found === true,
+      (result) => result?.targetMatches === false || (
+        result?.found === true
+        && (
+          allowedMediaUrl(result.currentSrc)
+          || isVerifiedDouyinPlayUrl(result.currentSrc, videoId)
+          || result.sourceUrls?.some((sourceUrl) => allowedMediaUrl(sourceUrl))
+          || result.sourceUrls?.some((sourceUrl) => isVerifiedDouyinPlayUrl(sourceUrl, videoId))
+        )
+      ),
     );
     if (!page?.targetMatches) {
       throw new Error(`目标视频校验失败，播放页实际是 ${page?.observedVideoId || '未知视频'}`);
     }
     if (!page.found) throw new Error('目标视频详情页未出现可播放的视频元素');
-    capture.considerCurrentSource(page.currentSrc, {
-      width: page.videoWidth,
-      height: page.videoHeight,
-    });
+    // The player can hydrate its source data only after playback starts. Give
+    // the available resolutions a bounded chance before choosing.
+    const refreshedStructuredSources = await executeUntilPageCondition(
+      tab.id,
+      extractVerifiedVideoMediaSources,
+      [videoId],
+      'MAIN',
+      structuredSources?.videoCandidates?.length ? 1000 : DETAIL_DOM_WAIT_MS,
+      (result) => Boolean(result?.videoCandidates?.length),
+    );
+    const pageMediaUrls = [...new Set([
+      page.currentSrc,
+      ...(page.sourceUrls || []),
+    ].filter((value) => typeof value === 'string' && value))].slice(0, 16);
+    const verifiedPageMediaUrls = pageMediaUrls.filter(
+      (sourceUrl) => allowedMediaUrl(sourceUrl) || isVerifiedDouyinPlayUrl(sourceUrl, videoId),
+    );
+    capture.markTargetActivated();
+    capture.considerStructuredSources(structuredSources);
+    capture.considerStructuredSources(refreshedStructuredSources);
+    for (const sourceUrl of verifiedPageMediaUrls) {
+      capture.considerCurrentSource(sourceUrl, {
+        width: page.videoWidth,
+        height: page.videoHeight,
+      });
+    }
+    if (capture.hasVideoCandidate()) capture.stop();
     const selected = await capture.promise;
     const finalPage = await executeInTab(tab.id, inspectVerifiedVideoTarget, [videoId]);
     if (!finalPage?.targetMatches) {
       throw new Error(`采集期间页面切换到了 ${finalPage?.observedVideoId || '未知视频'}，已丢弃媒体地址`);
     }
-    if (!selected.video) throw new Error('没有捕获到目标视频的完整视觉媒体流');
+    if (!selected.video) {
+      const diagnostics = capture.diagnostics();
+      throw new Error(
+        `没有捕获到经过目标视频校验的完整视觉媒体流（已检查 ${diagnostics.consideredMediaUrls} 个媒体地址，`
+        + `视频候选 ${diagnostics.videoCandidates} 个，拒绝 ${diagnostics.rejectedMediaUrls} 个）`,
+      );
+    }
+    const extractedVideoMetadata = await readVideoMetadataWithActivation(tab.id, videoId, requireCompleteMetadata, savedVideoMetadata);
+    if (!extractedVideoMetadata) {
+      throw new Error('采集元数据时目标视频页面发生切换，已停止分析');
+    }
+    const videoMetadata = {
+      ...extractedVideoMetadata,
+      title: extractedVideoMetadata.description || null,
+    };
+    if (requireCompleteMetadata) {
+      const requiredMetadata = [
+        ['标题', videoMetadata.title],
+        ['封面', videoMetadata.coverUrl],
+        ['博主名称', videoMetadata.authorName],
+        ['博主头像', videoMetadata.authorAvatarUrl],
+        ['博主主页', videoMetadata.authorProfileUrl],
+      ];
+      const missingMetadata = requiredMetadata.filter(([, value]) => typeof value !== 'string' || !value.trim());
+      if (missingMetadata.length) {
+        throw new Error(`目标视频信息读取不完整：缺少${missingMetadata.map(([label]) => label).join('、')}`);
+      }
+    }
     return {
       accountId,
       videoId,
@@ -1785,6 +2006,7 @@ async function captureFullVideoForAnalysis({ videoId, accountId, videoUrl }) {
         url: selected.audio.url,
         metadata: selected.audio.metadata,
       } : null,
+      videoMetadata,
       page: {
         videoWidth: page.videoWidth || null,
         videoHeight: page.videoHeight || null,
@@ -1796,6 +2018,93 @@ async function captureFullVideoForAnalysis({ videoId, accountId, videoUrl }) {
     capture?.stop();
     if (tab?.id) await chrome.tabs.remove(tab.id).catch(() => {});
   }
+}
+
+function inspectAnalysisVideoReady(expectedVideoId) {
+  const observedVideoId = location.pathname.match(/\/video\/(\d+)/)?.[1]
+    || new URL(location.href).searchParams.get('modal_id') || null;
+  const targetMatches = observedVideoId === expectedVideoId;
+  const hasVideo = Boolean(document.querySelector('video'));
+  const pageText = document.body?.innerText?.trim() || '';
+  // Only an explicit short error page is terminal. A normal player's login
+  // button or incidental words inside a video's description are not proof.
+  let blockingReason = null;
+  if (!hasVideo && pageText.length < 1500) {
+    if (/作品已删除|视频已删除|作品不存在/.test(pageText)) blockingReason = '视频已删除或作品不存在，请打开原视频核对';
+    else if (/无访问权限|该视频为私密|该作品为私密/.test(pageText)) blockingReason = '无访问权限，请核对原视频的公开状态';
+    else if (/登录已失效|请先登录后查看|必须重新登录/.test(pageText)) blockingReason = '必须重新登录，请在电脑抖音登录窗口完成登录';
+  }
+  return { url: location.href, targetMatches, ready: targetMatches && hasVideo, blockingReason };
+}
+
+async function waitForAnalysisVideoReady(tabId, videoId) {
+  const read = () => executeUntilPageCondition(
+    tabId, inspectAnalysisVideoReady, [videoId], 'ISOLATED', DETAIL_DOM_WAIT_MS,
+    (result) => result?.ready === true || result?.targetMatches === false || Boolean(result?.blockingReason),
+  );
+  const readiness = await read();
+  if (readiness?.ready || readiness?.targetMatches === false || readiness?.blockingReason) return readiness;
+  const captureTab = await chrome.tabs.get(tabId);
+  const [previousTab] = await chrome.tabs.query({ active: true, windowId: captureTab.windowId });
+  try {
+    await chrome.tabs.update(tabId, { active: true });
+    return await read();
+  } finally {
+    if (previousTab?.id && previousTab.id !== tabId) {
+      const [activeTab] = await chrome.tabs.query({ active: true, windowId: captureTab.windowId }).catch(() => []);
+      if (activeTab?.id === tabId) await chrome.tabs.update(previousTab.id, { active: true }).catch(() => {});
+    }
+  }
+}
+
+function mergeSavedVideoMetadata(metadata, saved, videoId) {
+  // A null result means the page switched videos: never mask that guard.
+  if (!metadata || String(saved?.videoId || '') !== String(videoId)) return metadata;
+  const merged = { ...metadata };
+  for (const key of ['description', 'coverUrl', 'authorName', 'authorAvatarUrl', 'authorProfileUrl']) {
+    if (!(typeof merged[key] === 'string' && merged[key].trim()) && typeof saved[key] === 'string' && saved[key].trim()) {
+      merged[key] = saved[key];
+    }
+  }
+  return merged;
+}
+
+async function readVideoMetadataWithActivation(tabId, videoId, requireCompleteMetadata, savedVideoMetadata = null) {
+  const read = async () => mergeSavedVideoMetadata(await executeUntilPageCondition(
+    tabId,
+    extractVideoDetailPage,
+    [videoId],
+    'ISOLATED',
+    DETAIL_DOM_WAIT_MS,
+    (result) => result === null || (Boolean(result) && (!requireCompleteMetadata || hasCompleteVideoLinkMetadata(mergeSavedVideoMetadata(result, savedVideoMetadata, videoId)))),
+  ), savedVideoMetadata, videoId);
+  const metadata = await read();
+  if (!requireCompleteMetadata || metadata === null || hasCompleteVideoLinkMetadata(metadata)) return metadata;
+
+  // Douyin may defer author and cover rendering while a tab stays hidden.
+  const captureTab = await chrome.tabs.get(tabId);
+  const [previousTab] = await chrome.tabs.query({ active: true, windowId: captureTab.windowId });
+  try {
+    await chrome.tabs.update(tabId, { active: true });
+    return await read();
+  } finally {
+    if (previousTab?.id && previousTab.id !== tabId) {
+      const [activeTab] = await chrome.tabs.query({ active: true, windowId: captureTab.windowId }).catch(() => []);
+      if (activeTab?.id === tabId) {
+        await chrome.tabs.update(previousTab.id, { active: true }).catch(() => {});
+      }
+    }
+  }
+}
+
+function hasCompleteVideoLinkMetadata(metadata) {
+  return [
+    metadata?.description,
+    metadata?.coverUrl,
+    metadata?.authorName,
+    metadata?.authorAvatarUrl,
+    metadata?.authorProfileUrl,
+  ].every((value) => typeof value === 'string' && value.trim());
 }
 
 async function requestLocalTranscription({ videoId, videoUrl, mediaUrl }) {
@@ -2736,7 +3045,13 @@ function waitForVideoDetailDom() {
   return inspect();
 }
 
-function extractVideoDetailPage() {
+function extractVideoDetailPage(expectedVideoId = null) {
+  const requestedVideoId = /^\d+$/.test(String(expectedVideoId || '')) ? String(expectedVideoId) : null;
+  const observedVideoId = location.pathname.match(/\/video\/(\d+)/)?.[1]
+    || new URL(location.href).searchParams.get('modal_id')
+    || null;
+  if (requestedVideoId && observedVideoId !== requestedVideoId) return null;
+  const targetVideoId = requestedVideoId || observedVideoId;
   const numberOrNull = (value) => {
     if (value === null || value === undefined || value === '') return null;
     if (typeof value === 'number') return Number.isFinite(value) ? value : null;
@@ -2757,6 +3072,63 @@ function extractVideoDetailPage() {
     }
     return null;
   };
+  const urlFromElement = (element, attributes) => {
+    if (!element) return null;
+    for (const attribute of attributes) {
+      const value = element.getAttribute?.(attribute);
+      if (typeof value !== 'string' || !value.trim()) continue;
+      try {
+        const resolved = new URL(value, location.href);
+        if (resolved.protocol === 'https:') return resolved.href;
+      } catch { /* ignore malformed page metadata */ }
+    }
+    return null;
+  };
+  const douyinProfileUrl = (value) => {
+    if (typeof value !== 'string' || !value.trim()) return null;
+    try {
+      const resolved = new URL(value, location.href);
+      if (
+        resolved.protocol !== 'https:'
+        || resolved.hostname.toLowerCase() !== 'www.douyin.com'
+        || !/^\/user\/(?!self(?:\/|$))[^/]+\/?$/.test(resolved.pathname)
+      ) return null;
+      return resolved.href;
+    } catch {
+      return null;
+    }
+  };
+  const breadcrumbAuthor = (() => {
+    if (!targetVideoId) return null;
+    for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
+      let parsed;
+      try { parsed = JSON.parse(script.textContent || ''); } catch { continue; }
+      const documents = Array.isArray(parsed) ? [...parsed] : [parsed];
+      for (let documentIndex = 0; documentIndex < documents.length; documentIndex += 1) {
+        const structured = documents[documentIndex];
+        if (Array.isArray(structured?.['@graph'])) documents.push(...structured['@graph']);
+        const entries = Array.isArray(structured?.itemListElement) ? structured.itemListElement : [];
+        const targetIndex = entries.findIndex((entry) => {
+          const item = typeof entry?.item === 'string'
+            ? entry.item
+            : entry?.item?.['@id'] || entry?.item?.url || '';
+          try { return new URL(item, location.href).pathname === `/video/${targetVideoId}`; } catch { return false; }
+        });
+        if (targetIndex < 1) continue;
+        for (let index = targetIndex - 1; index >= 0; index -= 1) {
+          const entry = entries[index];
+          const item = typeof entry?.item === 'string'
+            ? entry.item
+            : entry?.item?.['@id'] || entry?.item?.url || '';
+          const profileUrl = douyinProfileUrl(item);
+          const rawName = typeof entry?.name === 'string' ? entry.name : entry?.item?.name;
+          const name = typeof rawName === 'string' ? rawName.trim() : '';
+          if (profileUrl) return { name: name || null, profileUrl };
+        }
+      }
+    }
+    return null;
+  })();
   const metricFrom = (selectors) => {
     for (const selector of selectors) {
       const element = document.querySelector(selector);
@@ -2800,7 +3172,25 @@ function extractVideoDetailPage() {
     '[data-e2e="video-duration"]',
     '[data-e2e*="duration"]',
   ]);
-  const videoElement = document.querySelector('video');
+  const videoElements = [...document.querySelectorAll('video')];
+  const videoTargetsId = (video) => {
+    const urls = [video?.currentSrc, video?.src];
+    if (typeof video?.querySelectorAll === 'function') {
+      urls.push(...[...video.querySelectorAll('source')]
+        .flatMap((source) => [source.src, source.getAttribute?.('src') || '']));
+    }
+    return Boolean(targetVideoId) && urls.some((urlValue) => {
+      if (typeof urlValue !== 'string' || !urlValue) return false;
+      try {
+        const ids = new URL(urlValue, location.href).searchParams.getAll('__vid');
+        return ids.length === 1 && ids[0] === targetVideoId;
+      } catch { return false; }
+    });
+  };
+  const videoElement = videoElements.find((video) => {
+    const player = video.closest?.('[data-e2e="player-container"]');
+    return Boolean(targetVideoId && player?.classList?.contains(`video_${targetVideoId}`));
+  }) || videoElements.find(videoTargetsId) || (videoElements.length === 1 ? videoElements[0] : null);
   const nativeDuration = Number(videoElement?.duration);
   const description = textFrom([
     'h1',
@@ -2808,10 +3198,34 @@ function extractVideoDetailPage() {
     '[data-e2e="video-title"]',
     '[data-e2e*="video-desc"]',
   ]) || '';
+  const authorRoots = [...document.querySelectorAll('[data-e2e="user-info"]')];
+  const profilePath = (() => {
+    try { return breadcrumbAuthor ? new URL(breadcrumbAuthor.profileUrl).pathname : null; } catch { return null; }
+  })();
+  const rootProfileAnchors = (root) => [...(root?.querySelectorAll?.('a[href*="/user/"]') || [])]
+    .filter((anchor) => douyinProfileUrl(anchor.getAttribute?.('href') || anchor.href));
+  const matchingAuthorRoot = profilePath ? authorRoots.find((root) => rootProfileAnchors(root).some((anchor) => {
+    try { return new URL(anchor.href, location.href).pathname === profilePath; } catch { return false; }
+  })) : null;
+  const authorRoot = breadcrumbAuthor ? matchingAuthorRoot || null : null;
+  const scopedAuthorAnchors = rootProfileAnchors(authorRoot);
+  const profileAnchors = profilePath ? scopedAuthorAnchors.filter((anchor) => {
+    try { return new URL(anchor.href, location.href).pathname === profilePath; } catch { return false; }
+  }) : scopedAuthorAnchors;
+  const authorAnchor = profileAnchors.find((anchor) => anchor.textContent?.trim()) || profileAnchors[0] || null;
+  const authorName = breadcrumbAuthor?.name || authorAnchor?.textContent?.trim() || null;
+  const authorAvatar = authorAnchor?.querySelector?.('img')
+    || authorRoot?.querySelector?.('img[src], img[data-src]')
+    || null;
 
   return {
     description,
-    coverUrl: videoElement?.poster && /^https?:\/\//.test(videoElement.poster) ? videoElement.poster : null,
+    coverUrl: urlFromElement(document.querySelector('meta[name="lark:url:video_cover_image_url"]'), ['content'])
+      || urlFromElement(document.querySelector('meta[property="og:image"], meta[name="og:image"]'), ['content'])
+      || (videoElement?.poster && /^https?:\/\//.test(videoElement.poster) ? videoElement.poster : null),
+    authorName,
+    authorProfileUrl: breadcrumbAuthor?.profileUrl || douyinProfileUrl(authorAnchor?.getAttribute?.('href') || authorAnchor?.href),
+    authorAvatarUrl: urlFromElement(authorAvatar, ['src', 'data-src']),
     playCount: metricFrom([
       '[data-e2e="video-player-play-count"]',
       '[data-e2e="video-play-count"]',
@@ -2870,10 +3284,30 @@ function activateVerifiedVideoPlayback(expectedVideoId) {
       pageUrl: location.href,
     };
   }
-  const findVideo = () => [...document.querySelectorAll('video')]
-    .find((candidate) => candidate.getClientRects().length > 0)
-    || document.querySelector('video');
-  const video = findVideo();
+  const mediaUrlsFor = (candidate) => {
+    if (!candidate) return [];
+    const urls = [candidate.currentSrc, candidate.src];
+    if (typeof candidate.querySelectorAll === 'function') {
+      urls.push(...[...candidate.querySelectorAll('source')]
+        .flatMap((source) => [source.src, source.getAttribute?.('src') || '']));
+    }
+    return [...new Set(urls.filter((value) => typeof value === 'string' && value))];
+  };
+  const explicitlyTargetsVideo = (urlValue) => {
+    try {
+      const boundIds = new URL(urlValue, location.href).searchParams.getAll('__vid');
+      return boundIds.length === 1 && boundIds[0] === expectedVideoId;
+    } catch {
+      return false;
+    }
+  };
+  const videos = [...document.querySelectorAll('video')];
+  const video = videos.find((candidate) => mediaUrlsFor(candidate).some(explicitlyTargetsVideo))
+    || videos.find((candidate) => candidate.closest?.('[data-e2e="player-container"]')?.classList?.contains(`video_${expectedVideoId}`))
+    || (videos.length === 1 ? videos[0] : null)
+    || videos.find((candidate) => candidate.getClientRects().length > 0)
+    || videos[0]
+    || null;
   const finalObservedId = observedVideoId();
   if (!video || finalObservedId !== expectedVideoId) {
     return {
@@ -2892,12 +3326,18 @@ function activateVerifiedVideoPlayback(expectedVideoId) {
     playResult?.catch?.(() => {});
   } catch { /* network media requests may already be active */ }
   const duration = Number(video.duration);
+  const sourceUrls = typeof video.querySelectorAll === 'function'
+    ? [...video.querySelectorAll('source')]
+      .flatMap((source) => [source.src, source.getAttribute?.('src') || ''])
+      .filter(Boolean)
+    : [];
   return {
     targetMatches: true,
     found: true,
     observedVideoId: finalObservedId,
     pageUrl: location.href,
     currentSrc: video.currentSrc || video.src || null,
+    sourceUrls,
     videoWidth: Number(video.videoWidth) || null,
     videoHeight: Number(video.videoHeight) || null,
     durationSeconds: Number.isFinite(duration) && duration > 0 ? duration : null,

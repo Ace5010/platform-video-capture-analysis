@@ -75,6 +75,25 @@ export function orderVideosOldestFirst<T extends AnalyticsVideoLike>(videos: rea
   });
 }
 
+// Keep a missing sample as a gap; zero is a real observation on the baseline.
+// The caller supplies display order so point indices match the chart labels.
+export function metricTrendSegments(
+  videos: readonly AnalyticsVideoLike[],
+  metricKey: AnalyticsMetricKey,
+): { index: number; value: number }[][] {
+  const segments: { index: number; value: number }[][] = [];
+  let current: { index: number; value: number }[] = [];
+  videos.forEach((video, index) => {
+    const value = analyticsMetricValue(video[metricKey]);
+    if (value === null) {
+      if (current.length) segments.push(current);
+      current = [];
+    } else current.push({ index, value });
+  });
+  if (current.length) segments.push(current);
+  return segments;
+}
+
 export function calculateDelta(currentValue: unknown, baselineValue: unknown): NumericDelta | null {
   const current = analyticsMetricValue(currentValue);
   const baseline = analyticsMetricValue(baselineValue);

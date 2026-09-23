@@ -6,10 +6,11 @@
 
 主要功能：
 
-- 通过主机 Chrome 扩展抓取公开的抖音账号和视频数据。
+- 由电脑后台通过 Playwright Core 控制专用 Chrome，抓取公开抖音账号和视频数据；电脑和手机都不需要扩展。
 - 保存账号、视频、互动快照、口播稿和 AI 分析结果。
-- 使用本地 faster-whisper 识别口播，并在本机恢复中文标点。
-- 用户主动点击后，获取完整原视频并交给阿里云百炼 Qwen 分析。
+- 使用云端 `qwen3-asr-flash-filetrans` 识别目标视频的完整音轨，已有完成的同视频口播稿直接复用。
+- 用户主动点击后，获取完整视频，优先选用平台已有的 1080p 源，连同口播稿交给阿里云百炼 `qwen3.8-flash` 分析。
+- `local_asr/` 的本地 faster-whisper 保留兼容入口，不用于视频分析默认流程，也不在云端失败后自动回退到本地识别。现有标点规范化继续保留，不改动识别文字。
 - 允许同一局域网内的其他设备访问工作台并提交任务。
 
 目前抖音功能已经实现；小红书、哔哩哔哩和 YouTube 只有预留入口，尚未实现。采集由用户手动触发，没有定时自动采集。
@@ -22,6 +23,13 @@
 - 不要为了局部问题改变无关模块。
 - 重大架构调整、数据结构重做、技术栈替换或行为改变，必须先询问用户。
 - 如果发现文档和代码不一致，先核对当前实现，不要凭空猜测。
+
+## 网页设计与文案规范
+
+- 网页中的文字、字段、标签和装饰元素必须有明确用途，能帮助用户理解信息或完成操作。
+- 除非用户本人明确要求，否则不得添加或保留意义不明、仅为装饰或填充版面的内容，例如无实际用途的英文标题、英文副标题、字母缩写、编号或标语。
+- 非必要的小字说明、角标和装饰性文字默认不添加、不保留；确有必要的信息必须使用清晰可读的字号，不得为了视觉效果刻意缩小。
+- 设计或修改网页时，检查本次涉及的区域：无法说明实际用途的内容应省略或移除，不要为了显得丰富而堆砌元素。
 
 ## Git 提交规范
 
@@ -48,9 +56,11 @@
 
 ## 视频处理
 
-- AI 分析必须使用经过视频 ID 校验的目标完整原视频。
-- 不得偷偷降级为关键帧、OCR、低分辨率视频、压缩视频或只发送口播稿。
+- AI 分析必须使用经过视频 ID 校验的目标完整视频。按用户最新要求，优先选择约 1080p、足够辨认画面与字幕的已有媒体源，不再追求 4K；没有合适源时选择最接近的可用清晰度。
+- 不得用关键帧、OCR 或仅口播稿代替完整视频。优先选择平台已有编码，不额外转码压缩；模型采样预算应兼顾辨认能力与分析耗时。
 - 视频与音频分离时使用 FFmpeg stream copy 无损封装。
+- 云端口播识别必须使用已校验目标视频的完整音轨，并与视频上传准备并行；已有完成的同视频口播稿应直接复用，避免重复转写计费。
+- 视频分析保留 `qwen3.8-flash` 的严格结构化输出校验。独立云端转写的按秒用量与视频模型的 Token 用量分别记录，成功、失败和重试均不得遗漏已发生的云端费用。
 - 超过服务限制时只能按现有逻辑无损分段。
 - 临时媒体必须在成功、失败或重试结束后清理。
 - 标点恢复只能增加或规范标点，不能修改、删减或调整识别文字顺序。
@@ -86,14 +96,16 @@
 测试对应关系：
 
 - 前端互动数据计算：`npm run test:video-analytics`
+- 分析用量与费用展示：`npm run test:analysis-usage`
 - 工作台与扩展桥接：`npm run test:bridge`
 - 后台 API、认证、SQLite、任务队列或 AI 分析流程：`npm run test:host`
-- 口播识别或标点恢复：`npm run test:asr`
+- 云端口播识别及其与视频分析的并行流程：`npm run test:host`
+- 本地口播兼容入口或标点恢复：`npm run test:asr`
 - 扩展任务调度、锁或多账号执行：`npm run test:scheduler`
 - 扩展与主机连接、鉴权、队列或媒体选择：`npm run test:connector`
 - 扩展版本或能力要求：`npm run test:extension-compatibility`
 
-扩展源码修改后，需要在 `chrome://extensions` 中刷新已加载的扩展。不要声称测试通过，除非实际运行过对应命令。
+专用浏览器复用 `chrome-extension/background.js` 内的采集函数，每个任务重新加载；生产模式已禁用旧扩展接口。修改采集函数后无需刷新扩展；修改 `scripts/browser-worker.mjs` 或 Python 后台后需安全重启主机服务。浏览器驱动和队列改动运行 `npm run test:browser`。不要声称测试通过，除非实际运行过对应命令。
 
 # 5. 项目地图
 
@@ -102,6 +114,8 @@
   - 全局样式：`app/globals.css`
 - 前端共享逻辑：`lib/`
 - 后台：`host_service/`
+  - 专用浏览器队列：`host_service/browser.py`
+  - 浏览器驱动：`scripts/browser-worker.mjs`
   - API：`host_service/server.py`
   - 配置：`host_service/config.py`
 - Chrome 扩展：`chrome-extension/`
@@ -111,7 +125,7 @@
   - 分析流程：`host_service/analysis.py`
   - Qwen 调用：`host_service/qwen.py`
   - 媒体处理：`host_service/media.py`
-  - 本地口播识别：`local_asr/`
+  - 本地口播识别兼容入口：`local_asr/`
 - 数据库：`host_service/database.py`
 - 启动和测试脚本：`scripts/`
 
@@ -124,10 +138,10 @@
 - React / Next.js / TypeScript
 - Vinext / Vite
 - Python / SQLite
-- faster-whisper / sherpa-onnx
+- faster-whisper / sherpa-onnx（本地兼容入口）
 - Chrome Manifest V3
 - FFmpeg / ffprobe
-- 阿里云百炼 Qwen
+- 阿里云百炼 `qwen3.8-flash` 视频分析 / `qwen3-asr-flash-filetrans` 云端口播识别
 
 具体版本以 `package.json`、`package-lock.json`、`requirements-asr.txt`、`chrome-extension/manifest.json` 及对应配置文件为准。
 

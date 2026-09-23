@@ -90,10 +90,9 @@ class HostConfig:
             # about 33%, so keep the original binary at a safe 7MiB ceiling.
             direct_base64_bytes=_env_int("DOUYIN_QWEN_BASE64_BYTES", 7 * 1024 * 1024, 0, 7 * 1024 * 1024),
             qwen_model=os.environ.get("DOUYIN_QWEN_MODEL", "qwen3.8-flash").strip() or "qwen3.8-flash",
-            # Qwen accepts up to 10 sampled frames per second. The client
-            # dynamically lowers this cap only when a video's duration would
-            # otherwise force the service to reduce per-frame resolution.
-            qwen_fps=_env_int("DOUYIN_QWEN_FPS", 10, 1, 10),
+            # Default to one model-sampled frame per second. Explicit user
+            # overrides remain supported; long videos are capped in QwenClient.
+            qwen_fps=_env_int("DOUYIN_QWEN_FPS", 1, 1, 10),
             qwen_endpoint=os.environ.get(
                 "DOUYIN_QWEN_ENDPOINT",
                 "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",

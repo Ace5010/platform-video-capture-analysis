@@ -18,6 +18,7 @@ from local_asr.punctuation import restore_transcript_text
 
 from .compatibility import CONNECTOR_FRESHNESS_SECONDS, semver_at_least
 from .config import HostConfig
+from .recovery import safe_error
 
 
 CANONICAL_JOB_TYPES = {
@@ -33,6 +34,7 @@ CANONICAL_JOB_TYPES = {
     "analysis.video": "analyze_video",
 }
 ACTIVE_JOB_STATUSES = ("queued", "claimed", "running")
+LINK_VIDEO_ACCOUNT_ID = "__video_link_analysis__"
 
 
 def utc_now() -> str:
@@ -544,7 +546,8 @@ class Database:
         account_id = _identifier(incoming.get("id"), "account.id")
         current = connection.execute("SELECT data_json FROM accounts WHERE id=?", (account_id,)).fetchone()
         account = json.loads(current["data_json"]) if current else {}
-        account.update({key: value for key, value in incoming.items() if value is not None})
+        account.update({key: value for key, value in incoming.items()
+                        if value is not None or key in ("currentSyncMode", "collectionError")})
         platform = str(account.get("platform") or "douyin")[:64]
         url = str(account.get("url") or "")[:4096]
         name = str(account.get("name") or "待识别账号")[:512]
@@ -562,6 +565,82 @@ class Database:
         with self.transaction() as connection:
             return self._upsert_account(connection, account)
 
+    def acknowledge_account_updates(self, accounts: list[dict[str, Any]]) -> None:
+        with self.transaction() as connection:
+            for item in accounts:
+                account_id = _identifier(_object(item, "account").get("id"), "account.id")
+                row = connection.execute("SELECT data_json FROM accounts WHERE id=?", (account_id,)).fetchone()
+                if not row:
+                    continue
+                account = json.loads(row["data_json"])
+                checked_at = account.get("lastCheckedAt")
+                # A click only acknowledges the check the device actually displayed.
+                if checked_at and checked_at == item.get("lastCheckedAt"):
+                    account["updatesReadAt"] = checked_at
+                    self._upsert_account(connection, account)
+
+    def upsert_link_video(self, video_id: str, canonical_url: str, source_url: str) -> dict[str, Any]:
+        video_id = _identifier(video_id, "videoId")
+        now = utc_now()
+        with self.transaction() as connection:
+            current = connection.execute(
+                "SELECT account_id,data_json FROM videos WHERE id=?",
+                (video_id,),
+            ).fetchone()
+            if current:
+                video = json.loads(current["data_json"])
+                video.update(
+                    {
+                        "id": video_id,
+                        "accountId": str(current["account_id"]),
+                        "isLinkAnalysis": True,
+                        "linkSourceUrl": source_url,
+                        "linkLastSubmittedAt": now,
+                    }
+                )
+                video.setdefault("linkAddedAt", now)
+                video.setdefault("url", canonical_url)
+            else:
+                self._upsert_account(
+                    connection,
+                    {
+                        "id": LINK_VIDEO_ACCOUNT_ID,
+                        "platform": "douyin",
+                        "url": "https://www.douyin.com/",
+                        "name": "视频链接分析",
+                        "hidden": True,
+                        "sourceKind": "video_link_internal",
+                        "addedAt": now,
+                        "initialSyncStatus": "complete",
+                    },
+                )
+                video = {
+                    "id": video_id,
+                    "accountId": LINK_VIDEO_ACCOUNT_ID,
+                    "title": "正在读取视频信息…",
+                    "description": "",
+                    "url": canonical_url,
+                    "coverUrl": None,
+                    "publishedAt": None,
+                    "durationSeconds": None,
+                    "likeCount": None,
+                    "commentCount": None,
+                    "favoriteCount": None,
+                    "shareCount": None,
+                    "capturedAt": now,
+                    "firstSeenAt": now,
+                    "lastSeenAt": now,
+                    "transcript": None,
+                    "transcriptStatus": "idle",
+                    "analysis": None,
+                    "analysisStatus": "idle",
+                    "isLinkAnalysis": True,
+                    "linkSourceUrl": source_url,
+                    "linkAddedAt": now,
+                    "linkLastSubmittedAt": now,
+                }
+            return self._upsert_video(connection, video)
+
     def remove_account(self, account_id: str) -> bool:
         account_id = _identifier(account_id, "accountId")
         with self.transaction() as connection:
@@ -578,6 +657,32 @@ class Database:
                         "UPDATE jobs SET status='cancelled',error=?,updated_at=? WHERE id=?",
                         ("监控账号已移除", utc_now(), job["id"]),
                     )
+            preserved_link_videos = []
+            for row in connection.execute("SELECT id,data_json FROM videos WHERE account_id=?", (account_id,)):
+                video = json.loads(row["data_json"])
+                if video.get("isLinkAnalysis") is True:
+                    preserved_link_videos.append((str(row["id"]), video))
+            if preserved_link_videos:
+                now = utc_now()
+                self._upsert_account(
+                    connection,
+                    {
+                        "id": LINK_VIDEO_ACCOUNT_ID,
+                        "platform": "douyin",
+                        "url": "https://www.douyin.com/",
+                        "name": "视频链接分析",
+                        "hidden": True,
+                        "sourceKind": "video_link_internal",
+                        "addedAt": now,
+                        "initialSyncStatus": "complete",
+                    },
+                )
+                for video_id, video in preserved_link_videos:
+                    video["accountId"] = LINK_VIDEO_ACCOUNT_ID
+                    connection.execute(
+                        "UPDATE videos SET account_id=?,data_json=?,updated_at=? WHERE id=?",
+                        (LINK_VIDEO_ACCOUNT_ID, _compact_json(video), now, video_id),
+                    )
             removed = connection.execute("DELETE FROM accounts WHERE id=?", (account_id,)).rowcount
         return bool(removed)
 
@@ -591,7 +696,8 @@ class Database:
         exists = connection.execute("SELECT id FROM accounts WHERE id=?", (account_id,)).fetchone()
         if not exists:
             raise ValueError(f"视频 {video_id} 对应的监控账号不存在")
-        current = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
+        current = connection.execute("SELECT data_json,created_at FROM videos WHERE id=?", (video_id,)).fetchone()
+        first_seen = (json.loads(current["data_json"]).get("firstSeenAt") or current["created_at"]) if current else (video.get("firstSeenAt") or utc_now())
         if current:
             merged = json.loads(current["data_json"])
             for removed_metric in ("playCount", "play_count", "viewCount", "view_count"):
@@ -603,7 +709,7 @@ class Database:
                     if key in json.loads(current["data_json"]):
                         merged[key] = json.loads(current["data_json"])[key]
             video = merged
-        video.update({"id": video_id, "accountId": account_id})
+        video.update({"id": video_id, "accountId": account_id, "firstSeenAt": first_seen})
         _normalize_video_transcript(video)
         source_hash = video.get("sourceHash")
         now = utc_now()
@@ -651,24 +757,67 @@ class Database:
         return {"accounts": len(accounts), "videos": len(videos), "snapshots": len(snapshots)}
 
     def state(self) -> dict[str, Any]:
+        self.reconcile_collection_statuses()
         with closing(self.connect()) as connection:
-            accounts = [json.loads(row["data_json"]) for row in connection.execute("SELECT data_json FROM accounts ORDER BY created_at")]
-            videos = [_normalize_video_transcript(json.loads(row["data_json"])) for row in connection.execute("SELECT data_json FROM videos ORDER BY created_at")]
+            accounts = [
+                account
+                for row in connection.execute("SELECT data_json FROM accounts ORDER BY created_at")
+                if not (account := json.loads(row["data_json"])).get("hidden")
+            ]
+            video_rows = connection.execute("SELECT account_id,data_json,created_at FROM videos ORDER BY created_at").fetchall()
+            all_videos = [
+                (str(row["account_id"]), _normalize_video_transcript({**json.loads(row["data_json"]),
+                    "firstSeenAt": json.loads(row["data_json"]).get("firstSeenAt") or row["created_at"]}))
+                for row in video_rows
+            ]
             runs_by_video: dict[str, list[dict[str, Any]]] = {}
             for row in connection.execute(
                 "SELECT id,job_id,video_id,status,usage_json,error,created_at,updated_at "
                 "FROM analysis_runs ORDER BY created_at DESC,id DESC"
             ):
                 runs_by_video.setdefault(str(row["video_id"]), []).append(_analysis_run_dict(row))
-            for video in videos:
+            for _, video in all_videos:
                 video["analysisRuns"] = runs_by_video.get(str(video.get("id") or ""), [])
-            snapshots = [json.loads(row["data_json"]) for row in connection.execute("SELECT data_json FROM snapshots ORDER BY captured_at")]
+            videos = [video for account_id, video in all_videos if account_id != LINK_VIDEO_ACCOUNT_ID]
+            link_videos = [video for _, video in all_videos if video.get("isLinkAnalysis") is True]
+            snapshots = [
+                json.loads(row["data_json"])
+                for row in connection.execute(
+                    "SELECT data_json FROM snapshots WHERE account_id!=? ORDER BY captured_at",
+                    (LINK_VIDEO_ACCOUNT_ID,),
+                )
+            ]
         return {
             "accounts": accounts,
             "videos": videos,
+            "linkVideos": link_videos,
             "snapshots": snapshots,
             "connector": self.connector_status(),
         }
+
+    def reconcile_collection_statuses(self) -> None:
+        """Repair stale account flags without changing captured videos or counts."""
+        with self.transaction() as connection:
+            jobs = connection.execute(
+                "SELECT status,payload_json,error FROM jobs WHERE type IN ('collect_latest','archive_account') "
+                "ORDER BY created_epoch DESC,created_at DESC"
+            ).fetchall()
+            for row in connection.execute("SELECT id,data_json FROM accounts").fetchall():
+                account = json.loads(row["data_json"])
+                if account.get("status") != "checking":
+                    continue
+                relevant = []
+                for job in jobs:
+                    payload = json.loads(job["payload_json"])
+                    ids = payload.get("accountIds") or ([payload["accountId"]] if payload.get("accountId") else [])
+                    if not ids or row["id"] in ids:
+                        relevant.append(job)
+                if any(job["status"] in ("queued", "claimed", "running") for job in relevant):
+                    continue
+                account["status"] = "error"
+                account["currentSyncMode"] = None
+                account["collectionError"] = (relevant[0]["error"] if relevant else None) or "采集已中断，请重新检查"
+                self._upsert_account(connection, account)
 
     def get_video(self, video_id: str) -> dict[str, Any] | None:
         video_id = _identifier(video_id, "videoId")
@@ -701,7 +850,8 @@ class Database:
                 "LEFT JOIN jobs ON jobs.id=analysis_runs.job_id ORDER BY analysis_runs.updated_at"
             ).fetchall()
             for row in runs:
-                source = row["transcript_raw"] or row["transcript"]
+                has_raw = isinstance(row["transcript_raw"], str) and bool(row["transcript_raw"].strip())
+                source = row["transcript_raw"] if has_raw else row["transcript"]
                 result: dict[str, Any] | None = None
                 if row["result_json"]:
                     try:
@@ -712,11 +862,16 @@ class Database:
                     raw_transcript = (result.get("transcriptRaw") or result.get("transcript")) if result else None
                     if isinstance(raw_transcript, str) and raw_transcript.strip():
                         source = raw_transcript
+                # Failed-before-ASR and speechless runs have nothing to
+                # normalize. Do not turn every restart into a new update to
+                # their immutable historical failure/completion time.
+                if not isinstance(source, str) or not source.strip():
+                    continue
                 normalized = restore_transcript_text(source)
-                if normalized != row["transcript"] or not row["transcript_raw"]:
+                if normalized != row["transcript"] or not has_raw:
                     connection.execute(
-                        "UPDATE analysis_runs SET transcript_raw=COALESCE(transcript_raw,?),transcript=?,updated_at=? WHERE id=?",
-                        (source, normalized, utc_now(), row["id"]),
+                        "UPDATE analysis_runs SET transcript_raw=?,transcript=?,updated_at=? WHERE id=?",
+                        (row["transcript_raw"] if has_raw else source, normalized, utc_now(), row["id"]),
                     )
                 if result is not None and (result.get("transcript") != normalized or not result.get("transcriptRaw")):
                     if not result.get("transcriptRaw"):
@@ -861,20 +1016,48 @@ class Database:
         job_ttl = self.config.analysis_job_expiry_seconds if job_type == "analyze_video" else self.config.job_expiry_seconds
         with self.transaction() as connection:
             self.expire_and_requeue(connection)
+
+            def upgrade_active_link_analysis(row: sqlite3.Row) -> sqlite3.Row:
+                if (
+                    job_type != "analyze_video"
+                    or payload.get("sourceKind") != "video_link"
+                    or row["status"] not in ACTIVE_JOB_STATUSES
+                ):
+                    return row
+                current_payload = json.loads(row["payload_json"])
+                if current_payload.get("sourceKind") == "video_link":
+                    return row
+                current_payload["sourceKind"] = "video_link"
+                connection.execute(
+                    "UPDATE jobs SET payload_json=?,updated_at=? WHERE id=?",
+                    (_compact_json(current_payload), now, row["id"]),
+                )
+                return connection.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
+
             if job_type == "archive_account" and isinstance(payload.get("account"), dict):
                 self._upsert_account(connection, payload["account"])
             existing = connection.execute("SELECT * FROM jobs WHERE idempotency_key=?", (key,)).fetchone()
             if job_type == "analyze_video" and bool(payload.get("retry")):
                 latest = self._latest_analysis_job(connection, key)
                 if latest and latest["status"] in ACTIVE_JOB_STATUSES:
-                    return _job_dict(latest), False
+                    return _job_dict(upgrade_active_link_analysis(latest)), False
                 if latest:
                     key = hashlib.sha256(f"{key}|retry-of|{latest['id']}".encode("utf-8")).hexdigest()
                     repeated = connection.execute("SELECT * FROM jobs WHERE idempotency_key=?", (key,)).fetchone()
                     if repeated:
-                        return _job_dict(repeated), False
+                        return _job_dict(upgrade_active_link_analysis(repeated)), False
+            elif job_type == "archive_account" and payload.get("retry") and existing:
+                latest = next((row for row in connection.execute(
+                    "SELECT * FROM jobs WHERE type='archive_account' ORDER BY created_epoch DESC,created_at DESC,id DESC"
+                ).fetchall() if self._idempotency_key("archive_account", json.loads(row["payload_json"])) == key), existing)
+                if latest["status"] in ACTIVE_JOB_STATUSES:
+                    return _job_dict(latest), False
+                result = json.loads(latest["result_json"] or "{}")
+                if latest["status"] == "succeeded" and not result.get("partial"):
+                    return _job_dict(latest), False
+                key = hashlib.sha256(f"{key}|retry-of|{latest['id']}".encode("utf-8")).hexdigest()
             elif existing:
-                return _job_dict(existing), False
+                return _job_dict(upgrade_active_link_analysis(existing)), False
             job_id = str(uuid.uuid4())
             connection.execute(
                 "INSERT INTO jobs(id,type,payload_json,status,idempotency_key,created_at,updated_at,created_epoch,expires_at) "
@@ -942,7 +1125,7 @@ class Database:
         limit = max(1, min(500, int(limit)))
         with self.transaction() as connection:
             self.expire_and_requeue(connection)
-            rows = connection.execute("SELECT * FROM jobs ORDER BY created_epoch DESC LIMIT ?", (limit,)).fetchall()
+            rows = connection.execute("SELECT * FROM jobs ORDER BY created_epoch DESC,rowid DESC LIMIT ?", (limit,)).fetchall()
         return [_job_dict(row) for row in rows]
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
@@ -1070,6 +1253,8 @@ class Database:
                     (status, _compact_json(payload), utc_now(), job_id),
                 )
             elif event_type == "collection_result":
+                if payload.get("pendingVideos"):
+                    raise ValueError("不允许提交未完成的采集结果")
                 account_values = payload.get("accounts") or ([payload["account"]] if isinstance(payload.get("account"), dict) else [])
                 for account in account_values:
                     normalized = dict(_object(account, "account"))
@@ -1077,7 +1262,9 @@ class Database:
                     completed_at = str(payload.get("completedAt") or utc_now())
                     normalized["lastCheckedAt"] = completed_at
                     normalized["lastSuccessAt"] = completed_at
+                    normalized["pendingVideos"] = []  # Clear legacy incomplete records after a full capture.
                     normalized["status"] = "ready"
+                    normalized["collectionError"] = None
                     normalized["currentSyncMode"] = None
                     account_videos = [
                         video for video in payload.get("videos") or []
@@ -1085,7 +1272,7 @@ class Database:
                     ]
                     video_ids = list(dict.fromkeys(str(video.get("id")) for video in account_videos if video.get("id")))
                     if video_ids:
-                        normalized["latestVideoIds"] = video_ids[:3]
+                        normalized["latestVideoIds"] = video_ids[:5]
                     if payload.get("mode") in ("initial", "archive", "archive30"):
                         normalized["initialSyncStatus"] = "complete"
                         normalized["initialSyncCompletedAt"] = completed_at
@@ -1172,9 +1359,9 @@ class Database:
                     )
                 if job_id:
                     connection.execute(
-                        "UPDATE jobs SET status='failed',error=?,progress_json=NULL,claimed_by=NULL,claim_until=NULL,"
+                        "UPDATE jobs SET status='failed',error=?,result_json=?,progress_json=NULL,claimed_by=NULL,claim_until=NULL,"
                         "claim_token=NULL,updated_at=? WHERE id=?",
-                        (message, utc_now(), job_id),
+                        (message, _compact_json(payload), utc_now(), job_id),
                     )
             elif event_type == "analysis_media":
                 if not job or job["type"] != "analyze_video":
@@ -1183,6 +1370,20 @@ class Database:
                 job_payload = json.loads(job["payload_json"])
                 if video_id != str(job_payload.get("videoId")):
                     raise ValueError("媒体 videoId 与任务目标不一致")
+                video_row = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
+                video = json.loads(video_row["data_json"]) if video_row else None
+                metadata = payload.get("videoMetadata") if isinstance(payload.get("videoMetadata"), dict) else {}
+                if video and video.get("isLinkAnalysis") is True:
+                    required_metadata = {
+                        "标题": metadata.get("title"),
+                        "封面": metadata.get("coverUrl"),
+                        "博主名称": metadata.get("authorName"),
+                        "博主头像": metadata.get("authorAvatarUrl"),
+                        "博主主页": metadata.get("authorProfileUrl"),
+                    }
+                    missing = [label for label, value in required_metadata.items() if not isinstance(value, str) or not value.strip()]
+                    if missing:
+                        raise ValueError(f"视频链接分析未取得完整页面信息：{'、'.join(missing)}")
                 run_id = str(uuid.uuid4())
                 connection.execute(
                     "INSERT INTO analysis_runs(id,job_id,video_id,source_hash,analysis_version,status,created_at,updated_at) "
@@ -1201,9 +1402,27 @@ class Database:
                     "UPDATE jobs SET status='running',progress_json=?,claimed_by=NULL,claim_until=NULL,claim_token=NULL,updated_at=? WHERE id=?",
                     (_compact_json({"stage": "media_received"}), utc_now(), job_id),
                 )
-                video_row = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
-                if video_row:
-                    video = json.loads(video_row["data_json"])
+                if video:
+                    for key in (
+                        "title",
+                        "description",
+                        "coverUrl",
+                        "publishedAt",
+                        "durationSeconds",
+                        "likeCount",
+                        "commentCount",
+                        "favoriteCount",
+                        "shareCount",
+                        "authorName",
+                        "authorAvatarUrl",
+                        "authorProfileUrl",
+                    ):
+                        value = metadata.get(key)
+                        if value is not None and value != "":
+                            video[key] = value
+                    if video.get("isLinkAnalysis") is True:
+                        video["capturedAt"] = utc_now()
+                        video["lastSeenAt"] = video["capturedAt"]
                     video.update({"analysisStatus": "processing", "analysisError": None, "analysisUsage": None})
                     if not video.get("transcript"):
                         video.update({"transcriptStatus": "processing", "transcriptError": None})
@@ -1215,6 +1434,31 @@ class Database:
                 raise ValueError("不支持的 connector 事件类型")
             current = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone() if job_id else None
         return False, _job_dict(current) if current else {"id": None, "status": "accepted"}
+
+    def save_analysis_transcript(self, job_id: str, transcript: str, usage: dict[str, Any]) -> None:
+        """Checkpoint completed cloud speech without completing the video job."""
+        raw_transcript = str(transcript or "").strip()
+        restored = restore_transcript_text(raw_transcript)
+        with self.transaction() as connection:
+            job = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not job:
+                raise ValueError("任务不存在")
+            payload = json.loads(job["payload_json"])
+            video_id = _identifier(payload.get("videoId"), "videoId")
+            self._ensure_analysis_run(connection, job_id, payload, status="running")
+            row = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
+            if not row:
+                raise ValueError("分析目标视频不存在")
+            updated_at = utc_now()
+            video = json.loads(row["data_json"])
+            video.update({"transcript": restored, "transcriptStatus": "ready", "transcriptUpdatedAt": updated_at,
+                          "transcriptError": None, "analysisUsage": usage})
+            connection.execute("UPDATE videos SET data_json=?,updated_at=? WHERE id=?",
+                               (_compact_json(video), updated_at, video_id))
+            connection.execute(
+                "UPDATE analysis_runs SET status=?,transcript_raw=?,transcript=?,usage_json=?,updated_at=? WHERE job_id=?",
+                ("cancelled" if job["status"] == "cancelled" else "running", raw_transcript, restored, _compact_json(usage), updated_at, job_id),
+            )
 
     def save_analysis_success(
         self,
@@ -1238,6 +1482,8 @@ class Database:
                 raise ValueError("分析目标视频不存在")
             updated_at = utc_now()
             video = json.loads(video_row["data_json"])
+            # A targeted completion can return only one requested section.
+            analysis = {**(video.get("analysis") or {}), **analysis}
             video.update(
                 {
                     "transcript": transcript,
@@ -1249,6 +1495,7 @@ class Database:
                     "analysisStatus": "ready",
                     "analysisUpdatedAt": updated_at,
                     "analysisError": None,
+                    "analysisDiagnostics": None,
                     "sourceHash": source_hash,
                 }
             )
@@ -1257,13 +1504,16 @@ class Database:
                 (source_hash, _compact_json(video), updated_at, video_id),
             )
             connection.execute(
-                "UPDATE analysis_runs SET source_hash=?,status='succeeded',transcript_raw=?,transcript=?,analysis_json=?,usage_json=?,error=NULL,updated_at=? WHERE job_id=?",
-                (source_hash, raw_transcript, transcript, _compact_json(analysis), _compact_json(usage), updated_at, job_id),
+                "UPDATE analysis_runs SET source_hash=?,status=?,transcript_raw=?,transcript=?,analysis_json=?,usage_json=?,error=NULL,updated_at=? WHERE job_id=?",
+                (source_hash, "cancelled" if job["status"] == "cancelled" else "succeeded", raw_transcript, transcript, _compact_json(analysis), _compact_json(usage), updated_at, job_id),
             )
             result = {"videoId": video_id, "transcriptRaw": raw_transcript, "transcript": transcript, "analysis": analysis, "analysisUsage": usage, "sourceHash": source_hash}
+            cancelled = job["status"] == "cancelled"
+            if cancelled:
+                video.update({"analysisStatus": "ready", "analysisError": None})
             connection.execute(
-                "UPDATE jobs SET status='succeeded',result_json=?,progress_json=NULL,error=NULL,updated_at=? WHERE id=?",
-                (_compact_json(result), updated_at, job_id),
+                "UPDATE jobs SET status=?,result_json=?,progress_json=NULL,error=NULL,updated_at=? WHERE id=?",
+                ("cancelled" if cancelled else "succeeded", _compact_json(result), updated_at, job_id),
             )
 
     def save_analysis_failure(
@@ -1272,8 +1522,9 @@ class Database:
         message: str,
         transcript: str | None = None,
         usage: dict[str, Any] | None = None,
+        diagnostics: dict[str, Any] | None = None,
     ) -> None:
-        safe_message = message[:2000]
+        safe_message = safe_error(message)
         raw_transcript = str(transcript).strip() if transcript is not None else None
         if transcript is not None:
             transcript = restore_transcript_text(transcript)
@@ -1282,6 +1533,7 @@ class Database:
             if not job:
                 return
             payload = json.loads(job["payload_json"])
+            cancelled = job["status"] == "cancelled"
             video_id = str(payload.get("videoId") or "")
             self._ensure_analysis_run(connection, job_id, payload, status="running")
             video_row = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
@@ -1296,27 +1548,147 @@ class Database:
                             "transcriptError": None,
                         }
                     )
-                video.update({"analysisStatus": "error", "analysisError": safe_message, "analysisUsage": usage})
+                video.update({"analysisStatus": "cancelled" if cancelled else "error", "analysisError": safe_message, "analysisUsage": usage})
+                if diagnostics is not None:
+                    video["analysisDiagnostics"] = diagnostics
                 connection.execute(
                     "UPDATE videos SET data_json=?,updated_at=? WHERE id=?",
                     (_compact_json(video), utc_now(), video_id),
                 )
             connection.execute(
-                "UPDATE analysis_runs SET status='failed',transcript_raw=COALESCE(?,transcript_raw),"
+                "UPDATE analysis_runs SET status=?,transcript_raw=COALESCE(?,transcript_raw),"
                 "transcript=COALESCE(?,transcript),usage_json=?,error=?,updated_at=? WHERE job_id=?",
-                (raw_transcript, transcript, _compact_json(usage) if usage is not None else None, safe_message, utc_now(), job_id),
+                ("cancelled" if cancelled else "failed", raw_transcript, transcript, _compact_json(usage) if usage is not None else None, safe_message, utc_now(), job_id),
             )
             connection.execute(
-                "UPDATE jobs SET status='failed',error=?,progress_json=NULL,updated_at=? WHERE id=?",
-                (safe_message, utc_now(), job_id),
+                "UPDATE jobs SET status=?,error=?,result_json=COALESCE(?,result_json),progress_json=NULL,updated_at=? WHERE id=?",
+                ("cancelled" if cancelled else "failed", safe_message,
+                 _compact_json({"diagnostics": diagnostics}) if diagnostics is not None else None, utc_now(), job_id),
             )
 
-    def update_job_progress(self, job_id: str, stage: str) -> None:
+    def update_job_progress(self, job_id: str, stage: str, **detail: Any) -> None:
         with self.transaction() as connection:
             connection.execute(
-                "UPDATE jobs SET status='running',progress_json=?,updated_at=? WHERE id=?",
-                (_compact_json({"stage": stage}), utc_now(), job_id),
+                "UPDATE jobs SET status='running',progress_json=?,updated_at=? WHERE id=? AND status IN ('queued','claimed','running')",
+                (_compact_json({"stage": stage, **detail}), utc_now(), job_id),
             )
+
+    def start_host_analysis(self, job_id: str) -> None:
+        """Hand the full capture/download attempt budget to the analysis worker."""
+        with self.transaction() as connection:
+            row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not row or row["status"] not in ACTIVE_JOB_STATUSES:
+                return
+            payload = json.loads(row["payload_json"])
+            self._ensure_analysis_run(connection, job_id, payload, status="running")
+            connection.execute("UPDATE analysis_runs SET status='running',updated_at=? WHERE job_id=?", (utc_now(), job_id))
+            connection.execute("UPDATE jobs SET status='running',claimed_by=NULL,claim_until=NULL,claim_token=NULL,updated_at=? WHERE id=?", (utc_now(), job_id))
+
+    def save_analysis_media_metadata(self, job_id: str, media: dict[str, Any]) -> None:
+        """Persist public metadata, never CDN addresses or temporary media."""
+        with self.transaction() as connection:
+            job = connection.execute("SELECT payload_json FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not job:
+                raise ValueError("任务不存在")
+            video_id = str(json.loads(job["payload_json"]).get("videoId"))
+            if str(media.get("videoId")) != video_id:
+                raise ValueError("媒体 videoId 与任务目标不一致")
+            row = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
+            if not row:
+                raise ValueError("分析目标视频不存在")
+            video = json.loads(row["data_json"])
+            metadata = media.get("videoMetadata") or {}
+            if video.get("isLinkAnalysis") is True:
+                required = ("title", "coverUrl", "authorName", "authorAvatarUrl", "authorProfileUrl")
+                if any(not isinstance(metadata.get(key), str) or not metadata[key].strip() for key in required):
+                    raise ValueError("视频链接分析未取得完整页面信息")
+            for key in ("title", "description", "coverUrl", "publishedAt", "durationSeconds", "likeCount", "commentCount", "favoriteCount", "shareCount", "authorName", "authorAvatarUrl", "authorProfileUrl"):
+                if metadata.get(key) is not None and metadata.get(key) != "":
+                    video[key] = metadata[key]
+            video.update({"analysisStatus": "processing", "analysisError": None})
+            if video.get("isLinkAnalysis") is True:
+                video.update({"capturedAt": utc_now(), "lastSeenAt": utc_now()})
+            connection.execute("UPDATE videos SET data_json=?,updated_at=? WHERE id=?", (_compact_json(video), utc_now(), video_id))
+
+    def save_analysis_checkpoint(self, job_id: str, analysis: dict[str, Any], usage: dict[str, Any] | None, source_hash: str) -> None:
+        """Save validated independent sections without declaring all complete."""
+        with self.transaction() as connection:
+            job = connection.execute("SELECT payload_json FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not job:
+                raise ValueError("任务不存在")
+            video_id = str(json.loads(job["payload_json"]).get("videoId"))
+            row = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
+            if not row:
+                raise ValueError("分析目标视频不存在")
+            video = json.loads(row["data_json"])
+            merged = {**(video.get("analysis") or {}), **analysis}
+            video.update({"analysis": merged, "analysisUsage": usage, "analysisUpdatedAt": utc_now(), "sourceHash": source_hash})
+            connection.execute("UPDATE videos SET source_hash=?,data_json=?,updated_at=? WHERE id=?", (source_hash, _compact_json(video), utc_now(), video_id))
+            connection.execute("UPDATE analysis_runs SET analysis_json=?,usage_json=?,source_hash=?,updated_at=? WHERE job_id=?", (_compact_json(merged), _compact_json(usage), source_hash, utc_now(), job_id))
+
+    def restore_superseded_analysis_history(self, result: dict[str, Any]) -> bool:
+        """Recover an older paid receipt without replacing newer video results.
+
+        SQLite queue insertion order is unambiguous even when both tasks were
+        created within the same timestamp. This runs during startup recovery,
+        before new browser/analysis work is dispatched.
+        """
+        job_id = str(result.get("jobId") or "")
+        with self.transaction() as connection:
+            job = connection.execute("SELECT rowid AS queue_order,* FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not job:
+                return False
+            payload = json.loads(job["payload_json"])
+            video_id = str(payload.get("videoId") or "")
+            if video_id != str(result.get("videoId") or ""):
+                raise ValueError("恢复结果与任务视频不一致")
+            newer = connection.execute(
+                "SELECT 1 FROM jobs newer JOIN analysis_runs run ON run.job_id=newer.id "
+                "WHERE newer.rowid>? AND run.video_id=? AND (run.analysis_json IS NOT NULL OR run.transcript IS NOT NULL) LIMIT 1",
+                (job["queue_order"], video_id),
+            ).fetchone()
+            if not newer:
+                return False
+            self._ensure_analysis_run(connection, job_id, payload)
+            transcript = result.get("transcript")
+            raw_transcript = str(transcript).strip() if transcript is not None else None
+            restored = restore_transcript_text(raw_transcript) if raw_transcript is not None else None
+            analysis = result.get("analysis")
+            usage = result.get("usage")
+            diagnostics = result.get("diagnostics") or {}
+            complete = {"transcript", "content", "remotion"}.issubset(set(diagnostics.get("completedSteps") or []))
+            status = "cancelled" if job["status"] == "cancelled" else "succeeded" if complete else "failed"
+            message = None if status == "succeeded" else safe_error(diagnostics.get("lastError") or "已恢复旧任务结果；当前视频保留更新任务的结果")
+            now = utc_now()
+            connection.execute(
+                "UPDATE analysis_runs SET status=?,transcript_raw=COALESCE(?,transcript_raw),transcript=COALESCE(?,transcript),"
+                "analysis_json=COALESCE(?,analysis_json),usage_json=?,source_hash=COALESCE(?,source_hash),error=?,updated_at=? WHERE job_id=?",
+                (status, raw_transcript, restored, _compact_json(analysis) if analysis else None,
+                 _compact_json(usage) if usage is not None else None, result.get("sourceHash") or None, message, now, job_id),
+            )
+            connection.execute(
+                "UPDATE jobs SET status=?,result_json=?,progress_json=NULL,error=?,updated_at=? WHERE id=?",
+                (status, _compact_json({"videoId": video_id, "transcript": restored, "analysis": analysis,
+                                       "analysisUsage": usage, "sourceHash": result.get("sourceHash"), "diagnostics": diagnostics}), message, now, job_id),
+            )
+        return True
+
+    def cancel_job(self, job_id: str) -> dict[str, Any] | None:
+        with self.transaction() as connection:
+            row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not row:
+                return None
+            if row["status"] in ACTIVE_JOB_STATUSES:
+                connection.execute("UPDATE jobs SET status='cancelled',error='用户已取消任务',progress_json=NULL,claimed_by=NULL,claim_until=NULL,claim_token=NULL,updated_at=? WHERE id=?", (utc_now(), job_id))
+                connection.execute("UPDATE analysis_runs SET status='cancelled',error='用户已取消任务',updated_at=? WHERE job_id=?", (utc_now(), job_id))
+                payload = json.loads(row["payload_json"])
+                video_row = connection.execute("SELECT data_json FROM videos WHERE id=?", (str(payload.get("videoId")),)).fetchone()
+                if video_row:
+                    video = json.loads(video_row["data_json"])
+                    video.update({"analysisStatus": "cancelled", "analysisError": "用户已取消任务；已完成结果保留"})
+                    connection.execute("UPDATE videos SET data_json=?,updated_at=? WHERE id=?", (_compact_json(video), utc_now(), str(payload.get("videoId"))))
+            current = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        return _job_dict(current)
 
     def mark_stale_analysis_failed(self) -> int:
         """Recover tasks interrupted by a service or machine restart."""

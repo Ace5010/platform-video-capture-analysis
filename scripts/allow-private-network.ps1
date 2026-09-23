@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 
 Set-StrictMode -Version Latest
@@ -36,7 +36,7 @@ foreach ($rule in $rules) {
             -Enabled True | Out-Null
     }
     else {
-        $existing | Set-NetFirewallRule -Direction Inbound -Action Allow -Profile Private -Enabled True | Out-Null
+        $existing | Set-NetFirewallRule -Direction Inbound -Action Allow -Profile Private -Enabled True -Protocol TCP -LocalPort $rule.Port -RemoteAddress LocalSubnet | Out-Null
     }
     Write-Host "[network] 已允许专用局域网访问 TCP $($rule.Port)"
 }

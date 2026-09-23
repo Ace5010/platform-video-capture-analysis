@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "抖音监控账号 - 本地采集组件",
-  "version": "0.8.0",
+  "version": "0.9.7",
   "minimum_chrome_version": "110",
   "description": "连接本机任务队列与当前 Chrome 登录状态，采集公开抖音账号数据及完整视频媒体流。",
   "permissions": ["alarms", "scripting", "storage", "tabs", "webRequest", "unlimitedStorage"],
