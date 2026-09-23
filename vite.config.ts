@@ -15,8 +15,11 @@ const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === 'seatbelt';
 
 const localBindingConfig = {
   account_id: remoteHost.accountId,
-  main: 'vinext/server/app-router-entry',
+  main: './cloudflare-worker.ts',
   compatibility_flags: ['nodejs_compat'],
+  // The anonymous page shell is generated at build time. API requests always
+  // enter the authenticated gateway, even when opened as a browser navigation.
+  assets: { binding: 'ASSETS', run_worker_first: ['/host/*'] },
   vars: { HOST_PUBLIC_ORIGIN: remoteHost.publicOrigin },
   vpc_services: remoteHost.vpcServiceId
     ? [{ binding: 'HOST_SERVICE', service_id: remoteHost.vpcServiceId }]
@@ -60,7 +63,7 @@ export default defineConfig(async ({ command }) => {
       },
     },
     plugins: [
-      vinext(),
+      vinext({ prerender: true }),
       sites(),
       cloudflare({
         viteEnvironment: { name: 'rsc', childEnvironments: ['ssr'] },

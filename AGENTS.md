@@ -121,7 +121,7 @@
   - API：`host_service/server.py`
   - 配置：`host_service/config.py`
   - Cloudflare 隧道进程与加密连接配置：`host_service/remote.py`
-- Cloudflare HTTPS 网关：`app/host/[...path]/route.ts`、`lib/host-proxy.ts`
+- Cloudflare HTTPS 网关：`cloudflare-worker.ts`、`app/host/[...path]/route.ts`、`lib/host-proxy.ts`；生产 `/host/*` 直接复用受限网关，首页通过 `scripts/prepare-cloudflare-static.mjs` 发布匿名预渲染外壳。变更部署入口后运行 `npm run build`、`npm run test:cloudflare-static` 和 `npm run test:cloudflare-worker`（模拟主机，不连接真实隧道）。
 - 非秘密部署绑定：`cloudflare-host.json`；不要在此填写任何 token 或 API Key。
 - Chrome 扩展：`chrome-extension/`
   - 主要逻辑：`chrome-extension/background.js`

@@ -89,6 +89,8 @@ npm run dev
 
 公网网页部署在 Cloudflare Workers；电脑仍负责 SQLite、专用 Chrome 和视频分析。手机通过同一网站的 `/host/` HTTPS 接口访问后台，不能直接请求公网地址的 `43129` 端口。公网入口继续使用电脑上设置的工作台访问密码，不需要手机 VPN 或扩展；电脑必须开机、联网且不休眠。
 
+`npm run build` 会在构建时预渲染匿名首页，并由 `postbuild` 校验版本、发布到静态资源目录，打开网页时无需再次执行 React 服务端渲染。`cloudflare-worker.ts` 将 `/host/*` 直接交给原有受限网关，避免历史数据响应经过页面框架处理而耗尽免费套餐每请求 10ms 的 CPU 额度（1102）。账号、口播稿和分析结果仍在登录后实时获取，接口保持 `no-store`；不能把这些数据写进静态首页。新增依赖请求状态的首页逻辑时，须重新评估预渲染边界。Cloudflare 构建命令继续使用 `npm run build`，部署命令不变。
+
 连接方式为 `手机 → Workers → VPC Service → Cloudflare Tunnel → 电脑受限接口`。Workers VPC 在公开测试期间免费，仍受 Workers 套餐的请求和计算额度限制，不能承诺永久免费。它需要电脑能通过 UDP 7844 连接 Cloudflare（QUIC）；能打开网页不等于隧道已经连通。不同运营商和网络的实际可达性需另行验证。
 
 ### 一次性配置

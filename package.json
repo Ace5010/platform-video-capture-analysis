@@ -20,6 +20,9 @@
     "test:analysis-usage": "node --experimental-strip-types scripts/test-analysis-usage.ts",
     "test:reading": "node --experimental-strip-types scripts/test-remotion-plan.ts && node --experimental-strip-types scripts/test-analysis-diagnostics.ts",
     "build": "vinext build",
+    "postbuild": "node scripts/prepare-cloudflare-static.mjs",
+    "test:cloudflare-static": "node scripts/test-cloudflare-static.mjs",
+    "test:cloudflare-worker": "node scripts/test-cloudflare-worker.mjs",
     "start": "vinext start",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "test:browser": "node scripts/test-browser-worker.mjs && node scripts/test-partial-capture.mjs && .venv\\Scripts\\python.exe scripts/test-browser-host.py"
