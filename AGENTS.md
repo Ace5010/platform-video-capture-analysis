@@ -12,6 +12,7 @@
 - 用户主动点击后，获取完整视频，优先选用平台已有的 1080p 源，连同口播稿交给阿里云百炼 `qwen3.8-flash` 分析。
 - `local_asr/` 的本地 faster-whisper 保留兼容入口，不用于视频分析默认流程，也不在云端失败后自动回退到本地识别。现有标点规范化继续保留，不改动识别文字。
 - 允许同一局域网内的其他设备访问工作台并提交任务。
+- 用户已要求通过 Cloudflare 网站远程使用电脑后台。远程访问使用 Workers VPC 与专用隧道，复用原有密码、CSRF、数据库和任务队列；电脑仍须开机。连接配置和实际联网验收未完成前不得声称远程功能已可用。
 
 目前抖音功能已经实现；小红书、哔哩哔哩和 YouTube 只有预留入口，尚未实现。采集由用户手动触发，没有定时自动采集。
 
@@ -70,7 +71,8 @@
 - 当前默认端口：工作台 `3000`、主机服务 `43129`、本地转写兼容端口 `43128`。
 - 除非任务明确要求，否则不得修改这些端口。
 - 修改端口时，必须同步检查相关认证来源、Cookie、扩展白名单、局域网访问配置、启动脚本、文档和测试。
-- 不得把服务开放到公用网络或互联网。
+- 不得把原有服务端口直接开放到公用网络或互联网。已授权的 Cloudflare 远程接入仅连接 `127.0.0.1:43130` 受限入口，不做路由器端口映射，不把 `43129` 作为 VPC 目标。
+- 远程入口仅监听回环地址，由账号内私有 VPC Service 连接；验证正式网站来源并保留密码会话及 CSRF，始终视为非本机。不得允许远程设置密码、修改 Qwen Key、迁移旧数据、打开登录窗口或调用扩展接口。隧道凭据使用独立 DPAPI 文件，不配置公网后台域名或公共隧道路由。
 
 ## 通常不应直接修改的目录与文件
 
@@ -118,6 +120,9 @@
   - 浏览器驱动：`scripts/browser-worker.mjs`
   - API：`host_service/server.py`
   - 配置：`host_service/config.py`
+  - Cloudflare 隧道进程与加密连接配置：`host_service/remote.py`
+- Cloudflare HTTPS 网关：`app/host/[...path]/route.ts`、`lib/host-proxy.ts`
+- 非秘密部署绑定：`cloudflare-host.json`；不要在此填写任何 token 或 API Key。
 - Chrome 扩展：`chrome-extension/`
   - 主要逻辑：`chrome-extension/background.js`
   - 扩展配置：`chrome-extension/manifest.json`

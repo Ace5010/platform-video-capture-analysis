@@ -34,6 +34,7 @@ from .database import CANONICAL_JOB_TYPES, Database, utc_now
 from .douyin_links import resolve_douyin_video_link
 from .media import cleanup_stale_temp
 from .qwen import QwenClient, analysis_section_status
+from .remote import GATEWAY_PORT, RemoteConnection, TunnelProcess
 from .security import (
     MIN_PASSWORD_LENGTH,
     SecretStore,
@@ -108,16 +109,18 @@ class HostHTTPServer(ThreadingHTTPServer):
         database: Database,
         secrets: SecretStore,
         analysis: AnalysisManager,
+        remote_connection: RemoteConnection | None = None,
     ) -> None:
         super().__init__(address, HostRequestHandler)
         self.config = config
         self.database = database
         self.secrets = secrets
         self.analysis = analysis
+        self.remote_connection = remote_connection
         self.browser: BrowserManager | None = None
 
     def server_close(self) -> None:
-        if self.browser:
+        if self.browser and not self.remote_connection:
             self.browser.shutdown()
         super().server_close()
 
@@ -141,10 +144,35 @@ class HostRequestHandler(BaseHTTPRequestHandler):
         return self.server.database
 
     def _remote_ip(self) -> str:
+        if self.server.remote_connection:
+            # The loopback-only listener is reached through the account's VPC
+            # service binding. Public clients cannot connect to it directly.
+            value = self.headers.get("X-Workbench-Client-IP") or "unknown"
+            try:
+                return str(ipaddress.ip_address(value))
+            except ValueError:
+                return "remote-unknown"
         return self.client_address[0].split("%", 1)[0]
 
     def _loopback(self) -> bool:
-        return _is_loopback(self._remote_ip())
+        # The tunnel's TCP peer is local, but the person using it is never a
+        # localhost administrator. This cannot be overridden by request headers.
+        return not self.server.remote_connection and _is_loopback(self._remote_ip())
+
+    def _require_gateway(self) -> None:
+        connection = self.server.remote_connection
+        if not connection:
+            return
+        if not _is_loopback(self.client_address[0]):
+            raise ApiError(HTTPStatus.FORBIDDEN, "远程入口仅接受本机私有通道连接")
+        # Recheck the origin on the host as well as in the Worker.
+        if self.headers.get_all("Origin") != [connection.origin]:
+            raise ApiError(HTTPStatus.FORBIDDEN, "不允许的网页来源")
+        path = urlsplit(self.path).path
+        if path.startswith("/connector/") or (self.command != "GET" and path in {
+            "/api/auth/setup", "/api/qwen", "/api/qwen/config", "/api/migrate", "/api/browser/open",
+        }):
+            raise ApiError(HTTPStatus.FORBIDDEN, "此操作只能在电脑的 localhost 工作台执行")
 
     def _local_dashboard(self) -> bool:
         if not self._loopback():
@@ -161,10 +189,15 @@ class HostRequestHandler(BaseHTTPRequestHandler):
             raise ApiError(HTTPStatus.FORBIDDEN, message)
 
     def _cors_origin(self) -> str | None:
+        if self.server.remote_connection:
+            return None  # The public browser talks to its same-origin Worker.
         origin = self.headers.get("Origin")
         return origin if origin and _private_dashboard_origin(origin, self.config.dashboard_port) else None
 
     def _require_browser_origin(self) -> None:
+        if self.server.remote_connection:
+            self._require_gateway()
+            return
         origin = self.headers.get("Origin")
         if not origin or not _private_dashboard_origin(origin, self.config.dashboard_port):
             raise ApiError(HTTPStatus.FORBIDDEN, "不允许的网页来源")
@@ -265,9 +298,9 @@ class HostRequestHandler(BaseHTTPRequestHandler):
             raise ApiError(HTTPStatus.UNAUTHORIZED, "connector token 已失效")
         return connector
 
-    @staticmethod
-    def _session_cookie(token: str, max_age: int) -> str:
-        return f"{SESSION_COOKIE}={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Strict"
+    def _session_cookie(self, token: str, max_age: int) -> str:
+        secure = "; Secure" if self.server.remote_connection else ""
+        return f"{SESSION_COOKIE}={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Strict{secure}"
 
     def _new_session(self) -> tuple[str, str]:
         session_token = token_urlsafe(32)
@@ -303,6 +336,7 @@ class HostRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         try:
+            self._require_gateway()
             path = urlsplit(self.path).path
             if path == "/health":
                 self._send_json(
@@ -390,6 +424,7 @@ class HostRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
+            self._require_gateway()
             path = urlsplit(self.path).path
             if path.startswith("/connector/"):
                 self._handle_connector(path)
@@ -761,8 +796,30 @@ def create_server(config: HostConfig | None = None) -> HostHTTPServer:
     return server
 
 
+def create_remote_gateway(host: HostHTTPServer, connection: RemoteConnection, port: int = GATEWAY_PORT) -> HostHTTPServer:
+    gateway = HostHTTPServer(
+        ("127.0.0.1", port), host.config, host.database, host.secrets, host.analysis, connection,
+    )
+    gateway.browser = host.browser
+    return gateway
+
+
 def main() -> None:
     server = create_server()
+    gateway = None
+    tunnel = None
+    try:
+        connection = RemoteConnection.load(server.config)
+        if connection:
+            gateway = create_remote_gateway(server, connection)
+            threading.Thread(target=gateway.serve_forever, daemon=True, name="remote-gateway").start()
+            tunnel = TunnelProcess(server.config, connection)
+            tunnel.start()
+            print("[remote-host] 仅本机远程入口已启动；通道连接情况请在 Cloudflare 检查", flush=True)
+    except Exception as error:
+        # Local history and capture remain available if optional remote setup is
+        # broken. No exception text here: encrypted config can contain secrets.
+        print(f"[remote-host] 远程连接启动失败（{type(error).__name__}）；本机服务继续运行", flush=True)
     print(
         f"[host-service] 已监听 http://{server.config.listen_host}:{server.config.listen_port} "
         f"（数据目录 {server.config.data_dir}，Qwen {server.config.qwen_model}，完整视频 fps={server.config.qwen_fps}）",
@@ -773,6 +830,11 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        if tunnel:
+            tunnel.shutdown()
+        if gateway:
+            gateway.shutdown()
+            gateway.server_close()
         server.shutdown()
         server.server_close()
         server.analysis.shutdown()

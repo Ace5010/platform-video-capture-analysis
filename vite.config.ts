@@ -3,6 +3,7 @@ import tailwindcss from '@tailwindcss/postcss';
 import vinext from 'vinext';
 import { defineConfig } from 'vite';
 import hostingConfig from './.openai/hosting.json';
+import remoteHost from './cloudflare-host.json';
 
 const SITE_CREATOR_PLACEHOLDER_DATABASE_ID =
   '00000000-0000-4000-8000-000000000000';
@@ -13,8 +14,13 @@ const { d1, r2 } = hostingConfig;
 const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === 'seatbelt';
 
 const localBindingConfig = {
+  account_id: remoteHost.accountId,
   main: 'vinext/server/app-router-entry',
   compatibility_flags: ['nodejs_compat'],
+  vars: { HOST_PUBLIC_ORIGIN: remoteHost.publicOrigin },
+  vpc_services: remoteHost.vpcServiceId
+    ? [{ binding: 'HOST_SERVICE', service_id: remoteHost.vpcServiceId }]
+    : [],
   d1_databases: d1
     ? [
         {
@@ -34,7 +40,7 @@ const localBindingConfig = {
     : [],
 };
 
-export default defineConfig(async () => {
+export default defineConfig(async ({ command }) => {
   // Keep Wrangler and Miniflare state project-local. These are non-secret tool
   // settings; application environment belongs in ignored `.env*` files.
   process.env.WRANGLER_WRITE_LOGS ??= 'false';
@@ -58,7 +64,9 @@ export default defineConfig(async () => {
       sites(),
       cloudflare({
         viteEnvironment: { name: 'rsc', childEnvironments: ['ssr'] },
-        config: localBindingConfig,
+        // Local browsing uses the existing host directly and must still start
+        // offline, without a Cloudflare login or a remote VPC dev session.
+        config: command === 'serve' ? { ...localBindingConfig, vpc_services: [] } : localBindingConfig,
       }),
     ],
   };

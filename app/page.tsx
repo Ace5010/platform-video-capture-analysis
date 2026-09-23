@@ -6,6 +6,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState, type CSSP
 import { flushSync } from 'react-dom';
 import { ANALYSIS_STAGE_LABELS, formatAnalysisDiagnostics, redactDiagnosticText, type AnalysisDiagnostics } from '../lib/analysis-diagnostics';
 import { createClientId } from '../lib/client-id';
+import { hostApiBase } from '../lib/host-connection';
 import { browseContentVideos, collectionAccountScope, type ContentBrowseScope, type ContentResultFilter } from '../lib/content-browse';
 import { normalizeAnalysisUsage, formatTokenCount, formatEstimatedCost, formatCloudAudioSeconds, analysisRequestCountLabel, analysisUsageSummary, type AnalysisUsage } from '../lib/analysis-usage';
 
@@ -224,8 +225,7 @@ function isLoopbackHostname(hostname: string) {
 }
 
 function getHostApiBase() {
-  if (typeof window === 'undefined') return 'http://127.0.0.1:43129';
-  return `http://${window.location.hostname || '127.0.0.1'}:43129`;
+  return hostApiBase(typeof window === 'undefined' ? undefined : window.location);
 }
 
 async function hostApi<T>(base: string, path: string, options: RequestInit = {}, csrfToken = '', retried = false): Promise<T> {
@@ -758,7 +758,7 @@ export default function Home() {
         setCsrfToken(textValue(auth.csrfToken ?? auth.csrf_token));
         if (setupRequired) {
           setAuthPhase('setup');
-          setAuthMessage(isHostLocal ? '请先为局域网访问设置密码' : '请先在主机的 localhost 页面完成首次设置');
+          setAuthMessage(isHostLocal ? '请先设置工作台访问密码' : '请先在主机的 localhost 页面完成首次设置');
         } else if (authenticated) {
           setAuthPhase('ready');
           setAuthMessage('');
@@ -1601,12 +1601,12 @@ export default function Home() {
       <section className="accessCard" aria-live="polite">
         <div className="accessMark"><PlatformIcon platform="douyin" alt="抖音" /></div>
 
-        <h1>{authPhase === 'setup' ? '设置局域网访问密码' : authPhase === 'login' ? '登录监控工作台' : authPhase === 'error' ? '主机服务未连接' : '正在载入共享数据'}</h1>
+        <h1>{authPhase === 'setup' ? '设置工作台访问密码' : authPhase === 'login' ? '登录监控工作台' : authPhase === 'error' ? '主机服务未连接' : '正在载入共享数据'}</h1>
         <p>{authMessage || '正在加载账号、视频和分析结果。'}</p>
         {(authPhase === 'setup' || authPhase === 'login') && !setupBlocked && <form onSubmit={submitAuth}>
           <label htmlFor="access-password">访问密码</label>
           <input id="access-password" type="password" autoComplete={authPhase === 'login' ? 'current-password' : 'new-password'} minLength={10} value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} autoFocus />
-          {authPhase === 'setup' && <><small className="accessPasswordHint">至少 10 位，仅用于你的局域网设备访问。</small><label htmlFor="access-password-confirm">再次输入密码</label><input id="access-password-confirm" type="password" autoComplete="new-password" minLength={10} value={authPasswordConfirm} onChange={(event) => setAuthPasswordConfirm(event.target.value)} /></>}
+          {authPhase === 'setup' && <><small className="accessPasswordHint">至少 10 位，用于你的设备登录工作台。</small><label htmlFor="access-password-confirm">再次输入密码</label><input id="access-password-confirm" type="password" autoComplete="new-password" minLength={10} value={authPasswordConfirm} onChange={(event) => setAuthPasswordConfirm(event.target.value)} /></>}
           <button className="primaryButton" type="submit" disabled={authSubmitting}>{authSubmitting ? '请稍候…' : authPhase === 'setup' ? '保存并进入工作台' : '登录'}</button>
         </form>}
         {setupBlocked && <div className="accessNotice">首次密码只能在主机打开 <b>http://localhost:3000</b> 设置。设置完成后，本设备即可使用同一密码登录。</div>}

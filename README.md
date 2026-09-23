@@ -85,6 +85,32 @@ npm run dev
 
 4. 手机或另一台电脑在同一局域网打开终端给出的地址，用主机设置的访问密码登录。它们可以发起首次建档、最新检查和 AI 分析，但电脑和服务必须保持运行，采集浏览器会按需自动启动。
 
+## Cloudflare 远程访问（无需自有域名）
+
+公网网页部署在 Cloudflare Workers；电脑仍负责 SQLite、专用 Chrome 和视频分析。手机通过同一网站的 `/host/` HTTPS 接口访问后台，不能直接请求公网地址的 `43129` 端口。公网入口继续使用电脑上设置的工作台访问密码，不需要手机 VPN 或扩展；电脑必须开机、联网且不休眠。
+
+连接方式为 `手机 → Workers → VPC Service → Cloudflare Tunnel → 电脑受限接口`。Workers VPC 在公开测试期间免费，仍受 Workers 套餐的请求和计算额度限制，不能承诺永久免费。它需要电脑能通过 UDP 7844 连接 Cloudflare（QUIC）；能打开网页不等于隧道已经连通。不同运营商和网络的实际可达性需另行验证。
+
+### 一次性配置
+
+1. 在 Cloudflare 的 Tunnels 创建本项目专用隧道，例如 `content-workbench-home`。无需添加公共域名或创建公网应用路由。
+2. 在电脑项目目录运行 `powershell -ExecutionPolicy Bypass -File scripts/install-cloudflared.ps1`。脚本只下载官方 Windows 64 位版本并验证 SHA-256，存入被 Git 忽略的 `data/tools/`，不会安装全局服务或修改防火墙。
+3. 在本机终端运行 `.venv\Scripts\python.exe scripts/configure-remote-host.py`，按提示粘贴该隧道的 token。输入不回显，凭据保存在独立的 Windows CurrentUser DPAPI 文件 `data/host-service/remote-connection.dpapi`。不要把 token 放进源码、命令行参数、聊天或普通日志。
+4. 在 Workers VPC 创建 **HTTP Service**：选择该隧道，目标 IPv4 填 `127.0.0.1`，HTTP 端口填 **43130**。不要绑定 `43129`，它保留了本机管理功能。把返回的 Service ID 填入 `cloudflare-host.json` 的 `vpcServiceId`；其中账号 ID、正式网站来源和 Service ID 都是非秘密配置。
+5. 保存并推送配置后，现有 GitHub 自动构建会部署 VPC 绑定。构建命令为 `npm run build`，部署命令为 `npx wrangler deploy --config dist/server/wrangler.json`。VPC 是账号内私有服务绑定，不提供可绕过 Worker 的公网后台网址，也不需要另建一套网页登录凭据。
+6. 确认电脑没有进行中的任务后重启主机后台。它会启动仅监听 `127.0.0.1:43130` 的远程入口，并以当前 Windows 用户启动 cloudflared；之后仍使用现有桌面快捷方式。隧道进程由后台管理，退出后台时一起停止，不安装额外开机服务。
+
+### 权限和验收
+
+- 原有网页 `3000`、主机 `43129` 和兼容 ASR `43128` 端口不变；`43130` 仅监听回环地址，接收私有 VPC 隧道转发，并验证正式网站来源、工作台密码会话和 CSRF。不能做路由器端口映射，也不要放行其公网或局域网入站。
+- 远程访问始终按非本机处理，即使隧道连接来自 `127.0.0.1`。首次设密码、API Key 配置、旧数据迁移、打开抖音登录窗口和旧扩展接口均禁止远程调用。普通读取、登录、人工提交采集/分析及取消任务复用现有 API、SQLite 和 CSRF 检查。
+- 浏览器只持有原有 HttpOnly 会话，公网会话带 `Secure; SameSite=Strict`。Worker 不透传其他 Cookie 或客户端伪造的内部凭据，限制接口和请求体大小，不缓存用户数据，不在连接超时后自动重发任务。
+- Cloudflare 隧道健康后，手机在关闭 VPN 的移动网络下打开正式网址并登录，检查已有分析、手动采集和重连。模型分析仍由主动点击触发并按百炼规则计费；常规连接验收不用真实付费模型。
+- 关机或休眠后后台无法提供数据或执行任务；重新联网启动后再连接。云端没有复制一份数据库，已有结果仍留在电脑中。连接失败不会清空历史数据。
+- 隧道异常的最近记录在 `data/host-service/remote-tunnel.log`，内容经过脱敏并限制大小。远程通道配置失败不会阻止原有本机服务启动。开发模式继续直连本机后台，不要求 Cloudflare 登录。
+
+官方参考：[Workers VPC 配置](https://developers.cloudflare.com/workers-vpc/get-started/)、[Tunnel 与 QUIC 要求](https://developers.cloudflare.com/workers-vpc/configuration/tunnel/)、[公开测试期价格](https://developers.cloudflare.com/workers-vpc/platform/pricing/)。
+
 ## 数据与隐私
 
 - 主数据默认保存在项目目录下的 `data\host-service\monitor.sqlite3`（WAL 模式）。可通过 `DOUYIN_HOST_DATA_DIR` 或 `DOUYIN_DATA_DIR` 环境变量覆盖整个运行数据目录。

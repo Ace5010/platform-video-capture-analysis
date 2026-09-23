@@ -12,7 +12,7 @@
     "test:bridge": "node scripts/test-dashboard-bridge.mjs",
     "test:connector": "node scripts/test-extension-connector.mjs",
     "test:asr": ".venv\\Scripts\\python.exe scripts/test-local-asr.py",
-    "test:host": ".venv\\Scripts\\python.exe scripts/test-host-service.py && .venv\\Scripts\\python.exe scripts/test-cloud-asr.py && .venv\\Scripts\\python.exe scripts/test-qwen-upload.py && .venv\\Scripts\\python.exe scripts/test-analysis-reuse.py",
+    "test:host": ".venv\\Scripts\\python.exe scripts/test-host-service.py && .venv\\Scripts\\python.exe scripts/test-remote-host.py && node --experimental-strip-types scripts/test-host-proxy.ts && .venv\\Scripts\\python.exe scripts/test-cloud-asr.py && .venv\\Scripts\\python.exe scripts/test-qwen-upload.py && .venv\\Scripts\\python.exe scripts/test-analysis-reuse.py",
     "test:scheduler": "node scripts/test-extension-scheduler.mjs",
     "test:extension-compatibility": "node --experimental-strip-types scripts/test-extension-compatibility.ts",
     "test:video-analytics": "node --experimental-strip-types scripts/test-video-analytics.ts",
