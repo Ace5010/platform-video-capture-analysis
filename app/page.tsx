@@ -7,7 +7,7 @@ import { flushSync } from 'react-dom';
 import { ANALYSIS_STAGE_LABELS, formatAnalysisDiagnostics, redactDiagnosticText, type AnalysisDiagnostics } from '../lib/analysis-diagnostics';
 import { createClientId } from '../lib/client-id';
 import { hostApiBase } from '../lib/host-connection';
-import { browseContentVideos, collectionAccountScope, type ContentBrowseScope, type ContentResultFilter } from '../lib/content-browse';
+import { browseContentVideos, collectionAccountScope } from '../lib/content-browse';
 import { normalizeAnalysisUsage, formatTokenCount, formatEstimatedCost, formatCloudAudioSeconds, analysisRequestCountLabel, analysisUsageSummary, type AnalysisUsage } from '../lib/analysis-usage';
 
 import {
@@ -186,10 +186,10 @@ const navItems = [
 ];
 
 const ANALYTICS_METRICS = [
-  { key: 'likeCount' as const, label: '点赞', color: '#d45b4f' },
-  { key: 'commentCount' as const, label: '评论', color: '#4c72c7' },
-  { key: 'favoriteCount' as const, label: '收藏', color: '#d18d32' },
-  { key: 'shareCount' as const, label: '分享', color: '#418f72' },
+  { key: 'likeCount' as const, label: '点赞', color: '#a4d5ec' },
+  { key: 'commentCount' as const, label: '评论', color: '#a5dcca' },
+  { key: 'favoriteCount' as const, label: '收藏', color: '#bcdfe8' },
+  { key: 'shareCount' as const, label: '分享', color: '#bce2bb' },
 ];
 
 type PlatformMeta = {
@@ -558,8 +558,7 @@ export default function Home() {
   const [isCollecting, setIsCollecting] = useState(false);
   const [todayStart, setTodayStart] = useState(startOfTodayTimestamp);
   const [homeAccountId, setHomeAccountId] = useState('');
-  const [contentScope, setContentScope] = useState<ContentBrowseScope>('all');
-  const [contentResult, setContentResult] = useState<ContentResultFilter>('all');
+  const [selectedLinkId, setSelectedLinkId] = useState('');
   const [reader, setReader] = useState<ReaderState | null>(null);
   const closeReader = useCallback(() => setReader(null), []);
   const openReader = (video: Video, section: ReadingSection, scope: Video[]) => {
@@ -1222,11 +1221,6 @@ export default function Home() {
   }, [notice]);
 
   const todayVideos = videos.filter((video) => new Date(video.firstSeenAt).getTime() >= todayStart).length;
-  const lastSnapshotAt = snapshots
-    .map((snapshot) => snapshot.capturedAt)
-    .filter((value): value is string => Boolean(value))
-    .sort()
-    .at(-1) ?? null;
   const selectedAccount = useMemo(
     () => accounts.find((account) => account.id === selectedAccountId) || accounts[0] || null,
     [accounts, selectedAccountId],
@@ -1236,8 +1230,15 @@ export default function Home() {
     [selectedAccount, videos],
   );
   const homeVideos = useMemo(() => browseContentVideos(videos, accounts, {
-    accountId: homeAccountId, scope: contentScope, result: contentResult,
-  }).map((video) => ({ ...video, authorName: video.authorName || accounts.find((account) => account.id === video.accountId)?.name || null })), [videos, homeAccountId, accounts, contentScope, contentResult]);
+    accountId: homeAccountId, scope: 'all', result: 'all',
+  }).map((video) => ({ ...video, authorName: video.authorName || accounts.find((account) => account.id === video.accountId)?.name || null })), [videos, homeAccountId, accounts]);
+  const homeAccount = accounts.find((account) => account.id === homeAccountId);
+  const selectedLink = linkVideos.find((video) => video.id === selectedLinkId) || linkVideos[0];
+  const selectWorkspaceAccount = (id: string) => animateChange(() => {
+    setHomeAccountId(id);
+    if (id) setSelectedAccountId(id);
+    if (activeNav === '信源管理') setActiveNav('内容浏览');
+  });
   const checkAccountId = collectionAccountScope(activeNav, homeAccountId, selectedAccount?.id || '');
   const readerVideo = reader ? [...videos, ...linkVideos].find((video) => video.id === reader.videoId) : null;
   const selectedAccountSnapshots = useMemo(() => {
@@ -1559,8 +1560,8 @@ export default function Home() {
 
   const statCards = [
     ['监控账号', accounts.length, accounts.length ? `${initializedAccountCount} 个已建档${pendingAccountCount ? ` · ${pendingAccountCount} 个待建档` : ''}` : null],
-    ['已采集视频总数', videos.length, lastSnapshotAt ? `${snapshots.filter((snapshot) => snapshot.accountId).length} 次互动数据快照 · 最近快照 ${formatTime(lastSnapshotAt)}` : null],
-    ['今日新收录', todayVideos, '按首次发现时间统计'],
+    ['已采集视频总数', videos.length, null],
+    ['今日新收录', todayVideos, null],
   ];
 
   const submitAuth = async (event: FormEvent) => {
@@ -1660,7 +1661,7 @@ export default function Home() {
 
   return (
     <main className="appShell">
-      <aside className="sidebar">
+      <header className="sidebar">
         <div className="brand">
           <div className="brandMarkWrap" ref={platformMenuRef}>
             <button
@@ -1704,31 +1705,39 @@ export default function Home() {
         <nav className="navigation" aria-label="主导航">
 
           {navItems.map(([icon, label]) => (
-            <button className={activeNav === label ? 'navItem active' : 'navItem'} key={label} onClick={() => {
+            <button className={activeNav === label ? 'navItem active' : 'navItem'} aria-current={activeNav === label ? 'page' : undefined} key={label} onClick={() => {
               animateChange(() => setActiveNav(label));
               if (label === '信源管理') dismissAccountBadge();
             }}>
-              <span className="navIcon">{icon}</span><span className="navText">{label}</span>
+              <span className="navIcon" aria-hidden="true">{icon}</span><span className="navText">{label}</span>
               {label === '信源管理' && updatedAccountCount > 0 && <span className="navUpdateBadge" title={`${updatedAccountCount} 个博主有更新，共 ${latestNewVideoCount} 条新视频`}>{latestNewVideoCount}</span>}
             </button>
           ))}
         </nav>
-        <div className="sidebarFoot">
+        <details className="sidebarFoot serviceStatus">
+          <summary><i className={hostConnected ? 'connected' : ''} />{hostConnected ? '主机已连接' : '主机未连接'}</summary>
+          <div className="servicePopover">
           <div className={hostConnected ? 'localStatus connected' : 'localStatus'}><i /><span><b>主机采集服务</b><small>{dedicatedBrowser ? (hostConnected ? '已连接' : '正在连接电脑后台') : !hostConnected ? '服务已连接 · 等待主机 Chrome 自动连接' : isHostLocal ? bridgeNeedsReload ? `Chrome 组件缺少视频分析能力 · 需更新一次到 v${requiredExtensionVersion}` : bridgeReady ? `Chrome 已连接${bridgeVersion ? ` · v${bridgeVersion}` : ''}` : 'Chrome 后台已连接 · 网页桥接自动恢复中' : '已连接 · 任务由主机 Chrome 执行'}</small></span></div>
           <button className="logoutButton" type="button" onClick={logout}>退出当前设备</button>
-        </div>
-      </aside>
+          </div>
+        </details>
+      </header>
+
+      <WorkspaceRail
+        accounts={accounts} videos={videos} links={linkVideos}
+        activeNav={activeNav} selectedAccountId={activeNav === '信源管理' ? '' : activeNav === '互动数据' ? selectedAccount?.id || '' : homeAccountId}
+        selectedLinkId={selectedLink?.id || ''}
+        onSelect={selectWorkspaceAccount}
+        onLink={(id) => animateChange(() => setSelectedLinkId(id))}
+        onAdd={() => setShowAddAccount(true)}
+      />
 
       <section className="workspace">
         {activePlatform === 'douyin' && (
           <>
-            <header className="topbar">
+            <header className={activeNav === '链接分析' ? 'topbar linkTopbar' : 'topbar'}>
               <div>
-                <h1>{activeNav}</h1>
-                <p className="subtitle">{activeNav === '链接分析'
-                  ? '粘贴分享链接，获取口播稿、内容分析和制作规范。'
-                  : activeNav === '互动数据' ? '按视频发布时间查看当前账号的互动走势，逐条比较作品表现。'
-                  : activeNav === '内容浏览' ? '按发布时间浏览内容，查看要点后决定是否深入阅读。' : '添加账号并手动采集，管理已有信源。'}</p>
+                <h1>{activeNav === '内容浏览' ? homeAccount?.name || '全部账号' : activeNav === '互动数据' && selectedAccount ? selectedAccount.name : activeNav}</h1>
               </div>
               <div className="topActions">
                 {activeNav !== '链接分析' && <button className="secondaryButton" onClick={requestCheck} disabled={isCollecting} title={checkAccountId ? '检查当前账号的最新 5 条视频' : '逐个检查全部已建档账号的最新 5 条视频'}>{isCollecting ? '检查中…' : checkAccountId ? '检查当前账号' : '检查全部账号'}</button>}
@@ -1760,75 +1769,60 @@ export default function Home() {
 
             {activeNav === '内容浏览' && (
               <section className="homeFeed" aria-label="全部信源内容">
-                <div className="feedToolbar">
-                  <div className="contentScope" role="group" aria-label="内容范围">
-                    <button type="button" aria-pressed={contentScope === 'all'} onClick={() => animateChange(() => setContentScope('all'))}>全部内容</button>
-                    <button type="button" aria-pressed={contentScope === 'latest'} onClick={() => animateChange(() => setContentScope('latest'))}>最新 5 条 / 账号</button>
-                  </div>
-                  <label>信源账号<select value={homeAccountId} onChange={(event) => { const value = event.currentTarget.value; animateChange(() => { setHomeAccountId(value); if (value) setSelectedAccountId(value); }); }}><option value="">全部账号</option>{accounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}</select></label>
-                </div>
-                <div className="feedToolbar">
-                  <label>分析结果<select value={contentResult} onChange={(event) => { const value = event.currentTarget.value as ContentResultFilter; animateChange(() => setContentResult(value)); }}><option value="all">全部状态</option><option value="available">已有结果</option><option value="missing">尚无结果</option></select></label>
-                  <span>{homeVideos.length} 条视频 · 按视频发布时间排序</span>
-                </div>
-                {(!browserError && (accounts.some((account) => account.status === 'error') || !hostConnected)) && <div className="collectionWarning" role="status"><p>{accounts.filter((account) => account.status === 'error').map((account) => `${account.name}：${account.collectionError || '采集未完成'}`).join('；') || '主机采集服务暂未连接。'} 已保存结果仍可阅读。</p><button type="button" className="secondaryButton" onClick={() => animateChange(() => setActiveNav('信源管理'))}>查看账号与采集状态</button></div>}
-                {homeVideos.length ? <VideoTable videos={homeVideos} jobs={hostJobs} onOpen={openReader} onAnalysis={requestAnalysis} onCancel={cancelAnalysis} connectorConnected={hostConnected} connectorBusy={bridgeBusy || hostWorkerStatus === 'busy' || hostWorkerStatus === 'running'} showAuthor />
-                  : <EmptyData title={videos.length ? '当前筛选下没有视频' : '还没有视频数据'} detail={videos.length ? '调整账号、内容范围或结果筛选，查看其他已保存内容。' : '在信源管理中添加账号并手动采集。'} />}
+                {(!browserError && (accounts.some((account) => account.status === 'error') || !hostConnected)) && <div className="collectionWarning" role="status"><p>{!hostConnected ? '主机采集服务暂未连接' : `${accounts.filter((account) => account.status === 'error').length} 个账号采集未完成`}，已保存结果仍可阅读。</p><button type="button" className="secondaryButton" onClick={() => animateChange(() => setActiveNav('信源管理'))}>查看采集状态</button></div>}
+                {homeVideos.length ? <VideoBrowser key={homeAccountId || 'all'} videos={homeVideos} jobs={hostJobs} onOpen={openReader} onAnalysis={requestAnalysis} onCancel={cancelAnalysis} connectorConnected={hostConnected} connectorBusy={bridgeBusy || hostWorkerStatus === 'busy' || hostWorkerStatus === 'running'} />
+                  : <EmptyData title="暂无视频" />}
                 <details className="collectionSummary"><summary>采集状态与数据概况</summary>
                   <div className="statsGrid">{statCards.map(([label, value, detail]) => <article className="statCard" key={String(label)}><div className="statLabel">{label}</div><strong>{value}</strong>{detail && <small>{detail}</small>}</article>)}</div>
                   <div className="taskStatusGrid"><span><small>最近一次采集尝试</small><b>{formatTime(lastAccountCheckAt)}</b></span><span><small>最近一次成功采集</small><b>{formatTime(lastAccountSuccessAt)}</b></span><span><small>当前采集任务</small><b>{currentTaskLabel}</b></span></div>
-                  <p className="taskNote">采集由你手动发起；今日新收录按首次采集时间统计，不代表今日发布。</p>
                 </details>
               </section>
             )}
 
             {activeNav === '信源管理' && (
-              <><SectionHeading title="全部监控账号" count={`${accounts.length} 个账号`} /><AccountBoard accounts={accounts} onAdd={() => setShowAddAccount(true)} onRemove={removeAccount} onInitialSync={startInitialSync} isCollecting={isCollecting} /></>
+              <div className="workspacePage"><SectionHeading title="全部监控账号" count={`${accounts.length} 个账号`} /><AccountBoard accounts={accounts} onAdd={() => setShowAddAccount(true)} onRemove={removeAccount} onInitialSync={startInitialSync} isCollecting={isCollecting} /></div>
             )}
 
             {activeNav === '链接分析' && (
-              <>
-                <section className="linkAnalysisEntry">
-                  <div><h2>粘贴抖音视频分享链接</h2><p>支持视频链接或整段分享文案，使用完整原视频分析。</p></div>
+              <div className="workspacePage linkWorkspace">
+                <section className="linkAnalysisEntry" aria-labelledby="link-analysis-title">
+                  <h2 id="link-analysis-title">粘贴抖音视频链接</h2>
                   <form onSubmit={submitVideoLink}>
                     <textarea
                       value={videoLinkInput}
                       onChange={(event) => setVideoLinkInput(event.target.value)}
-                      placeholder="例如：复制此链接，打开抖音搜索，直接观看视频 https://v.douyin.com/……"
+                      placeholder="视频链接或分享文案"
                       disabled={linkSubmitting}
                       aria-label="抖音视频分享链接或分享文案"
                     />
                     <button className="primaryButton" type="submit" disabled={linkSubmitting || !videoLinkInput.trim()}>{linkSubmitting ? '正在解析…' : '开始分析'}</button>
                   </form>
-                  <small>结果保存在本机；已分析的视频直接打开历史结果，不重复调用 AI。</small>
                 </section>
-                <SectionHeading title="链接记录" count={`${linkVideos.length} 条`} />
-                {linkVideos.length
-                  ? <VideoTable
-                    videos={linkVideos}
+                {selectedLink
+                  ? <VideoPreview
+                    key={selectedLink.id}
+                    video={selectedLink}
+                    scope={linkVideos}
                     jobs={hostJobs}
                     onOpen={openReader}
                     onAnalysis={requestAnalysis}
                     onCancel={cancelAnalysis}
                     connectorConnected={hostConnected}
                     connectorBusy={bridgeBusy || hostWorkerStatus === 'busy' || hostWorkerStatus === 'running'}
-                    showAuthor
+                    linkLayout
                   />
-                  : <EmptyData title="还没有视频链接分析记录" detail="在上方粘贴任意有效的抖音视频分享链接，提交后会立即开始完整原视频分析。" />}
-              </>
+                  : <EmptyData title="暂无链接记录" />}
+              </div>
             )}
 
             {activeNav === '互动数据' && (
-              <>
-                <AccountSelector accounts={accounts} videos={videos} selectedAccountId={selectedAccount?.id || ''} onSelect={(id) => animateChange(() => setSelectedAccountId(id))} />
-                <SectionHeading title={selectedAccount ? `${selectedAccount.name} · 互动数据` : '互动数据'} count={`${selectedAccountVideos.length} 条视频`} />
+              <div className="workspacePage analyticsPage" key={selectedAccount?.id || 'empty'}>
                 <AnalyticsBoard
                   key={selectedAccount?.id || 'empty'}
                   videos={selectedAccountVideos}
                   snapshots={selectedAccountSnapshots}
-                  accountName={selectedAccount?.name || null}
                 />
-              </>
+              </div>
             )}
           </>
         )}
@@ -1860,7 +1854,6 @@ export default function Home() {
           <form className="modal" role="dialog" aria-modal="true" aria-labelledby="add-account-title" onSubmit={submitAccount} onMouseDown={(event) => event.stopPropagation()}>
             <button className="modalClose" type="button" aria-label="关闭" onClick={() => closeOverlay(() => setShowAddAccount(false))}>×</button>
             <h2 id="add-account-title">添加新监控账号</h2>
-            <p>目前只启用抖音采集，其他平台入口已预留，后续可直接接入。</p>
             <div className="platformGrid" aria-label="平台选择">
               {(Object.keys(PLATFORMS) as Platform[]).map((platform) => {
                 const meta = PLATFORMS[platform];
@@ -1879,7 +1872,7 @@ export default function Home() {
             </div>
             <label htmlFor="account-url">{PLATFORMS[activePlatform].name}作者主页链接</label>
             <input id="account-url" type="url" value={accountUrl} onChange={(event) => setAccountUrl(event.target.value)} placeholder="https://www.douyin.com/user/..." autoFocus />
-            <div className="modalNote">添加后自动抓取近 30 条非置顶视频；以后每次只检查最新 5 条。</div>
+            <div className="modalNote">首次近 30 条，后续检查最新 5 条。</div>
             <div className="modalActions"><button className="secondaryButton" type="button" onClick={() => closeOverlay(() => setShowAddAccount(false))}>取消</button><button className="primaryButton" type="submit">添加并抓取近 30 条</button></div>
           </form>
         </div>
@@ -1904,10 +1897,9 @@ export default function Home() {
   );
 }
 
-function AnalyticsBoard({ videos, snapshots, accountName }: {
+function AnalyticsBoard({ videos, snapshots }: {
   videos: Video[];
   snapshots: Snapshot[];
-  accountName: string | null;
 }) {
   const [metricKey, setMetricKey] = useState<AnalyticsMetricKey>('likeCount');
   const [sortMode, setSortMode] = useState<AnalyticsSortMode>('published');
@@ -1919,7 +1911,7 @@ function AnalyticsBoard({ videos, snapshots, accountName }: {
     || null;
 
   if (!videos.length) {
-    return <EmptyData title={accountName ? `${accountName} 尚无建档数据` : '等待首次建档'} detail="完成当前账号的首次建档后，这里会根据首次近 30 条非置顶视频及后续发现的新视频生成独立统计，不会混入其他账号。" />;
+    return <EmptyData title="暂无互动数据" />;
   }
 
   return <section className="analyticsComparisonView">
@@ -1929,25 +1921,32 @@ function AnalyticsBoard({ videos, snapshots, accountName }: {
       sortMode={sortMode}
       chartMode={chartMode}
       selectedVideoId={selectedVideo?.id || ''}
-      onMetricChange={(metric) => animateChange(() => setMetricKey(metric))}
-      onSortChange={(mode) => animateChange(() => {
-        setSortMode(mode);
-        if (mode === 'value') setChartMode('bar');
-      })}
-      onChartModeChange={(mode) => animateChange(() => {
-        setChartMode(mode);
-        if (mode === 'line') setSortMode('published');
-      })}
-      onSelectVideo={(videoId) => animateChange(() => setSelectedVideoId(videoId))}
+      onMetricChange={(metric) => {
+        if (metric !== metricKey) animateChange(() => setMetricKey(metric));
+      }}
+      onSortChange={(mode) => {
+        if (mode === sortMode) return;
+        animateChange(() => {
+          setSortMode(mode);
+          if (mode === 'value') setChartMode('bar');
+        });
+      }}
+      onChartModeChange={(mode) => {
+        if (mode === chartMode) return;
+        animateChange(() => {
+          setChartMode(mode);
+          if (mode === 'line') setSortMode('published');
+        });
+      }}
+      onSelectVideo={setSelectedVideoId}
     />
     {selectedVideo && <SelectedVideoComparison video={selectedVideo} videos={orderedVideos} snapshots={snapshots} />}
     <details className="analyticsBenchmarks">
       <summary>账号数据基准与近期对比</summary>
-      <p className="analysisMethodNote">仅使用当前账号已采集视频。中位数使用有效数据；最近 3 条与此前 3 条均须具备完整数据才比较。</p>
       <section className="analysisStats">{ANALYTICS_METRICS.map((dimension) => {
       const summary = summarizeMetric(videos, dimension.key);
       return <article key={dimension.key} style={{ '--metric-color': dimension.color } as React.CSSProperties}>
-        <div className="analysisStatTitle"><small>{dimension.label}账号基准</small><span>{summary.validCount}/{summary.totalCount} 条有效</span></div>
+        <div className="analysisStatTitle"><small>{dimension.label}账号基准</small>{summary.validCount < summary.totalCount && <span>缺少 {summary.totalCount - summary.validCount} 条数据</span>}</div>
         <strong>{formatMetric(summary.median)}</strong>
         <p className="analysisStatPrimaryLabel">账号中位数</p>
         <div className="analysisStatRows">
@@ -2015,12 +2014,7 @@ function MetricBarComparison({ videos, metricKey, sortMode, chartMode, selectedV
     : Math.round(index * (displayedVideos.length - 1) / (labelCount - 1))));
   const ticks = [0, .25, .5, .75, 1];
   const hasPublishedDate = (video: Video) => Boolean(video.publishedAt && Number.isFinite(Date.parse(video.publishedAt)));
-  const hasFallbackDates = videos.some((video) => !hasPublishedDate(video));
   const lineSegments = chartMode === 'line' ? metricTrendSegments(displayedVideos, metricKey) : [];
-  const publishedVideos = videos.filter(hasPublishedDate);
-  const capturedTimes = videos.map((video) => Date.parse(video.lastSeenAt)).filter(Number.isFinite);
-  const firstCaptured = capturedTimes.length ? new Date(Math.min(...capturedTimes)).toISOString() : null;
-  const lastCaptured = capturedTimes.length ? new Date(Math.max(...capturedTimes)).toISOString() : null;
   const selectedIndex = displayedVideos.findIndex((video) => video.id === selectedVideoId);
 
   useEffect(() => {
@@ -2041,12 +2035,7 @@ function MetricBarComparison({ videos, metricKey, sortMode, chartMode, selectedV
 
   return <article className="metricComparisonCard">
     <div className="metricComparisonHeader">
-      <div><h3>{sortMode === 'published' ? '账号视频互动走势' : '各视频互动高低对比'}</h3><p>{chartMode === 'line' ? '每个点是一条视频，按发布先后排列；点间距不代表时间间隔。' : sortMode === 'published' ? '每根柱是一条视频，按发布先后排列。' : `每根柱是一条视频，按${metric.label}从高到低排列。`}纵轴为最近采集的{metric.label}累计值。</p></div>
-    </div>
-    <div className="metricChartContext">
-      <span>当前账号 {videos.length} 条视频 · {metric.label}有效数据 {values.length} 条</span>
-      <span>{publishedVideos.length ? `发布时间：${formatCalendarDate(publishedVideos[0].publishedAt, true)} 至 ${formatCalendarDate(publishedVideos.at(-1)?.publishedAt || null, true)}` : '视频发布时间未知'}</span>
-      <span>数据采集：{firstCaptured && lastCaptured ? firstCaptured === lastCaptured ? formatTime(lastCaptured) : `${formatTime(firstCaptured)} 至 ${formatTime(lastCaptured)}` : '时间未知'}</span>
+      <h3>{sortMode === 'published' ? '账号视频互动走势' : '各视频互动高低对比'}</h3>
     </div>
       <div className="metricControls">
         <div className="metricTabs" role="group" aria-label="选择对比指标">
@@ -2061,7 +2050,6 @@ function MetricBarComparison({ videos, metricKey, sortMode, chartMode, selectedV
           <button type="button" aria-pressed={sortMode === 'value'} className={sortMode === 'value' ? 'active' : ''} onClick={() => onSortChange('value')}>按数据高低</button>
         </div>
       </div>
-    <p className="metricChartHelp">{chartMode === 'line' ? '折线展示全部视频的整体走势，日期按空间间隔显示；点击点或使用下方“查看视频”精确选择。' : '柱形图保留每条视频的日期，左右滑动逐条比较；点击柱或日期选择。'}键盘聚焦视频点后可用左右方向键选择。{values.length < videos.length ? '缺失数据标为“缺值”，折线在该处断开；0 表示实际采集值为零。' : ''}{hasFallbackDates ? '带 * 的日期为首次发现时间，发布时间未知。' : ''}</p>
     <div className={`metricBarChartScroll ${chartMode === 'line' ? 'metricLineChartFit' : ''}`} ref={chartScrollRef} tabIndex={0} role="region" aria-label={chartMode === 'line' ? '全部视频互动折线图' : '视频互动柱形图，可横向滚动'}>
       <svg className="metricBarChart" viewBox={`0 0 ${width} ${height}`} style={{ width: chartMode === 'line' ? '100%' : width, height }} role="group" aria-label={`${metric.label}数据按视频对比${chartMode === 'line' ? '折线图' : '柱形图'}`}>
         {ticks.map((ratio) => {
@@ -2142,7 +2130,6 @@ function MetricBarComparison({ videos, metricKey, sortMode, chartMode, selectedV
       <button className="secondaryButton" type="button" disabled={selectedIndex <= 0} onClick={() => onSelectVideo(displayedVideos[selectedIndex - 1].id)}>上一条</button>
       <button className="secondaryButton" type="button" disabled={selectedIndex < 0 || selectedIndex >= displayedVideos.length - 1} onClick={() => onSelectVideo(displayedVideos[selectedIndex + 1].id)}>下一条</button>
     </div>
-    <p className="analysisMethodNote">使用每条视频各自最新采集的累计值，采集时点和发布时长可能不同；这是视频之间的对比，不代表账号每日新增或相同发布时长的表现。单条视频的历史增长见下方“首次记录后变化”。</p>
   </article>;
 }
 
@@ -2152,22 +2139,29 @@ function SelectedVideoComparison({ video, videos, snapshots }: {
   snapshots: Snapshot[];
 }) {
   const previousVideo = previousPublishedVideo(video, videos);
+  const metricSnapshots = ANALYTICS_METRICS.map((dimension) => ({
+    dimension,
+    change: snapshotMetricChange(video, snapshots, dimension.key),
+  }));
+  const history = metricSnapshots[0].change;
   return <article className="selectedVideoComparison">
     <div className="selectedVideoPanelHeading">
       <h3>所选视频数据</h3>
-      <p>显示所选视频的累计值与历史快照增量；“上一条视频”始终按发布时间确定，与图表当前排序无关。</p>
     </div>
     <div className="selectedVideoHeader">
       <a className="selectedVideoCover" href={video.url} target="_blank" rel="noreferrer">
         {video.coverUrl ? <img src={video.coverUrl} alt="" referrerPolicy="no-referrer" /> : <span>无封面</span>}
       </a>
-      <div><span>所选日期 · {formatCalendarDate(video.publishedAt || video.firstSeenAt, true)}{video.publishedAt ? ' 发布' : ' 首次发现'} · 数据采集 {formatTime(video.lastSeenAt)}</span><h3>{video.title}</h3><p><a href={video.url} target="_blank" rel="noreferrer">打开原视频 ↗</a></p></div>
+      <div><span>{formatCalendarDate(video.publishedAt || video.firstSeenAt, true)}{video.publishedAt ? ' 发布' : ' 首次发现'} · 数据采集 {formatTime(video.lastSeenAt)}</span><h3>{video.title}</h3><p><a href={video.url} target="_blank" rel="noreferrer">打开原视频 ↗</a></p></div>
     </div>
+    {(previousVideo || history.sampleCount >= 2) && <div className="selectedComparisonContext">
+      {history.sampleCount >= 2 && <p>首次记录 {formatTime(history.firstCapturedAt)} · 最近记录 {formatTime(history.latestCapturedAt)} · {history.sampleCount} 次快照</p>}
+      {previousVideo && <p>对比对象：{formatCalendarDate(previousVideo.publishedAt || previousVideo.firstSeenAt, true)}{previousVideo.publishedAt ? ' 发布' : ' 首次发现'} · <a href={previousVideo.url} target="_blank" rel="noreferrer">{previousVideo.title}</a></p>}
+    </div>}
     <div className="selectedComparisonTableWrap">
       <table className="selectedComparisonTable">
         <thead><tr><th>指标</th><th>当前累计</th><th>首次记录后变化</th><th>比上一条视频</th><th>账号内排名</th></tr></thead>
-        <tbody>{ANALYTICS_METRICS.map((dimension) => {
-          const snapshotChange = snapshotMetricChange(video, snapshots, dimension.key);
+        <tbody>{metricSnapshots.map(({ dimension, change: snapshotChange }) => {
           const previousDelta = previousVideo ? calculateDelta(video[dimension.key], previousVideo[dimension.key]) : null;
           const rank = metricRank(video, videos, dimension.key);
           const validCount = videos.filter((candidate) => metricRank(candidate, videos, dimension.key) !== null).length;
@@ -2177,17 +2171,11 @@ function SelectedVideoComparison({ video, videos, snapshots }: {
           const previousText = previousVideo
             ? previousDelta ? formatDeltaDetail(previousDelta) : '两条视频数据不足'
             : '没有更早视频';
-          const snapshotTitle = snapshotChange.sampleCount >= 2 && snapshotChange.firstCapturedAt && snapshotChange.latestCapturedAt
-            ? `首次记录 ${formatTime(snapshotChange.firstCapturedAt)}；最近记录 ${formatTime(snapshotChange.latestCapturedAt)}`
-            : snapshotText;
-          const previousTitle = previousVideo
-            ? `对比对象：${formatCalendarDate(previousVideo.publishedAt || previousVideo.firstSeenAt, true)}${previousVideo.publishedAt ? ' 发布' : ' 首次发现'} · ${previousVideo.title}`
-            : previousText;
           return <tr key={dimension.key} style={{ '--metric-color': dimension.color } as React.CSSProperties}>
             <th scope="row"><i aria-hidden="true" /><span>{dimension.label}</span></th>
             <td data-label="当前累计"><b>{formatMetric(video[dimension.key])}</b></td>
-            <td data-label="首次记录后变化" className={deltaTone(snapshotChange.delta)}><span>{snapshotText}</span>{snapshotChange.sampleCount >= 2 && <small>{snapshotTitle} · {snapshotChange.sampleCount} 次快照</small>}</td>
-            <td data-label="比上一条视频" className={deltaTone(previousDelta)}><span>{previousText}</span>{previousVideo ? <small>{previousTitle}</small> : null}</td>
+            <td data-label="首次记录后变化" className={deltaTone(snapshotChange.delta)}><span>{snapshotText}</span></td>
+            <td data-label="比上一条视频" className={deltaTone(previousDelta)}><span>{previousText}</span></td>
             <td data-label="账号内排名">{rank && validCount >= 2 ? `第 ${rank} 名 / ${validCount} 条有效样本` : rank ? '仅 1 条有效样本，暂不比较' : '数据不足，暂无排名'}</td>
           </tr>;
         })}</tbody>
@@ -2200,39 +2188,35 @@ function SectionHeading({ title, count }: { title: string; count: string }) {
   return <div className="sectionHeading"><h2>{title}</h2><span>{count}</span></div>;
 }
 
-function AccountSelector({ accounts, videos, selectedAccountId, onSelect }: {
-  accounts: Account[];
-  videos: Video[];
-  selectedAccountId: string;
-  onSelect: (id: string) => void;
+function WorkspaceRail({ accounts, videos, links, activeNav, selectedAccountId, selectedLinkId, onSelect, onLink, onAdd }: {
+  accounts: Account[]; videos: Video[]; links: Video[]; activeNav: string;
+  selectedAccountId: string; selectedLinkId: string;
+  onSelect: (id: string) => void; onLink: (id: string) => void; onAdd: () => void;
 }) {
-  if (!accounts.length) return null;
+  const [expanded, setExpanded] = useState(false);
+  const isLinks = activeNav === '链接分析';
   const videoCounts = new Map<string, number>();
   videos.forEach((video) => videoCounts.set(video.accountId, (videoCounts.get(video.accountId) || 0) + 1));
-
-  return <section className="accountSelector" aria-label="按账号筛选数据">
-    <div className="accountSelectorIntro">
-      <strong>选择查看账号</strong>
-      <span>仅显示所选账号的数据。</span>
+  const currentName = isLinks ? '链接记录' : accounts.find((account) => account.id === selectedAccountId)?.name || '全部账号';
+  return <aside className="accountRail" data-expanded={expanded} aria-label={isLinks ? '链接记录' : '切换监控账号'}>
+    {isLinks && <div className="railHeading"><strong>链接记录</strong><span>{links.length}</span></div>}
+    <button className="mobileAccountSwitch" type="button" aria-expanded={expanded} aria-controls="workspace-rail-options" onClick={() => setExpanded((value) => !value)}><b>{currentName}</b><span>{expanded ? '收起 ↑' : isLinks ? '切换记录 ↓' : '切换账号 ↓'}</span></button>
+    <div className="railOptions" id="workspace-rail-options">
+      {isLinks ? <>
+        {links.length ? links.map((video) => <button className="railLink" type="button" key={video.id} aria-pressed={video.id === selectedLinkId} onClick={() => { onLink(video.id); setExpanded(false); }}>
+          <b>{video.title || '未命名视频'}</b><small>{video.authorName || '作者未记录'} · {formatPublishedTime(video.publishedAt)}</small>
+        </button>) : <p className="railEmpty">暂无记录</p>}
+      </> : <>
+        {activeNav !== '互动数据' && <button className="railAccount railAll" type="button" aria-pressed={!selectedAccountId} onClick={() => { onSelect(''); setExpanded(false); }}><b>全部账号</b><span>{accounts.length} 个</span></button>}
+        {accounts.map((account) => <button type="button" className="railAccount" key={account.id} aria-pressed={account.id === selectedAccountId} aria-label={`${account.name}，${videoCounts.get(account.id) || 0} 条视频`} title={`${account.name} · ${accountStatusLabels[account.status]}`} onClick={() => { onSelect(account.id); setExpanded(false); }}>
+          <span className="railAvatar" aria-hidden="true">{account.avatarUrl ? <img src={account.avatarUrl} alt="" loading="lazy" referrerPolicy="no-referrer" /> : account.name.slice(0, 1)}</span>
+          <span className="railAccountName">{account.name}</span>
+          <span className="railCount">{videoCounts.get(account.id) || 0}<i className={`railStatus ${account.status}`} aria-label={accountStatusLabels[account.status]} /></span>
+        </button>)}
+        <button className="railAdd secondaryButton" type="button" onClick={onAdd}>＋ 添加账号</button>
+      </>}
     </div>
-    <div className="accountSelectorOptions" role="tablist" aria-label="监控账号">
-      {accounts.map((account, index) => {
-        const isActive = account.id === selectedAccountId;
-        return <button
-          type="button"
-          role="tab"
-          aria-selected={isActive}
-          className={isActive ? 'accountSelectorOption active' : 'accountSelectorOption'}
-          key={account.id}
-          onClick={() => onSelect(account.id)}
-        >
-          <span className="accountSelectorAvatar">{account.avatarUrl ? <img src={account.avatarUrl} alt="" referrerPolicy="no-referrer" /> : index + 1}</span>
-          <span className="accountSelectorText"><b>{account.name}</b><small>{videoCounts.get(account.id) || 0} 条已建档视频</small></span>
-          <i aria-hidden="true" />
-        </button>;
-      })}
-    </div>
-  </section>;
+  </aside>;
 }
 
 const accountStatusLabels: Record<AccountStatus, string> = {
@@ -2250,7 +2234,7 @@ function AccountBoard({ accounts, onAdd, onRemove, onInitialSync, isCollecting }
   isCollecting: boolean;
 }) {
   if (!accounts.length) {
-    return <section className="emptyBoard"><div className="emptySymbol">＋</div><h3>添加第一个监控账号</h3><p>首次建立近 30 条非置顶视频档案，之后按需检查最新 5 条并自动去重。</p><button className="primaryButton" onClick={onAdd}>添加新监控账号</button></section>;
+    return <section className="emptyBoard"><div className="emptySymbol">＋</div><h3>添加第一个监控账号</h3><button className="primaryButton" onClick={onAdd}>添加新监控账号</button></section>;
   }
   return <section className="accountGrid">{accounts.map((account, index) => {
     const statusLabel = account.status === 'checking' ? '检查中'
@@ -2261,7 +2245,7 @@ function AccountBoard({ accounts, onAdd, onRemove, onInitialSync, isCollecting }
       <h3>{account.name}</h3><a href={account.url} target="_blank" rel="noreferrer">打开原账号主页 ↗</a>
       {account.status === 'error' && account.collectionError && <p className="accountUpdateNotice" role="status">失败原因：{account.collectionError}</p>}
       {account.status === 'checking' && account.currentSyncMode === 'latest'
-        ? <div className="accountUpdateNotice checking">正在检查，完成后显示更新数量</div>
+        ? <div className="accountUpdateNotice checking">检查中</div>
         : account.latestCheckNewVideoCount !== null && <div className={`accountUpdateNotice ${account.latestCheckNewVideoCount > 0 ? 'updated' : 'none'}`}>
           <strong>{`${account.status === 'error' ? '上次成功检查' : '最近一次检查'}${account.latestCheckNewVideoCount > 0 ? `：新增 ${account.latestCheckNewVideoCount} 条` : '：无新增'}`}</strong>
           {account.status === 'error' && <small>上次成功：{formatTime(account.lastSuccessAt)}</small>}
@@ -2300,56 +2284,108 @@ function analysisProgress(video: Video, job?: HostJob) {
   } as Record<string, string>)[stage] || (displayedAnalysisStatus(video, job) === 'queued' ? '任务已排队，等待主机处理' : '正在处理分析任务');
 }
 
-function VideoTable({ videos, jobs, onOpen, onAnalysis, onCancel, connectorConnected, connectorBusy, showAuthor = false }: {
-  videos: Video[]; jobs: HostJob[];
+type VideoPresentationProps = {
+  jobs: HostJob[];
   onOpen: (video: Video, section: ReadingSection, scope: Video[]) => void;
   onAnalysis: (video: Video, regenerate?: boolean, forceRegenerate?: boolean) => void;
   onCancel: (job: HostJob) => void;
-  connectorConnected: boolean; connectorBusy: boolean; showAuthor?: boolean;
-}) {
-  if (!videos.length) return <EmptyData title="还没有视频数据" detail="在信源管理中添加账号并手动采集。已有视频会按真实发布时间排列，打开结果不会发起分析。" />;
-  return <div className="videoTableScroll"><div className="videoTable">
-    {videos.map((video, index) => {
-      const duration = formatDuration(video.durationSeconds);
-      const latestJob = analysisJob(video, jobs);
-      const analysisStatus = displayedAnalysisStatus(video, latestJob);
-      const busy = analysisStatus === 'queued' || analysisStatus === 'processing';
-      const complete = savedSections(video);
-      const reading = videoContentReading(video.analysis);
-      const latestRun = video.analysisRuns[0] || null;
-      const latestUsage = video.analysisUsage || latestRun?.usage || null;
-      const previousRuns = video.analysisRuns.slice(1);
-      const metrics = [['点赞', video.likeCount], ['评论数', video.commentCount], ['收藏', video.favoriteCount], ['分享', video.shareCount]] as const;
-      return <article className="videoRecord" key={`${video.accountId}:${video.id}`} style={{ '--card-order': Math.min(index, 8) } as CSSProperties}>
-        <div className="videoMainRow">
-          <div className="videoIdentity">
-            <button type="button" className="coverLink" onClick={() => onOpen(video, 'content', videos)} aria-label={`阅读：${video.title}`}>
-              {video.coverUrl ? <img src={video.coverUrl} alt="" referrerPolicy="no-referrer" /> : <span>无封面</span>}{duration && <i>{duration}</i>}
+  connectorConnected: boolean; connectorBusy: boolean;
+};
+
+function VideoBrowser({ videos, ...presentation }: VideoPresentationProps & { videos: Video[] }) {
+  const [selectedId, setSelectedId] = useState('');
+  const [page, setPage] = useState(0);
+  const [mobileReading, setMobileReading] = useState(false);
+  const feedRef = useRef<HTMLDivElement>(null);
+  const previewRef = useRef<HTMLDivElement>(null);
+  const pageSize = 10;
+  const pages = Math.max(1, Math.ceil(videos.length / pageSize));
+  const currentPage = Math.min(page, pages - 1);
+  const pageVideos = videos.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
+  const selected = pageVideos.find((video) => video.id === selectedId) || pageVideos[0];
+  const changePage = (next: number) => {
+    animateChange(() => { setPage(next); setSelectedId(''); setMobileReading(false); });
+    feedRef.current?.scrollTo({ top: 0 });
+  };
+  return <div className="contentBrowser" data-reading={mobileReading}>
+    <section className="compactFeed" aria-label="视频列表">
+      <div className="compactFeedHeading"><strong>全部视频</strong><span>{videos.length} 条</span></div>
+      <div className="compactFeedScroll" ref={feedRef} key={currentPage}>
+        {pageVideos.map((video, index) => {
+          const reading = videoContentReading(video.analysis);
+          const job = analysisJob(video, presentation.jobs);
+          const status = displayedAnalysisStatus(video, job);
+          const busy = status === 'queued' || status === 'processing';
+          const result = busy ? status === 'queued' ? '等待分析' : '正在分析' : job?.status === 'cancelled' ? '任务已取消'
+            : status === 'error' ? '本次分析未完成' : reading.available ? '已有内容分析' : video.transcript ? '已有口播稿' : '尚未分析';
+          return <div className="compactVideoRow" data-selected={selected?.id === video.id} key={video.id} style={{ '--card-order': Math.min(index, 7) } as CSSProperties}>
+            <button type="button" className="compactVideo" aria-label={`预览：${video.title || '未命名视频'}`} aria-pressed={selected?.id === video.id} onClick={() => {
+              setSelectedId(video.id); setMobileReading(true);
+              if (window.matchMedia('(max-width: 980px)').matches) requestAnimationFrame(() => previewRef.current?.querySelector<HTMLElement>('h2')?.focus());
+            }}>
+              <span className="compactCover">{video.coverUrl ? <img src={video.coverUrl} alt="" loading="lazy" referrerPolicy="no-referrer" /> : <span aria-hidden="true">▷</span>}<small>{formatDuration(video.durationSeconds) || '视频'}</small></span>
+              <span className="compactVideoCopy"><b>{video.title || '未命名视频'}</b><span className="compactVideoMeta">{video.authorName || '作者未记录'} · {formatPublishedTime(video.publishedAt)}<span className={`compactVideoState ${busy ? 'processing' : ''}`}>{result}</span></span>
+                {(reading.overview || video.transcript) && <span className="compactVideoSummary">{reading.overview || `口播：${video.transcript}`}</span>}
+              </span>
             </button>
-            <div className="videoCopy"><button type="button" className="videoTitle" onClick={() => onOpen(video, 'content', videos)}>{video.title || '未命名视频'}</button>
-              {showAuthor && <div className="videoAuthor">{video.authorProfileUrl ? <a href={video.authorProfileUrl} target="_blank" rel="noreferrer">{video.authorName || '作者主页'} ↗</a> : <span>{video.authorName || '作者未记录'}</span>}</div>}
-              <div className="videoTimes"><span>视频发布：{formatPublishedTime(video.publishedAt)}</span><span>首次采集：{formatTime(video.firstSeenAt)}</span></div>
-              {reading.available && <p className="videoOverview">{reading.overview || '已保存内容分析，展开阅读完整内容。'}</p>}
-              <div className="videoResultState">{complete.length ? `${complete.length}/3 个分区已生成` : busy || analysisStatus === 'error' ? '尚未生成结果' : '尚未分析'}{busy ? ` · ${analysisProgress(video, latestJob)}` : latestJob?.status === 'cancelled' ? ' · 任务已取消' : analysisStatus === 'error' ? ' · 本次任务未完成' : ''}</div>
-            </div>
-          </div>
-          <div className="videoData videoMetrics" role="group" aria-label="视频互动数据"><div className="metricGrid">{metrics.map(([label, value]) => <span key={label}><small>{label}</small><b>{formatMetric(value)}</b></span>)}</div><small className="snapshotTime">采集于 {formatTime(video.lastSeenAt)}</small></div>
-          <div className="videoAnalysisActions">
-            {complete.length || reading.available || busy
-              ? <button type="button" className="primaryButton" onClick={() => onOpen(video, 'content', videos)}>{complete.length || reading.available ? '展开阅读' : '查看进度'}</button>
-              : <button type="button" className="primaryButton" onClick={() => onAnalysis({ ...video, analysisStatus }, analysisStatus === 'error')}>{analysisStatus === 'error' ? '重试分析' : '分析'}</button>}
-            {busy && latestJob && <button type="button" className="secondaryButton" onClick={() => onCancel(latestJob)}>取消任务</button>}
-            <a href={video.url} target="_blank" rel="noreferrer">打开原视频 ↗</a>
-          </div>
-        </div>
-        {busy && !connectorConnected && <p className="rowTaskMessage">采集服务暂未连接，任务仍保留。已生成内容可以继续阅读。</p>}
-        {busy && connectorConnected && connectorBusy && analysisStatus === 'queued' && <p className="rowTaskMessage">主机正在处理上一项任务，完成后自动继续。</p>}
-        {analysisStatus === 'error' && latestJob?.status !== 'cancelled' && <p className="rowTaskMessage analysisError">{redactDiagnosticText(video.analysisDiagnostics?.lastError || latestJob?.error || video.analysisError || '任务未完成，详细原因尚未记录')}<button type="button" onClick={() => onOpen(video, 'content', videos)}>查看诊断</button></p>}
+          </div>;
+        })}
+      </div>
+      <div className="feedPagination" aria-label="视频分页"><button type="button" className="secondaryButton" disabled={currentPage === 0} onClick={() => changePage(currentPage - 1)}>上一页</button><span>{currentPage + 1} / {pages}</span><button type="button" className="secondaryButton" disabled={currentPage >= pages - 1} onClick={() => changePage(currentPage + 1)}>下一页</button></div>
+    </section>
+    <div className="videoPreviewPane" ref={previewRef}>
+      {selected && <VideoPreview key={selected.id} video={selected} scope={videos} {...presentation} onBack={() => {
+        setMobileReading(false);
+        requestAnimationFrame(() => feedRef.current?.querySelector<HTMLElement>('[aria-pressed="true"]')?.focus());
+      }} />}
+    </div>
+  </div>;
+}
+
+function VideoPreview({ video, scope, jobs, onOpen, onAnalysis, onCancel, connectorConnected, connectorBusy, linkLayout = false, onBack }: VideoPresentationProps & { video: Video; scope: Video[]; linkLayout?: boolean; onBack?: () => void }) {
+  const latestJob = analysisJob(video, jobs);
+  const analysisStatus = displayedAnalysisStatus(video, latestJob);
+  const busy = analysisStatus === 'queued' || analysisStatus === 'processing';
+  const complete = savedSections(video);
+  const reading = videoContentReading(video.analysis);
+  const latestRun = video.analysisRuns[0] || null;
+  const latestUsage = video.analysisUsage || latestRun?.usage || null;
+  const previousRuns = video.analysisRuns.slice(1);
+  const metrics = [['点赞', video.likeCount], ['评论', video.commentCount], ['收藏', video.favoriteCount], ['分享', video.shareCount]] as const;
+  const hasPreviewContent = reading.available || (!linkLayout && Boolean(video.transcript));
+  const previewStatus = busy ? analysisProgress(video, latestJob)
+    : latestJob?.status === 'cancelled' ? '任务已取消'
+    : analysisStatus === 'error' ? '分析未完成'
+    : complete.length > 0 && complete.length < 3 ? `${complete.length}/3 个分区已生成` : '';
+  return <article className={`videoPreview ${linkLayout ? 'linkPreview' : ''}`} aria-label="视频内容预览">
+    {onBack && <button className="previewBack secondaryButton" type="button" onClick={onBack}>返回列表</button>}
+    <h2 tabIndex={-1} title={video.title || '未命名视频'}>{video.title || '未命名视频'}</h2>
+    <p className="previewMeta">{video.authorName || '作者未记录'}{formatDuration(video.durationSeconds) && ` · ${formatDuration(video.durationSeconds)}`} · {formatPublishedTime(video.publishedAt)}</p>
+    <div className="previewReading">
+      {linkLayout && <section className="previewSection"><h3>口播稿</h3><p className="previewExcerpt">{video.transcript || (video.transcriptStatus === 'error' ? '口播识别未完成' : '暂无口播稿')}</p></section>}
+      <section className="previewSection"><h3>{reading.available ? '内容摘要' : !linkLayout && video.transcript ? '口播节选' : '分析状态'}</h3>
+        <p className="previewExcerpt">{reading.overview || (reading.available ? '暂无摘要' : !linkLayout && video.transcript ? video.transcript : previewStatus || '尚未分析')}</p>
+        {reading.sections.length > 0 && <div className="previewDetails"><h3>{reading.sections[0].label}</h3><p className="previewExcerpt">{reading.sections[0].text}</p></div>}
+      </section>
+    </div>
+    {hasPreviewContent && previewStatus && <div className="previewResultState" role="status">{previewStatus}</div>}
+    <div className="previewActions">
+      {complete.length || reading.available || busy
+        ? <button type="button" className="primaryButton" onClick={() => onOpen(video, 'content', scope)}>{complete.length || reading.available ? '展开完整结果' : '查看进度'}</button>
+        : <button type="button" className="primaryButton" onClick={() => onAnalysis({ ...video, analysisStatus }, analysisStatus === 'error')}>{analysisStatus === 'error' ? '重试分析' : '分析此视频'}</button>}
+      {busy && latestJob && <button type="button" className="secondaryButton" onClick={() => onCancel(latestJob)}>取消任务</button>}
+      <a href={video.url} target="_blank" rel="noreferrer">打开原视频 ↗</a>
+    </div>
+    {(complete.length > 0 || reading.available) && <div className="previewSections" aria-label="直接阅读结果分区"><button type="button" onClick={() => onOpen(video, 'transcript', scope)}>口播稿</button><button type="button" onClick={() => onOpen(video, 'content', scope)}>内容分析</button><button type="button" onClick={() => onOpen(video, 'production', scope)}>制作规范</button></div>}
+    {busy && !connectorConnected && <p className="rowTaskMessage">采集服务未连接</p>}
+    {busy && connectorConnected && connectorBusy && analysisStatus === 'queued' && <p className="rowTaskMessage">等待主机空闲</p>}
+    {analysisStatus === 'error' && latestJob?.status !== 'cancelled' && <p className="rowTaskMessage analysisError">{redactDiagnosticText(video.analysisDiagnostics?.lastError || latestJob?.error || video.analysisError || '任务未完成，详细原因尚未记录')}<button type="button" onClick={() => onOpen(video, 'content', scope)}>查看诊断</button></p>}
+    <details className="previewMetadata"><summary>互动与采集信息</summary><div className="previewMetrics">{metrics.map(([label, value]) => <span key={label}><small>{label}</small><b>{formatMetric(value)}</b></span>)}</div><p>首次采集：{formatTime(video.firstSeenAt)}<br />最近采集：{formatTime(video.lastSeenAt)}</p></details>
         {(video.analysis || latestRun || latestUsage) && <details className="analysisCosts">
           <summary><span>用量与费用</span><strong>{analysisUsageSummary(latestUsage, analysisStatus)}</strong></summary>
           <div className="analysisPane usagePane">
             {latestUsage && <section className="analysisUsage" aria-label="最近一次 AI 分析用量与费用">
-              <div className="analysisUsageHeader"><b>本次消耗</b><small>{latestRun?.updatedAt ? formatTime(latestRun.updatedAt) : '已永久保存'}</small></div>
+              <div className="analysisUsageHeader"><b>本次消耗</b>{latestRun?.updatedAt && <small>{formatTime(latestRun.updatedAt)}</small>}</div>
               <div className="analysisUsageGrid">
                 <span><small>视频模型请求</small><b>{analysisRequestCountLabel(latestUsage)}</b></span>
                 <span><small>模型</small><b>{latestUsage.requestedModel}</b></span>
@@ -2364,31 +2400,27 @@ function VideoTable({ videos, jobs, onOpen, onAnalysis, onCancel, connectorConne
                 </>}
               </div>
               {latestUsage.requestIds.length > 0 && <p className="analysisRequestIds" title={latestUsage.requestIds.join('\n')}>请求 ID：{latestUsage.requestIds.join('、')}</p>}
-              <p className="analysisUsageNote">{latestUsage.billingNote}{latestUsage.pricing?.checkedAt ? ` 单价核对日期：${latestUsage.pricing.checkedAt}。` : ''}</p>
-              {latestUsage.cloudAsr && <p className="analysisUsageNote">云端口播（{latestUsage.cloudAsr.model}）：{latestUsage.cloudAsr.billingNote}</p>}
             </section>}
             {!latestUsage && latestRun && <p className="analysisUsageUnavailable">{['queued', 'claimed', 'running'].includes(latestRun.status)
-              ? '本次分析尚未结束，用量将在接口返回后永久保存。'
+              ? '本次分析未结束，暂未返回用量。'
               : latestRun.status === 'succeeded'
-                ? '这次历史分析完成时尚未记录接口用量，无法从已保存结果倒推精确 Token 与费用。'
-                : '这次分析未保存到接口用量；可能尚未发起模型请求，也可能未收到完整回执，请以百炼账单核对。'}</p>}
-            {!latestRun && video.analysis && !latestUsage && <p className="analysisUsageUnavailable">这条历史分析完成时尚未记录接口用量，无法从已保存结果倒推精确 Token 与费用。</p>}
+                ? '历史用量未记录。'
+                : '本次用量未记录。'}</p>}
+            {!latestRun && video.analysis && !latestUsage && <p className="analysisUsageUnavailable">历史用量未记录。</p>}
             {(video.analysis || latestRun || latestUsage) && <a className="analysisBillingLink" href="https://bailian.console.aliyun.com/?tab=costing-balance" target="_blank" rel="noreferrer">打开百炼模型用量核对实际账单 ↗</a>}
             {previousRuns.length > 0 && <section className="analysisRunHistory" aria-label="历史 AI 分析费用记录">
-              <div className="analysisUsageHeader"><b>历次分析记录</b><small>每次独立保存</small></div>
+              <div className="analysisUsageHeader"><b>历次分析记录</b></div>
               <div className="analysisRunList">{previousRuns.map((run) => <div className="analysisRunItem" key={run.id}>
                 <span><b>{formatTime(run.createdAt || run.updatedAt)}</b><small>{analysisRunStatusLabel(run.status)}</small></span>
                 {run.usage
                   ? <span><b>{formatEstimatedCost(run.usage.totalEstimatedCostCny)} · {formatTokenCount(run.usage.totalTokens)} Token{run.usage.cloudAsr ? '（含云端口播）' : ''}</b><small>输入 {formatTokenCount(run.usage.promptTokens)} / 输出 {formatTokenCount(run.usage.completionTokens)} Token{run.usage.cloudAsr ? ` · 云端口播 ${formatCloudAudioSeconds(run.usage.cloudAsr.audioSeconds)} / ${formatEstimatedCost(run.usage.cloudAsr.estimatedCostCny)}` : ''}</small></span>
-                  : <span><b>无本机用量记录</b><small>{run.status === 'succeeded' ? '旧版本未保存，无法倒推' : '请按时间到百炼账单核对'}</small></span>}
+                  : <span><b>无用量记录</b></span>}
               </div>)}</div>
             </section>}
-            <p className="analysisUsageNote">Token 和口播秒数来自接口回执；金额按模型单价估算，不代表实际扣款或账户剩余额度。免费额度、套餐抵扣及优惠请在百炼账单核对。重复打开已完成结果不产生新调用。</p>
+            <p className="analysisUsageNote">费用为估算，以实际账单为准。</p>
           </div>
         </details>}
-      </article>;
-    })}
-  </div></div>;
+  </article>;
 }
 
 function closeOverlay(close: () => void) {
@@ -2506,7 +2538,7 @@ function VideoReader({ video, jobs, initialSection, index, total, onClose, onNav
     <div className="readerCloseBar"><button ref={closeButton} type="button" className="readerClose" onClick={requestClose} aria-label="关闭阅读，返回列表">关闭 <span aria-hidden="true">×</span></button></div>
     <div ref={scroller} className="readerScroll" style={{ '--reading-size': `${fontSize}px`, '--reading-direction': direction } as CSSProperties}>
       <header className="readerHeader"><span className="readerPosition">当前列表 · 第 {index + 1} / {total} 条</span><h2 id="reader-title">{video.title}</h2><div className="readerMetadata"><span>视频发布：{formatPublishedTime(video.publishedAt)}</span><span>首次采集：{formatTime(video.firstSeenAt)}</span><a href={video.url} target="_blank" rel="noreferrer">打开原视频核对 ↗</a></div>
-        <div className="readerNavigation"><button className="secondaryButton" type="button" disabled={index <= 0} onClick={() => changeContent(() => onNavigate(-1), -1)}>← 上一条</button><button className="secondaryButton" type="button" disabled={index >= total - 1} onClick={() => changeContent(() => onNavigate(1), 1)}>下一条 →</button><span>{complete.length}/3 个分区已生成</span></div>
+        <div className="readerNavigation"><button className="secondaryButton" type="button" disabled={index <= 0} onClick={() => changeContent(() => onNavigate(-1), -1)}>← 上一条</button><button className="secondaryButton" type="button" disabled={index >= total - 1} onClick={() => changeContent(() => onNavigate(1), 1)}>下一条 →</button>{complete.length > 0 && complete.length < 3 && <span>{complete.length}/3 个分区已生成</span>}</div>
       </header>
       <div className="readerTabs" role="tablist" aria-label="分析结果分区">{(['transcript', 'content', 'production'] as const).map((key) => <button key={key} id={`reader-tab-${key}`} type="button" role="tab" aria-selected={section === key} aria-controls="reader-panel" tabIndex={section === key ? 0 : -1} onClick={() => { if (section !== key) changeTab(key); }} onKeyDown={(event) => {
         const keys: ReadingSection[] = ['transcript', 'content', 'production'];
@@ -2517,21 +2549,20 @@ function VideoReader({ video, jobs, initialSection, index, total, onClose, onNav
       }}>{labels[key]}</button>)}</div>
       <div className="readerToolbar"><fieldset className="readingFontControl"><legend>阅读字号</legend>{([18, 20, 22] as const).map((size) => <button type="button" key={size} aria-pressed={fontSize === size} onClick={() => setFontSize(size)}>{size}</button>)}</fieldset><div className="readerExport"><button className="secondaryButton" type="button" disabled={!sectionText} onClick={() => copy(sectionText)}>复制{labels[section]}</button><button className="secondaryButton" type="button" disabled={!sectionText} onClick={() => downloadReading(sectionText, `${section}-${video.id}.md`)}>下载 .md</button></div><span role="status" className="readerCopyStatus">{copyMessage}</span></div>
       {busy && <div className="readerTask" role="status"><p>{analysisProgress(video, latestJob)}</p>{latestJob && <button type="button" className="secondaryButton" onClick={() => onCancel(latestJob)}>取消任务</button>}</div>}
-      {latestJob?.status === 'cancelled' && <p className="readerTask">任务已取消。已生成的结果仍然保留。</p>}
+      {latestJob?.status === 'cancelled' && <p className="readerTask">任务已取消</p>}
       {failed && <section className="readerFailure" aria-label="任务诊断"><h3>本次分析未完成</h3><p>失败阶段：{ANALYSIS_STAGE_LABELS[diagnostics.failedStage || ''] || diagnostics.failedStage || '尚未记录'}{Number.isFinite(diagnostics.attemptCount) ? ` · 实际尝试 ${diagnostics.attemptCount} 次` : ' · 尝试次数未记录'}</p><p>最后错误：{redactDiagnosticText(diagnostics.lastError || latestJob?.error || video.analysisError || '没有详细记录，根因尚未确定')}</p><p>已保存并保留：{complete.join('、') || '暂无已生成结果'}</p>{diagnostics.userAction && <p>{redactDiagnosticText(diagnostics.userAction)}</p>}<button type="button" className="secondaryButton" onClick={() => copy(formatAnalysisDiagnostics({ ...diagnostics, jobId: diagnostics.jobId || latestJob?.id, videoId: video.id, lastError: diagnostics.lastError || latestJob?.error || video.analysisError || '' }))}>复制诊断信息</button></section>}
       <div id="reader-panel" key={`${video.id}:${section}`} role="tabpanel" aria-labelledby={`reader-tab-${section}`} className={`readerBody ${changing ? 'isChanging' : ''}`}>
-        {section === 'transcript' ? video.transcript ? <ReadingText>{video.transcript}</ReadingText> : <p className="readingEmpty">{video.transcriptStatus === 'ready' ? '完整音轨识别已完成，未识别到清晰口播文字。' : video.transcriptStatus === 'error' ? `口播稿尚未完成：${redactDiagnosticText(video.transcriptError || '具体原因未记录')}` : busy ? '口播稿尚未完成，完成后会先保存并显示。' : '尚未生成口播稿。'}</p> : section === 'content' ? reading.available ? <>
-          {reading.overview && <section className="readingSummary"><h3>{reading.legacy ? '已有内容摘要 · 历史原文节选' : '主要内容'}</h3><ReadingText>{reading.overview}</ReadingText></section>}
-          {reading.legacy && <p className="readingSourceNote">以下保留已有分析原文。旧结果未区分的证据与推断，不代表已经核实。</p>}
+        {section === 'transcript' ? video.transcript ? <ReadingText>{video.transcript}</ReadingText> : <p className="readingEmpty">{video.transcriptStatus === 'ready' ? '未识别到清晰口播' : video.transcriptStatus === 'error' ? `口播识别未完成：${redactDiagnosticText(video.transcriptError || '具体原因未记录')}` : busy ? '等待口播结果' : '暂无口播稿'}</p> : section === 'content' ? reading.available ? <>
+          {reading.overview && <section className="readingSummary"><h3>{reading.legacy ? '历史分析摘要' : '主要内容'}</h3><ReadingText>{reading.overview}</ReadingText></section>}
           {reading.sections.map((item) => <section className="readingSection" key={item.key}><h3>{item.label}</h3><ReadingText>{item.text}</ReadingText></section>)}
-        </> : <><p className="readingEmpty">尚未生成视频内容分析。已有口播稿或制作规范可切换查看。</p>{video.description && video.description.trim() !== video.title.trim() && <section className="readingSection"><h3>原视频文案</h3><ReadingText>{video.description}</ReadingText></section>}</> : isRemotionPlan(video.analysis) ? <><p className="readingSourceNote">用于参考视频的呈现与制作。观察、复现建议和待确认项以各段标注为准。</p>{REMOTION_PLAN_SECTIONS.map(([key, label]) => <section className="readingSection" key={key}><h3>{label}</h3><ReadingText>{video.analysis?.[key] || ''}</ReadingText></section>)}</> : <p className="readingEmpty">尚未生成 Remotion 制作规范。已有结果继续保留。</p>}
-        {!busy && complete.length < 3 && <div className="readerGenerate"><button className="primaryButton" type="button" onClick={() => onAnalysis({ ...video, analysisStatus }, Boolean(video.analysis) || analysisStatus === 'error')}>{complete.length ? '补全缺失分析' : '分析'}</button><span>一次处理三个分区，复用已有口播；可能产生云端费用。</span></div>}
-        {!busy && complete.length === 3 && <details className="readerMore"><summary>重新分析</summary><p>重新查看完整视频并生成内容分析与制作规范，已有口播稿仍会复用。失败时保留之前的结果。</p><button type="button" className="secondaryButton" onClick={() => { if (window.confirm('重新分析会再次调用付费视频模型，已有口播稿直接复用。确定继续吗？')) onAnalysis({ ...video, analysisStatus }, true, true); }}>重新分析内容与制作规范（会产生费用）</button></details>}
+        </> : <><p className="readingEmpty">尚未分析</p>{video.description && video.description.trim() !== video.title.trim() && <section className="readingSection"><h3>原视频文案</h3><ReadingText>{video.description}</ReadingText></section>}</> : isRemotionPlan(video.analysis) ? <>{REMOTION_PLAN_SECTIONS.map(([key, label]) => <section className="readingSection" key={key}><h3>{label}</h3><ReadingText>{video.analysis?.[key] || ''}</ReadingText></section>)}</> : <p className="readingEmpty">暂无制作规范</p>}
+        {!busy && complete.length < 3 && <div className="readerGenerate"><button className="primaryButton" type="button" onClick={() => onAnalysis({ ...video, analysisStatus }, Boolean(video.analysis) || analysisStatus === 'error')}>{complete.length ? '补全缺失分析' : '分析'}</button><span>可能产生云端费用</span></div>}
+        {!busy && complete.length === 3 && <details className="readerMore"><summary>重新分析</summary><button type="button" className="secondaryButton" onClick={() => { if (window.confirm('重新分析会再次调用付费视频模型，已有口播稿直接复用。确定继续吗？')) onAnalysis({ ...video, analysisStatus }, true, true); }}>重新分析内容与制作规范（会产生费用）</button></details>}
       </div>
     </div>
   </dialog>;
 }
 
-function EmptyData({ title, detail }: { title: string; detail: string }) {
-  return <section className="emptyBoard compact"><div className="emptySymbol">·</div><h3>{title}</h3><p>{detail}</p></section>;
+function EmptyData({ title, detail }: { title: string; detail?: string }) {
+  return <section className="emptyBoard compact"><div className="emptySymbol">·</div><h3>{title}</h3>{detail && <p>{detail}</p>}</section>;
 }
