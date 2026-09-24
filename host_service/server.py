@@ -117,6 +117,8 @@ class HostHTTPServer(ThreadingHTTPServer):
         self.secrets = secrets
         self.analysis = analysis
         self.remote_connection = remote_connection
+        self.tunnel: TunnelProcess | None = None
+        self.remote_error: str | None = None
         self.browser: BrowserManager | None = None
 
     def server_close(self) -> None:
@@ -346,6 +348,10 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                         "service": "douyin-monitor-host",
                         "version": __version__,
                         "hostTime": utc_now(),
+                        **({"remote": self.server.tunnel.status() if self.server.tunnel else {
+                            "state": "blocked" if self.server.remote_error else "not_configured",
+                            "lastError": self.server.remote_error,
+                        }} if self._loopback() else {}),
                     },
                 )
                 return
@@ -814,12 +820,14 @@ def main() -> None:
             gateway = create_remote_gateway(server, connection)
             threading.Thread(target=gateway.serve_forever, daemon=True, name="remote-gateway").start()
             tunnel = TunnelProcess(server.config, connection)
+            server.tunnel = tunnel
             tunnel.start()
-            print("[remote-host] 仅本机远程入口已启动；通道连接情况请在 Cloudflare 检查", flush=True)
+            print("[remote-host] 仅本机远程入口已启动；通道由后台自动检查和恢复", flush=True)
     except Exception as error:
         # Local history and capture remain available if optional remote setup is
         # broken. No exception text here: encrypted config can contain secrets.
-        print(f"[remote-host] 远程连接启动失败（{type(error).__name__}）；本机服务继续运行", flush=True)
+        server.remote_error = f"远程连接启动失败（{type(error).__name__}）；请检查本机连接配置，本机服务继续运行"
+        print(f"[remote-host] {server.remote_error}", flush=True)
     print(
         f"[host-service] 已监听 http://{server.config.listen_host}:{server.config.listen_port} "
         f"（数据目录 {server.config.data_dir}，Qwen {server.config.qwen_model}，完整视频 fps={server.config.qwen_fps}）",

@@ -89,6 +89,8 @@ const data = {
 
 function browserFixture(fixtureData) {
   const nativeFetch = window.fetch.bind(window);
+  const connectionFailures = Number(new URL(window.location.href).searchParams.get('connectionFailures')) || 0;
+  let authChecks = 0;
   const qa = { requests: [], errors: [], data: fixtureData, isolated: true };
   window.__workspaceQa = qa;
   const redact = (value) => typeof value === 'string'
@@ -107,6 +109,8 @@ function browserFixture(fixtureData) {
     report.textContent = JSON.stringify({
       errors: qa.errors,
       requests: qa.requests.filter((request) => !['GET', 'HEAD'].includes(request.method)),
+      authChecks,
+      simulatedConnectionFailures: connectionFailures,
     });
   };
   syncReport();
@@ -127,6 +131,11 @@ function browserFixture(fixtureData) {
     let body = init.body ?? (input instanceof Request ? await input.clone().text() : null);
     try { if (typeof body === 'string' && body) body = JSON.parse(body); } catch { /* Keep a non-JSON fixture request readable. */ }
     qa.requests.push({ method, path: url.pathname, body: redact(body), at: new Date().toISOString(), mocked: true });
+    if (url.pathname === '/api/auth/status') {
+      authChecks += 1;
+      syncReport();
+      if (authChecks <= connectionFailures) return new Response(JSON.stringify({ message: '模拟通道暂时断连' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+    }
     if (!['GET', 'HEAD'].includes(method)) syncReport();
     if (url.pathname === '/api/auth/status') return json({ authenticated: true, configured: true, setupRequired: false, csrfToken: 'fixture-only' });
     if (url.pathname === '/api/state') return json({ state: fixtureData });

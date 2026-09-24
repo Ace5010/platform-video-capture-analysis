@@ -741,39 +741,81 @@ export default function Home() {
     processedResultIds.current = new Set(readStored<string[]>(processedResultStoreKey, []));
   }, []);
 
+  const applyAuthStatus = useCallback((payload: Record<string, unknown>) => {
+    const auth = payload.auth && typeof payload.auth === 'object' ? payload.auth as Record<string, unknown> : payload;
+    const setupRequired = Boolean(
+      auth.setupRequired
+      ?? auth.requiresSetup
+      ?? auth.firstRun
+      ?? (auth.configured === false),
+    );
+    const authenticated = Boolean(auth.authenticated ?? auth.loggedIn);
+    setCsrfToken(textValue(auth.csrfToken ?? auth.csrf_token));
+    if (setupRequired) {
+      setAuthPhase('setup');
+      setAuthMessage(isHostLocal ? '请先设置工作台访问密码' : '请先在主机的 localhost 页面完成首次设置');
+    } else if (authenticated) {
+      setAuthPhase('ready');
+      setAuthMessage('');
+    } else {
+      setAuthPhase('login');
+      setAuthMessage('请输入访问密码');
+    }
+  }, [isHostLocal]);
+
   useEffect(() => {
     if (!browserReady) return;
     let active = true;
-    hostApi<Record<string, unknown>>(apiBase, '/api/auth/status')
-      .then((payload) => {
-        if (!active) return;
-        const auth = payload.auth && typeof payload.auth === 'object' ? payload.auth as Record<string, unknown> : payload;
-        const setupRequired = Boolean(
-          auth.setupRequired
-          ?? auth.requiresSetup
-          ?? auth.firstRun
-          ?? (auth.configured === false),
-        );
-        const authenticated = Boolean(auth.authenticated ?? auth.loggedIn);
-        setCsrfToken(textValue(auth.csrfToken ?? auth.csrf_token));
-        if (setupRequired) {
-          setAuthPhase('setup');
-          setAuthMessage(isHostLocal ? '请先设置工作台访问密码' : '请先在主机的 localhost 页面完成首次设置');
-        } else if (authenticated) {
-          setAuthPhase('ready');
-          setAuthMessage('');
-        } else {
-          setAuthPhase('login');
-          setAuthMessage('请输入访问密码');
-        }
-      })
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 6_000);
+    hostApi<Record<string, unknown>>(apiBase, '/api/auth/status', { signal: controller.signal })
+      .then((payload) => { if (active) applyAuthStatus(payload); })
       .catch((error: Error) => {
         if (!active) return;
         setAuthPhase('error');
         setAuthMessage(`无法连接主机服务：${error.message}`);
-      });
-    return () => { active = false; };
-  }, [apiBase, browserReady, isHostLocal]);
+      }).finally(() => window.clearTimeout(timeout));
+    return () => { active = false; controller.abort(); window.clearTimeout(timeout); };
+  }, [apiBase, browserReady, applyAuthStatus]);
+
+  useEffect(() => {
+    if (authPhase !== 'error' || !browserReady) return;
+    let active = true;
+    let failures = 0;
+    let controller: AbortController | null = null;
+    let timer = 0;
+    const reconnect = async () => {
+      if (!active || controller) return;
+      window.clearTimeout(timer);
+      controller = new AbortController();
+      const request = controller;
+      const timeout = window.setTimeout(() => request.abort(), 6_000);
+      try {
+        // Read-only connection checks must never replay user-submitted jobs.
+        const payload = await hostApi<Record<string, unknown>>(apiBase, '/api/auth/status', { signal: request.signal });
+        if (active) applyAuthStatus(payload);
+      } catch {
+        if (active) {
+          const delay = [1_000, 2_000, 5_000, 10_000][Math.min(failures++, 3)];
+          timer = window.setTimeout(() => { void reconnect(); }, delay);
+        }
+      } finally {
+        window.clearTimeout(timeout);
+        controller = null;
+      }
+    };
+    const resume = () => { if (document.visibilityState === 'visible') void reconnect(); };
+    timer = window.setTimeout(() => { void reconnect(); }, 1_000);
+    window.addEventListener('online', resume);
+    document.addEventListener('visibilitychange', resume);
+    return () => {
+      active = false;
+      controller?.abort();
+      window.clearTimeout(timer);
+      window.removeEventListener('online', resume);
+      document.removeEventListener('visibilitychange', resume);
+    };
+  }, [apiBase, authPhase, browserReady, applyAuthStatus]);
 
   useEffect(() => {
     if (authPhase !== 'ready') return;
@@ -1610,7 +1652,7 @@ export default function Home() {
           <button className="primaryButton" type="submit" disabled={authSubmitting}>{authSubmitting ? '请稍候…' : authPhase === 'setup' ? '保存并进入工作台' : '登录'}</button>
         </form>}
         {setupBlocked && <div className="accessNotice">首次密码只能在主机打开 <b>http://localhost:3000</b> 设置。设置完成后，本设备即可使用同一密码登录。</div>}
-        {authPhase === 'error' && <button className="secondaryButton" type="button" onClick={() => window.location.reload()}>重新连接</button>}
+        {authPhase === 'error' && <><p>正在自动重连，连接恢复后会自动进入工作台。</p><button className="secondaryButton" type="button" onClick={() => window.location.reload()}>立即重试</button></>}
         <small>主机地址：{apiBase.replace(/^https?:\/\//, '')}</small>
       </section>
     </main>;

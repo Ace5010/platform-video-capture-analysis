@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import ipaddress
+import http.client
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -94,7 +98,13 @@ class RemoteConnection:
 
 
 class TunnelProcess:
-    """Only supervises its own child; cloudflared handles transport reconnects."""
+    """Supervise only our connector, never replay capture or paid model jobs."""
+
+    RETRY_DELAYS = (1, 2, 5, 10, 15, 30)
+    CHECK_INTERVAL = 2
+    STARTUP_GRACE = 30
+    UNHEALTHY_GRACE = 10
+    STABLE_SECONDS = 60
 
     def __init__(self, config: HostConfig, connection: RemoteConnection) -> None:
         self.config = config
@@ -103,72 +113,180 @@ class TunnelProcess:
         self.stopped = threading.Event()
         self.thread: threading.Thread | None = None
         self.error: str | None = None
+        self._last_stderr = ""
+        self._log_lock = threading.Lock()
+        self._status = {"state": "starting", "attempts": 0, "readyConnections": 0, "lastError": None}
+        self._failures = 0
+        self._metrics_port = 0
+
+    def status(self) -> dict:
+        return self._status.copy()
+
+    def _update(self, **values) -> None:
+        self._status = {**self._status, **values}
 
     def start(self) -> None:
+        if self.stopped.is_set() or (self.thread and self.thread.is_alive()):
+            return
         self.thread = threading.Thread(target=self._run, daemon=True, name="cloudflare-tunnel")
         self.thread.start()
 
-    def _read_errors(self, process: subprocess.Popen) -> None:
+    def _record(self, message: str) -> str:
+        message = safe_error(message.replace(self.connection.tunnel_token, "[凭据已隐藏]")).strip()
         log_path = self.config.data_dir / "remote-tunnel.log"
-        if process.stderr is None:
-            return
-        for raw in process.stderr:
-            message = safe_error(raw.replace(self.connection.tunnel_token, "[凭据已隐藏]")).strip()
-            self.error = message
+        with self._log_lock:
             try:
                 # Keep a small, redacted connection log, never request headers.
                 if log_path.exists() and log_path.stat().st_size > 64 * 1024:
                     tail = log_path.read_bytes()[-32 * 1024:].decode("utf-8", errors="ignore")
                     log_path.write_text(tail, encoding="utf-8")
                 with log_path.open("a", encoding="utf-8") as log:
-                    log.write(message + "\n")
+                    log.write(f"{datetime.now(timezone.utc).isoformat()} {message}\n")
             except OSError:
                 pass
+        return message
+
+    def _read_errors(self, process: subprocess.Popen) -> None:
+        if process.stderr is None:
+            return
+        for raw in process.stderr:
+            message = self._record(raw)
+            if process is self.process:
+                self._last_stderr = message
+
+    def _ready_connections(self) -> int:
+        # Explicit loopback HTTP bypasses proxy settings and never sends secrets.
+        client = http.client.HTTPConnection("127.0.0.1", self._metrics_port, timeout=2)
+        try:
+            client.request("GET", "/ready")
+            response = client.getresponse()
+            payload = json.loads(response.read(4096))
+            count = payload.get("readyConnections")
+            return count if response.status == 200 and type(count) is int and count > 0 else 0
+        except (OSError, http.client.HTTPException, ValueError, AttributeError):
+            return 0
+        finally:
+            client.close()
+
+    def _monitor(self, process: subprocess.Popen) -> str:
+        unhealthy_since: float | None = time.monotonic()
+        healthy_since: float | None = None
+        has_connected = False
+        next_check = 0.0
+        while not self.stopped.wait(0.5):
+            code = process.poll()
+            if code is not None:
+                return f"cloudflared 已退出（代码 {code}）"
+            now = time.monotonic()
+            if now < next_check:
+                continue
+            next_check = now + self.CHECK_INTERVAL
+            count = self._ready_connections()
+            if self.stopped.is_set():
+                break
+            if count:
+                has_connected = True
+                if healthy_since is None:
+                    healthy_since = now
+                    self._record(f"通道已连接（可用连接 {count}，第 {self._status['attempts']} 次启动）")
+                unhealthy_since = None
+                self.error = None
+                self._update(state="connected", readyConnections=count, lastError=None, nextRetrySeconds=0)
+                if now - healthy_since >= self.STABLE_SECONDS:
+                    self._failures = 0
+            else:
+                healthy_since = None
+                if unhealthy_since is None:
+                    unhealthy_since = now
+                    self._record("通道暂时断开，等待客户端自动重连")
+                self._update(state="reconnecting", readyConnections=0)
+                grace = self.UNHEALTHY_GRACE if has_connected else self.STARTUP_GRACE
+                if now - unhealthy_since >= grace:
+                    return f"连续 {grace} 秒未检测到可用隧道连接，将重新检测网络并启动通道"
+        return "主机已请求停止通道"
+
+    @staticmethod
+    def _stop_child(process: subprocess.Popen) -> None:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
 
     def _run(self) -> None:
         local_binary = Path(__file__).resolve().parents[1] / "data" / "tools" / "cloudflared.exe"
         executable = str(local_binary) if local_binary.is_file() else shutil.which("cloudflared")
         if not executable:
-            self.error = "未安装 cloudflared，远程连接尚未启动"
-            print(f"[remote-host] {self.error}", flush=True)
+            self.error = self._record("未安装 cloudflared，远程连接尚未启动；请安装项目隧道客户端")
+            self._update(state="blocked", lastError=self.error)
             return
         # The token is never a command-line argument or a plaintext file.
         environment = os.environ.copy()
         environment["TUNNEL_TOKEN"] = self.connection.tunnel_token
-        for attempt in range(3):
-            if self.stopped.wait(0 if attempt == 0 else 5 * attempt):
-                return
-            try:
-                network_arguments = [] if self.config.testing else direct_tunnel_arguments()
+        delay = 0
+        try:
+            # A persistent connection must recover after a later network outage;
+            # analysis/capture attempts keep their separate, bounded budgets.
+            while not self.stopped.wait(delay):
+                self._update(state="starting", attempts=self._status["attempts"] + 1, nextRetrySeconds=0)
+                reader = None
+                reason = ""
+                try:
+                    network_arguments = [] if self.config.testing else direct_tunnel_arguments()
+                    if self.stopped.is_set():
+                        return
+                    # Give this child its own loopback metrics port, rather than
+                    # accidentally treating another project's tunnel as healthy.
+                    with socket.socket() as probe:
+                        probe.bind(("127.0.0.1", 0))
+                        self._metrics_port = probe.getsockname()[1]
+                    self._last_stderr = ""
+                    self.process = subprocess.Popen(
+                        [executable, "tunnel", "--no-autoupdate", "--protocol", "quic", "--loglevel", "warn",
+                         "--metrics", f"127.0.0.1:{self._metrics_port}", *network_arguments, "run"],
+                        env=environment, stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                        text=True, encoding="utf-8", errors="replace",
+                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                    )
+                    self._record(f"启动通道（第 {self._status['attempts']} 次，PID {self.process.pid}）")
+                    reader = threading.Thread(target=self._read_errors, args=(self.process,), daemon=True, name="tunnel-errors")
+                    reader.start()
+                    reason = self._monitor(self.process)
+                except (FileNotFoundError, PermissionError) as error:
+                    self.error = self._record(f"无法运行隧道客户端（{type(error).__name__}）；请检查安装或文件权限")
+                    self._update(state="blocked", readyConnections=0, lastError=self.error)
+                    return
+                except Exception as error:
+                    reason = f"通道检查或启动失败：{safe_error(error)}"
+                finally:
+                    if self.process:
+                        # Never start another connector until our previous child
+                        # has exited; do not terminate any unrelated process.
+                        self._stop_child(self.process)
+                    if reader:
+                        reader.join(timeout=2)
+                    self.process = None
                 if self.stopped.is_set():
                     return
-                self.process = subprocess.Popen(
-                    [executable, "tunnel", "--no-autoupdate", "--protocol", "quic", "--loglevel", "warn", *network_arguments, "run"],
-                    env=environment, stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                    text=True, encoding="utf-8", errors="replace",
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-                )
-                threading.Thread(target=self._read_errors, args=(self.process,), daemon=True, name="tunnel-errors").start()
-                self.error = None
-                while not self.stopped.wait(0.5):
-                    if self.process.poll() is not None:
-                        break
-                if self.stopped.is_set():
-                    return
-                self.error = f"cloudflared 已退出（代码 {self.process.returncode}，启动 {attempt + 1}/3）"
-            except OSError:
-                self.error = f"无法启动 cloudflared（启动 {attempt + 1}/3）"
-            print(f"[remote-host] {self.error}", flush=True)
+                if self._last_stderr:
+                    reason += f"；最近客户端记录：{self._last_stderr}"
+                self.error = self._record(reason)
+                delay = self.RETRY_DELAYS[min(self._failures, len(self.RETRY_DELAYS) - 1)]
+                self._failures += 1
+                self._update(state="waiting", readyConnections=0, lastError=self.error, nextRetrySeconds=delay)
+                self._record(f"将在 {delay} 秒后重新启动通道")
+        except Exception as error:
+            self.error = self._record(f"通道管理停止：{safe_error(error)}；请检查客户端进程后重启工作台")
+            self._update(state="blocked", readyConnections=0, lastError=self.error)
+        finally:
+            if self.stopped.is_set():
+                self._update(state="stopped", readyConnections=0, nextRetrySeconds=0)
+                self._record("主机停止通道；不再安排重连")
 
     def shutdown(self) -> None:
         self.stopped.set()
         if self.thread:
-            self.thread.join(timeout=2)
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+            self.thread.join(timeout=30)
