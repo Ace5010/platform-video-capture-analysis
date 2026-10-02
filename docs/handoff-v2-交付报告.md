@@ -167,3 +167,25 @@
 - 新增/更新的自动测试：`scripts/test-preview-media.py`、`scripts/test-collection-discoveries.py`、`scripts/test-follower-count.ts`、`scripts/test-playback-browser.mjs`、`scripts/test-live-workspace.mjs`、`scripts/playback-fixture-host.py`
 - 文档：`README.md`、`AGENTS.md`（已同步新的播放、清理、新增分区与粉丝量规则）
 - 退役：`scripts/test-persistent-media.py`（对应能力已移除）
+
+## 九、提交与工作区状态
+
+本轮提交（基于执行前的 HEAD `4b83d43`）：
+
+- `80c49c3` 功能：改为按需低清在线播放并清理旧持久视频
+- `c109cfc` 文档：更新按需播放、媒体清理、新增分区与粉丝量说明
+
+说明：72 小时新增分区与粉丝量的代码改动与播放改造交织在 `host_service/database.py`、`app/page.tsx` 等同一批文件中，因此随第一个提交一起入库，没有为了拆分成两个提交而重做已完成且已通过测试的代码。
+
+工作区中保留、**未提交**的内容（属于本机原有的在途改动，本轮未触碰、未回退）：
+
+- `android/` 目录及 `scripts/build-android.ps1`、`scripts/prepare-android-fixture.mjs`、`scripts/setup-android-signing.ps1`：另一个功能方向的在途工作。
+- `.gitignore`、`cloudflare-worker.ts`、`scripts/preview-workspace-fixture.mjs`、`scripts/test-history-boundary.mjs`、`scripts/test-browser-worker.mjs`、`scripts/test-host-proxy.ts`、`scripts/test-host-service.py` 的未提交改动。
+- 新增工具脚本 `scripts/stop-process-gracefully.ps1`（用于安全停止主机服务，未提交）。
+
+当前运行状态（提交后复核）：
+
+- 主机服务：`http://127.0.0.1:43129/health` 正常，远程通道状态 `connected`。
+- 工作台：`http://localhost:3000` 返回 `200`。
+- `data/host-service/media/`：**0 个文件**。
+
