@@ -117,7 +117,13 @@ class AnalysisManager:
                 time.sleep(0.1 * attempt)
 
     def _obtain_media(self, job_id, original_payload, task_dir, capture_media, diagnostics):
-        """One budget: fresh page/URL, original bytes, identity and completeness."""
+        """One budget: fresh page/URL, original bytes, identity and completeness.
+
+        Browsing prepares short preview ranges on demand and keeps no local
+        video library, so every analysis run fetches the complete target video
+        into this task's temporary directory and removes it afterwards.
+        """
+        video_id = str(original_payload.get("videoId") or "")
         def record(stage, attempt, error):
             diagnostics["failedStage"] = stage
             diagnostics["attempts"].append({"stage": stage, "attempt": attempt, "error": safe_error(error), "at": utc_now()})

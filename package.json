@@ -12,11 +12,12 @@
     "test:bridge": "node scripts/test-dashboard-bridge.mjs",
     "test:connector": "node scripts/test-extension-connector.mjs",
     "test:asr": ".venv\\Scripts\\python.exe scripts/test-local-asr.py",
-    "test:host": ".venv\\Scripts\\python.exe scripts/test-host-service.py && .venv\\Scripts\\python.exe scripts/test-remote-host.py && node --experimental-strip-types scripts/test-host-proxy.ts && .venv\\Scripts\\python.exe scripts/test-cloud-asr.py && .venv\\Scripts\\python.exe scripts/test-qwen-upload.py && .venv\\Scripts\\python.exe scripts/test-analysis-reuse.py",
+    "test:host": ".venv\\Scripts\\python.exe scripts/test-host-service.py && .venv\\Scripts\\python.exe scripts/test-preview-media.py && .venv\\Scripts\\python.exe scripts/test-collection-discoveries.py && .venv\\Scripts\\python.exe scripts/test-remote-host.py && node --experimental-strip-types scripts/test-host-proxy.ts && .venv\\Scripts\\python.exe scripts/test-cloud-asr.py && .venv\\Scripts\\python.exe scripts/test-qwen-upload.py && .venv\\Scripts\\python.exe scripts/test-analysis-reuse.py",
     "test:scheduler": "node scripts/test-extension-scheduler.mjs",
     "test:extension-compatibility": "node --experimental-strip-types scripts/test-extension-compatibility.ts",
     "test:video-analytics": "node --experimental-strip-types scripts/test-video-analytics.ts",
     "test:content-browse": "node --experimental-strip-types scripts/test-content-browse.ts",
+    "test:follower-count": "node --experimental-strip-types scripts/test-follower-count.ts",
     "test:analysis-usage": "node --experimental-strip-types scripts/test-analysis-usage.ts",
     "test:reading": "node --experimental-strip-types scripts/test-remotion-plan.ts && node --experimental-strip-types scripts/test-analysis-diagnostics.ts",
     "build": "vinext build",
@@ -25,7 +26,7 @@
     "test:cloudflare-worker": "node scripts/test-cloudflare-worker.mjs",
     "start": "vinext start",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
-    "test:browser": "node scripts/test-browser-worker.mjs && node scripts/test-partial-capture.mjs && .venv\\Scripts\\python.exe scripts/test-browser-host.py"
+    "test:browser": "node scripts/test-browser-worker.mjs && node scripts/test-history-boundary.mjs && node scripts/test-partial-capture.mjs && node scripts/test-playback-browser.mjs && .venv\\Scripts\\python.exe scripts/test-browser-host.py"
   },
   "dependencies": {
     "next": "16.2.6",

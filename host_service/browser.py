@@ -9,14 +9,36 @@ import subprocess
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from . import __version__
 from .database import utc_now
+from .config import create_task_temp_dir
+from .media import download_media, has_audio_stream, media_duration_seconds, mux_original_streams, probe_media, sha256_file, remove_task_dir
 from .recovery import AnalysisCancelled, safe_error
 
 CAPABILITIES = ["collect_latest", "archive_account", "analyze_video"]
+PREVIEW_RPC_TIMEOUT_SECONDS = 90
+
+
+@dataclass
+class PreviewCandidate:
+    """One target-bound low-resolution source chosen for on-demand playback."""
+
+    url: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def fingerprint(self) -> str:
+        """Identity of the encoded resource, independent of the signed token."""
+        generator = self.metadata.get("generator") or ""
+        if generator:
+            return str(generator)[:96]
+        parts = [str(self.metadata.get(key) if self.metadata.get(key) is not None else "") for key in
+                 ("width", "height", "bitrate", "contentLength", "codec", "contentType")]
+        return "|".join(parts)
 
 
 class BrowserManager:
@@ -33,6 +55,7 @@ class BrowserManager:
         self.ready = False
         self.running = False
         self.error = ""
+        self.media_paused = False
         self.active_job = None
         self.rpc_lock = threading.RLock()
 
@@ -48,6 +71,7 @@ class BrowserManager:
                 "running": self.running, "error": self.error, "opening": self.open_event.is_set(),
                 "capabilities": CAPABILITIES if self.ready else [],
                 "workerStatus": "running" if self.active_job else "idle",
+                "mediaPaused": self.media_paused,
                 "activeJobId": self.active_job["id"] if self.active_job else None}
 
     def open(self):
@@ -187,6 +211,7 @@ class BrowserManager:
     def _collect_accounts(self, job, payload, mode, accounts):
         failures = []
         account_updates = []
+        discovery_counts: dict[str, int] = {}
         for account in accounts:
             try:
                 self.database.upsert_account({"id": account["id"], "status": "checking", "currentSyncMode": mode, "collectionError": None})
@@ -197,7 +222,7 @@ class BrowserManager:
                 pending = result.get("pendingVideos") or []
                 if pending:
                     raise RuntimeError("采集结果仍有未完成视频，已拒绝写入和标记完成")
-                if not videos:
+                if not videos and not (mode == "latest" and result.get("discoveredVideoIds") == []):
                     raise RuntimeError("账号页返回了空视频列表，请检查抖音登录和验证码")
                 required = ("title", "description", "coverUrl", "publishedAt", "durationSeconds",
                             "likeCount", "commentCount", "favoriteCount", "shareCount")
@@ -205,22 +230,77 @@ class BrowserManager:
                     raise RuntimeError("采集结果字段不完整，已拒绝写入和标记完成")
                 updated = {**account, "name": result.get("accountName") or account["name"],
                            "avatarUrl": result.get("accountAvatarUrl") or account.get("avatarUrl")}
+                # Follower data is auxiliary: a missing reading keeps the last
+                # saved value and must never fail an otherwise complete capture.
+                follower = result.get("accountFollowers")
+                if isinstance(follower, dict):
+                    updated.update(follower)
                 self._event(job, "collection_result", {"account": updated, "accountId": account["id"],
-                    "mode": mode, "videos": videos, "completedAt": captured}, f'account:{account["id"]}')
+                    "mode": mode, "videos": videos, "discoveredVideoIds": result.get("discoveredVideoIds") or [],
+                    "completedAt": captured}, f'account:{account["id"]}')
+                # Account checking no longer waits for any video file: new-works
+                # detection, follower refresh and on-demand preview are separate.
                 if mode == "latest":
                     saved = next(item for item in self.database.state()["accounts"] if item["id"] == account["id"])
+                    # "This run's new findings" and "the rolling 72-hour total"
+                    # are separate numbers and must stay separate in the report.
                     account_updates.append({"accountId": account["id"], "accountName": saved["name"],
-                                            "newVideoCount": saved.get("latestCheckNewVideoCount", 0)})
+                                            "newVideoCount": saved.get("latestCheckNewVideoCount", 0),
+                                            "discoveryCount": discovery_counts.get(account["id"], 0),
+                                            "followersCapturedAt": saved.get("followerCountCapturedAt")})
             except Exception as error:
                 self.database.upsert_account({"id": account["id"], "status": "error", "currentSyncMode": None, "collectionError": safe_error(error)[:500],
                     **({"initialSyncStatus": "error"} if mode == "initial" else {})})
                 failures.append(f'{account.get("name", "账号")}：{safe_error(error)}')
+        _, discovery_counts = self.database.recent_discoveries()
         self._event(job, "job_failed" if failures else "job_completed",
                     {"message": "；".join(failures), "total": len(accounts),
                      "accountUpdates": account_updates,
                      "newVideoCount": sum(item["newVideoCount"] for item in account_updates),
+                     "newDiscoveryCount": sum(item["newVideoCount"] for item in account_updates),
+                     "discoveryTotalCount": sum(discovery_counts.values()),
                      "succeeded": len(accounts) - len(failures), "failed": len(failures),
                      **({"accountId": accounts[0]["id"], "mode": mode} if len(accounts) == 1 else {})})
+
+    def resolve_preview(self, video_id: str, video_url: str, *, timeout: float = PREVIEW_RPC_TIMEOUT_SECONDS,
+                        check_cancelled=None) -> PreviewCandidate:
+        """Resolve one target-bound low-resolution source for on-demand playback.
+
+        This never downloads media and never starts an analysis task; it only
+        reuses the audited target verification and source extraction.
+        """
+        result = self._rpc({"action": "preview", "payload": {"videoId": video_id, "videoUrl": video_url}},
+                           timeout=max(1.0, timeout), check_cancelled=check_cancelled)
+        if str(result.get("videoId") or "") != str(video_id):
+            raise RuntimeError("预览源视频 ID 校验失败")
+        video = result.get("video") or {}
+        url = video.get("url")
+        if not isinstance(url, str) or not url:
+            raise RuntimeError("没有取得经过目标校验的可用播放源")
+        metadata = video.get("metadata") if isinstance(video.get("metadata"), dict) else {}
+        return PreviewCandidate(url=url, metadata=metadata)
+
+    def capture_analysis_media(self, payload, *, deadline, check_cancelled):
+        # Exactly one address capture. AnalysisManager alone owns the
+        # three-attempt budget covering capture + download + validation.
+        video_id = str(payload["videoId"])
+        media = self._rpc({"action": "capture", "payload": {
+            "videoId": video_id, "accountId": payload.get("accountId"),
+            "videoUrl": f"https://www.douyin.com/video/{video_id}",
+            "purpose": "analysis",
+            "requireCompleteMetadata": payload.get("sourceKind") == "video_link",
+            "savedVideoMetadata": payload.get("savedVideoMetadata"),
+        }}, timeout=max(1, min(180, deadline - time.monotonic())), check_cancelled=check_cancelled)
+        metadata = media.get("videoMetadata") or {}
+        result = {"videoUrl": media["video"]["url"], "audioUrl": (media.get("audio") or {}).get("url"),
+            "videoId": video_id, "accountId": payload.get("accountId"),
+            "title": metadata.get("title") or payload.get("title"),
+            "description": metadata.get("description") or payload.get("description"),
+            "authorName": metadata.get("authorName") or payload.get("authorName"),
+            "videoMetadata": metadata, "sourceVideoUrl": media["sourceVideoUrl"],
+            "mediaMeta": {"video": media["video"]["metadata"],
+                          "audio": (media.get("audio") or {}).get("metadata"), "page": media["page"]}}
+        return result
 
     def _loop(self):
         while not self.stop_event.is_set():

@@ -60,6 +60,15 @@ class HostConfig:
     qwen_fps: int
     qwen_endpoint: str
     upload_policy_endpoint: str
+    preview_purpose: str
+    preview_cache_bytes: int
+    preview_cache_idle_seconds: int
+    preview_prefetch_initial_bytes: int
+    preview_prefetch_max_bytes: int
+    preview_prefetch_seconds: int
+    preview_prefetch_max_ratio: float
+    preview_max_prepare_ids: int
+    preview_resolve_timeout_seconds: int
     testing: bool
     mock_qwen: bool
 
@@ -98,6 +107,18 @@ class HostConfig:
                 "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
             ).strip(),
             upload_policy_endpoint="https://dashscope.aliyuncs.com/api/v1/uploads",
+            # On-demand browsing: bytes are relayed from the platform CDN and a
+            # small capped prefix is kept in host memory only. These are the
+            # development starting points; adjust them with tests, not guesses.
+            preview_purpose="preview",
+            preview_cache_bytes=_env_int("DOUYIN_PREVIEW_CACHE_BYTES", 32 * 1024 * 1024, 1024 * 1024, 512 * 1024 * 1024),
+            preview_cache_idle_seconds=_env_int("DOUYIN_PREVIEW_CACHE_IDLE_SECONDS", 120, 10, 3600),
+            preview_prefetch_initial_bytes=_env_int("DOUYIN_PREVIEW_PREFETCH_CHUNK_BYTES", 512 * 1024, 32 * 1024, 4 * 1024 * 1024),
+            preview_prefetch_max_bytes=_env_int("DOUYIN_PREVIEW_PREFETCH_MAX_BYTES", 2 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024),
+            preview_prefetch_seconds=_env_int("DOUYIN_PREVIEW_PREFETCH_SECONDS", 3, 1, 30),
+            preview_prefetch_max_ratio=0.2,
+            preview_max_prepare_ids=2,
+            preview_resolve_timeout_seconds=_env_int("DOUYIN_PREVIEW_RESOLVE_TIMEOUT_SECONDS", 90, 10, 300),
             testing=_env_bool("DOUYIN_HOST_TESTING"),
             mock_qwen=_env_bool("DOUYIN_QWEN_MOCK"),
         )

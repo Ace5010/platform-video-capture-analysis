@@ -1,4 +1,4 @@
-/** A narrow JSON gateway. Never proxy arbitrary URLs, credentials, or local admin routes. */
+/** Narrow JSON and registered-media gateway. Never proxy arbitrary URLs or local admin routes. */
 export type HostProxyEnvironment = {
   HOST_SERVICE?: { fetch(request: Request): Promise<Response> };
   HOST_PUBLIC_ORIGIN?: string;
@@ -7,7 +7,11 @@ export type HostProxyEnvironment = {
 const COOKIE_NAME = 'douyin_monitor_session';
 const MAX_BODY_BYTES = 64 * 1024;
 const GET_PATHS = new Set(['/health', '/api/auth/status', '/api/state', '/api/jobs', '/api/qwen', '/api/qwen/status']);
-const POST_PATHS = new Set(['/api/auth/login', '/api/auth/logout', '/api/accounts/upsert', '/api/accounts/remove', '/api/accounts/ack-updates', '/api/video-links/analyze', '/api/jobs']);
+const POST_PATHS = new Set(['/api/auth/login', '/api/auth/logout', '/api/accounts/upsert', '/api/accounts/remove', '/api/accounts/ack-updates', '/api/video-links/analyze', '/api/jobs', '/api/previews/prepare']);
+// On-demand playback: the host resolves the low-resolution source itself, so
+// the gateway only ever forwards a registered work id and a source generation.
+const PREVIEW_STATUS_PATH = /^\/api\/previews\/\d{1,32}\/status$/;
+const PREVIEW_MEDIA_PATH = /^\/api\/previews\/\d{1,32}\/[a-f0-9]{8,64}\/media$/;
 
 function errorResponse(status: number, error: string, upstreamStatus?: number): Response {
   return Response.json({ ok: false, error, ...(upstreamStatus ? { upstreamStatus } : {}) }, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
@@ -25,8 +29,10 @@ export async function proxyHostRequest(request: Request, env: HostProxyEnvironme
   }
   if (!url.pathname.startsWith('/host/')) return errorResponse(404, '接口不存在');
   const path = url.pathname.slice('/host'.length);
+  const mediaPath = PREVIEW_MEDIA_PATH.test(path);
   const allowed = request.method === 'GET'
-    ? GET_PATHS.has(path) || /^\/api\/jobs\/[a-zA-Z0-9_-]+$/.test(path)
+    ? GET_PATHS.has(path) || mediaPath || PREVIEW_STATUS_PATH.test(path) || /^\/api\/jobs\/[a-zA-Z0-9_-]+$/.test(path)
+    : request.method === 'HEAD' && mediaPath ? true
     : request.method === 'POST' && (POST_PATHS.has(path) || /^\/api\/jobs\/[a-zA-Z0-9_-]+\/cancel$/.test(path));
   if (!allowed) return errorResponse(403, '此操作只能在电脑的 localhost 工作台执行，或接口不受支持');
   const origin = request.headers.get('Origin');
@@ -44,10 +50,15 @@ export async function proxyHostRequest(request: Request, env: HostProxyEnvironme
   if (cookie) headers.set('Cookie', cookie);
   const csrf = request.headers.get('X-CSRF-Token');
   if (csrf && /^[a-zA-Z0-9_-]{32,256}$/.test(csrf)) headers.set('X-CSRF-Token', csrf);
+  if (mediaPath) {
+    const range = request.headers.get('Range');
+    if (range && /^bytes=(?:\d+-\d*|-\d+)$/.test(range)) headers.set('Range', range);
+    else if (range) return errorResponse(416, '无效的媒体读取范围');
+  }
 
   // Job creation already uses database deduplication. Never retry a POST here:
   // a timeout does not prove that the host did not accept it.
-  const signal = AbortSignal.any([request.signal, AbortSignal.timeout(30_000)]);
+  const signal = mediaPath ? request.signal : AbortSignal.any([request.signal, AbortSignal.timeout(30_000)]);
   try {
     let body: Uint8Array<ArrayBuffer> | undefined;
     if (request.method === 'POST') {
@@ -90,6 +101,22 @@ export async function proxyHostRequest(request: Request, env: HostProxyEnvironme
       target.searchParams.set('limit', limit);
     }
     const upstream = await env.HOST_SERVICE.fetch(new Request(target, { method: request.method, headers, body, redirect: 'manual', signal }));
+    if (mediaPath && [200, 206, 416].includes(upstream.status)) {
+      if ((upstream.status !== 416 && upstream.headers.get('Content-Type')?.split(';')[0] !== 'video/mp4')
+          || !/^bytes$/.test(upstream.headers.get('Accept-Ranges') || '')
+          || !/^\d+$/.test(upstream.headers.get('Content-Length') || '')
+          || (upstream.status === 206 && !/^bytes \d+-\d+\/\d+$/.test(upstream.headers.get('Content-Range') || ''))
+          || (upstream.status === 416 && !/^bytes \*\/\d+$/.test(upstream.headers.get('Content-Range') || ''))) {
+        await upstream.body?.cancel();
+        return errorResponse(502, '电脑后台媒体响应无效');
+      }
+      const mediaHeaders = new Headers({ 'Accept-Ranges': 'bytes', 'Content-Length': upstream.headers.get('Content-Length')!,
+        'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' });
+      if (upstream.status !== 416) mediaHeaders.set('Content-Type', 'video/mp4');
+      const contentRange = upstream.headers.get('Content-Range');
+      if (contentRange) mediaHeaders.set('Content-Range', contentRange);
+      return new Response(request.method === 'HEAD' ? null : upstream.body, { status: upstream.status, headers: mediaHeaders });
+    }
     if ((upstream.status >= 300 && upstream.status < 400) || !upstream.headers.get('Content-Type')?.includes('application/json')) {
       await upstream.body?.cancel();
       if (upstream.status >= 500) return errorResponse(503, '电脑连接通道暂时不可用，请确认电脑工作台和隧道正在运行。', upstream.status);

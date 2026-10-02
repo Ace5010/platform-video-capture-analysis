@@ -61,7 +61,9 @@ export class BrowserWorker {
     tab.status = 'loading';
     tab.error = null;
     // Match chrome.tabs: navigation returns before the page finishes loading.
-    void tab.page.goto(url, { waitUntil: 'load', timeout: 45_000 }).catch(() => {
+    // The collector separately waits for the target DOM/media fields. Unrelated
+    // images and recommendation resources must not hold the whole page open.
+    void tab.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(() => {
       tab.error = '目标视频或账号页未能加载，请在电脑专用浏览器检查登录、验证码和网络后重试';
     }).finally(() => {
       tab.status = 'complete';
@@ -108,7 +110,14 @@ export class BrowserWorker {
             .map((key) => [key, value.video[key]]));
           const music = Object.fromEntries(['play_url', 'playUrl'].filter((key) => Object.hasOwn(value.music || {}, key))
             .map((key) => [key, value.music[key]]));
-          const record = { aweme_id: expectedVideoId, video, music };
+          const statistics = {};
+          const stats = value.statistics;
+          if (stats && (!stats.aweme_id || stats.aweme_id === expectedVideoId)) {
+            for (const key of ['digg_count', 'comment_count', 'collect_count', 'share_count']) {
+              if (Number.isSafeInteger(stats[key]) && stats[key] >= 0) statistics[key] = stats[key];
+            }
+          }
+          const record = { aweme_id: expectedVideoId, video, music, statistics };
           if (Object.keys(video).length && Buffer.byteLength(JSON.stringify(record), 'utf8') <= 2 * 1024 * 1024) {
             tab.verifiedMediaRoots = [...tab.verifiedMediaRoots, record].slice(-4);
           }
@@ -163,7 +172,7 @@ export class BrowserWorker {
         const tab = this.tabs.get(target.tabId);
         if (tab.error) throw new Error(tab.error);
         // Only functions from the local audited collector are evaluated.
-        const invocationArgs = func.name === 'extractVerifiedVideoMediaSources'
+        const invocationArgs = ['extractVerifiedVideoMediaSources', 'extractVideoDetailPage'].includes(func.name)
           ? [args[0], tab.verifiedMediaRoots.filter((record) => record.aweme_id === args[0])]
           : args;
         const result = await tab.page.evaluate(`(${func.toString()})(...${JSON.stringify(invocationArgs)})`);
@@ -188,12 +197,18 @@ export class BrowserWorker {
     if (command.action === 'open') return this.open();
     if (command.action === 'status') return { running: Boolean(this.context) };
     if (command.action === 'close') { await this.close(); return { running: false }; }
-    if (!['collect', 'capture'].includes(command.action)) throw new Error('不支持的浏览器任务');
+    if (!['collect', 'capture', 'preview'].includes(command.action)) throw new Error('不支持的浏览器任务');
     const collector = await this.collector();
     if (command.action === 'collect') {
       return collector.collectAccount(command.account, command.mode, async () => {});
     }
-    return collector.captureFullVideoForAnalysis(command.payload);
+    // "preview" resolves one target-bound low-resolution source for on-demand
+    // playback and returns as soon as a usable address exists; it never
+    // downloads media and never starts a paid analysis task.
+    return collector.captureFullVideoForAnalysis({
+      ...command.payload,
+      purpose: command.action === 'preview' ? 'preview' : (command.payload?.purpose || 'analysis'),
+    });
   }
 
   async close() { if (this.context) await this.context.close(); }

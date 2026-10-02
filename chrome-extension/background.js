@@ -967,6 +967,7 @@ async function collectAll(accounts, dashboardTabId, {
         accountId: account.id,
         accountName: result.accountName,
         accountAvatarUrl: result.accountAvatarUrl,
+        accountFollowers: result.accountFollowers || null,
         accountUrl: account.url,
         mode,
         videos: result.videos.map((video) => ({ ...withoutPlayMetrics(video), capturedAt })),
@@ -1029,7 +1030,7 @@ async function keepServiceWorkerAliveUntil(task, lockToken) {
 }
 
 async function collectAccount(account, mode, onProgress) {
-  const targetCount = mode === 'initial' ? INITIAL_HISTORY_VIDEOS : LATEST_CHECK_VIDEOS;
+  const targetCount = mode === 'initial' ? INITIAL_HISTORY_VIDEOS : 1;
   const tab = await chrome.tabs.create({ url: account.url, active: false });
   if (!tab.id) throw new Error('无法创建账号采集标签页');
 
@@ -1041,7 +1042,7 @@ async function collectAccount(account, mode, onProgress) {
       throw new Error(`等待约 25 秒后仍未发现真实 /video/ 作品节点${pageLabel}，可能遇到登录、验证码、风控或页面结构变化`);
     }
 
-    const accountPage = await executeInTab(tab.id, extractAccountPageV3, [targetCount], 'MAIN');
+    let accountPage = await executeInTab(tab.id, extractAccountPageV3, [mode === 'initial' ? INITIAL_HISTORY_VIDEOS : 100000], 'MAIN');
     if (!accountPage || !Array.isArray(accountPage.videos)) {
       throw new Error('账号页没有返回可识别的数据结构');
     }
@@ -1053,12 +1054,32 @@ async function collectAccount(account, mode, onProgress) {
     if (accountPage.scoped !== true) {
       throw new Error('未能定位当前账号的作品列表，已停止以避免混入推荐或页脚视频');
     }
-    if (accountPage.videos.length === 0) {
+    if (accountPage.videos.length === 0 && mode === 'initial') {
       throw new Error('账号页没有可采集的非置顶可见视频');
     }
-
-    if (accountPage.hasMore === true && accountPage.videos.length < targetCount) {
-      throw new Error(`账号仍有更多作品，但本轮只完整读取到 ${accountPage.videos.length}/${targetCount} 条，已停止写入半成品`);
+    const historical = new Set((account.collectedHistoryIds?.length ? account.collectedHistoryIds : account.latestVideoIds || []).map(String));
+    if (mode === 'latest') {
+      // A successful previous capture is the only trusted stop marker. The
+      // current run's saved fragments never enter this set.
+      let observedDomCount = readiness.nonPinnedCount || 0;
+      while (!accountPage.videos.some((video) => historical.has(String(video.id))) && accountPage.hasMore === true) {
+        const before = accountPage.videos.length;
+        const loaded = await executeInTab(tab.id, waitForAccountVideoDom, [ACCOUNT_DOM_WAIT_MS, observedDomCount + 1]);
+        observedDomCount = Math.max(observedDomCount, loaded?.nonPinnedCount || 0);
+        accountPage = await executeInTab(tab.id, extractAccountPageV3, [100000], 'MAIN');
+        if (accountPage.videos.length <= before && accountPage.hasMore === true) {
+          throw new Error('账号仍有更多作品，但持续无法加载下一页，采集中断');
+        }
+      }
+      if (!accountPage.videos.some((video) => historical.has(String(video.id)))
+          && (accountPage.hasMore !== false || accountPage.capturedPageCount < 1)) {
+        throw new Error('未接上历史，且无法确认作品列表末尾');
+      }
+      const boundary = accountPage.videos.findIndex((video) => historical.has(String(video.id)));
+      const refreshCount = Math.min(LATEST_CHECK_VIDEOS, accountPage.videos.length);
+      accountPage.videos = accountPage.videos.slice(0, boundary < 0 ? accountPage.videos.length : Math.max(boundary + 1, refreshCount));
+    } else if (accountPage.hasMore === true && accountPage.videos.length < INITIAL_HISTORY_VIDEOS) {
+      throw new Error(`账号仍有更多作品，但本轮只完整读取到 ${accountPage.videos.length}/${INITIAL_HISTORY_VIDEOS} 条，已停止写入半成品`);
     }
 
     const pending = Array.isArray(account.pendingVideos) ? account.pendingVideos : [];
@@ -1087,7 +1108,9 @@ async function collectAccount(account, mode, onProgress) {
     return {
       accountName: accountPage.accountName || account.name || '抖音账号',
       accountAvatarUrl: accountPage.accountAvatarUrl || account.avatarUrl || null,
+      ...(accountPage.accountFollowers ? { accountFollowers: accountPage.accountFollowers } : {}),
       videos: enrichedVideos,
+      discoveredVideoIds: accountPage.videos.map((video) => String(video.id)),
     };
   } finally {
     await chrome.tabs.remove(tab.id).catch(() => {});
@@ -1724,6 +1747,62 @@ function fullMediaCandidate(
   };
 }
 
+// Preview playback wants the smallest usable encoding the platform already
+// publishes, not a locally re-compressed copy. Short edge is used as the
+// resolution measure so vertical works are not judged by pixel height alone.
+const PREVIEW_TARGET_SHORT_EDGE = 480;
+const PREVIEW_SHORT_EDGE_RANGE = [360, 540];
+const PREVIEW_FALLBACK_SHORT_EDGE = 720;
+
+function previewPlaybackCodecScore(candidate) {
+  const value = String(candidate.metadata?.codec || candidate.metadata?.contentType || '').toLowerCase();
+  return /h264|avc/.test(value) ? 3 : /av1|vp9/.test(value) ? 2 : /hevc|h265/.test(value) ? 0 : 1;
+}
+
+function previewByteSize(candidate) {
+  const metadata = candidate.metadata || {};
+  const pixels = metadata.width > 0 && metadata.height > 0 ? metadata.width * metadata.height : 0;
+  const seconds = metadata.contentLength && metadata.bitrate ? metadata.contentLength / (metadata.bitrate / 8) : 0;
+  // Prefer a smaller measured payload, then a lower bitrate. Resolution labels
+  // alone never prove a smaller transfer.
+  return metadata.contentLength || metadata.bitrate || pixels || 0;
+}
+
+function selectPreviewVideoCandidate(videoCandidates) {
+  const values = [...videoCandidates.values()].filter((candidate) => candidate.metadata.targetBound === true);
+  if (!values.length) return null;
+  const measured = values.filter(({ metadata }) => metadata.width > 0 && metadata.height > 0);
+  const select = (candidates) => [...candidates].sort((left, right) => {
+    const size = previewByteSize(left) - previewByteSize(right);
+    const codec = previewPlaybackCodecScore(right) - previewPlaybackCodecScore(left);
+    return size || codec || left.url.length - right.url.length;
+  })[0];
+  const shortEdge = ({ metadata }) => Math.min(metadata.width, metadata.height);
+  if (measured.length) {
+    const preferred = measured.filter((candidate) => {
+      const edge = shortEdge(candidate);
+      return edge >= PREVIEW_SHORT_EDGE_RANGE[0] && edge <= PREVIEW_SHORT_EDGE_RANGE[1];
+    });
+    if (preferred.length) return select(preferred);
+    const below = measured.filter((candidate) => shortEdge(candidate) < PREVIEW_SHORT_EDGE_RANGE[0]);
+    if (below.length) {
+      // Only sources smaller than the target exist; take the largest usable one.
+      return select(below.sort((left, right) => shortEdge(right) - shortEdge(left)));
+    }
+    const nearFallback = measured.filter((candidate) => shortEdge(candidate) <= PREVIEW_FALLBACK_SHORT_EDGE);
+    if (nearFallback.length) {
+      return select(nearFallback.sort((left, right) => shortEdge(left) - shortEdge(right)));
+    }
+    // Every published source is above the fallback: take the smallest one the
+    // platform actually offers and let the caller report the real limit.
+    return select(measured.sort((left, right) => shortEdge(left) - shortEdge(right)));
+  }
+  // Without measurements the platform only publishes one candidate, or the
+  // detail response omitted sizes. Report that limit instead of pretending a
+  // specific resolution was obtained.
+  return select(values);
+}
+
 function createFullVideoCapture(tabId, timeoutMs, expectedVideoId = null) {
   const videoCandidates = new Map();
   const audioCandidates = new Map();
@@ -1805,11 +1884,16 @@ function createFullVideoCapture(tabId, timeoutMs, expectedVideoId = null) {
       if (eligible.length) {
         const authority = (candidate) => candidate.metadata.sourceKind === 'structured' ? 3
           : candidate.metadata.sourceKind === 'current-source' ? 2 : 1;
+        const playbackCodec = (candidate) => {
+          const value = String(candidate.metadata.codec || candidate.metadata.contentType || '').toLowerCase();
+          return /h264|avc/.test(value) ? 3 : /av1|vp9/.test(value) ? 2 : /hevc|h265/.test(value) ? 0 : 1;
+        };
         // Use the best complete source within 1080p, in either orientation.
         // If every known source is larger, use the smallest available one.
         return eligible.sort((left, right) => (
           within1080p.length ? pixels(right) - pixels(left) : pixels(left) - pixels(right)
-        ) || (right.metadata.bitrate || 0) - (left.metadata.bitrate || 0)
+        ) || playbackCodec(right) - playbackCodec(left)
+          || (right.metadata.bitrate || 0) - (left.metadata.bitrate || 0)
           || authority(right) - authority(left)
           || (right.metadata.contentLength || 0) - (left.metadata.contentLength || 0))[0];
       }
@@ -1890,9 +1974,11 @@ async function captureFullVideoForAnalysis({
   videoId,
   accountId,
   videoUrl,
+  purpose = 'analysis',
   requireCompleteMetadata = false,
   savedVideoMetadata = null,
 }) {
+  const previewPurpose = purpose === 'preview';
   let tab;
   let capture;
   try {
@@ -1914,6 +2000,39 @@ async function captureFullVideoForAnalysis({
       [videoId],
       'MAIN',
     );
+    if (previewPurpose) {
+      // Preview address resolution ends as soon as one valid target-bound
+      // low-resolution source exists. Refresh only when the first pass found
+      // nothing, and never wait for the highest available quality.
+      let sources = structuredSources;
+      if (!sources?.videoCandidates?.length) {
+        sources = await executeUntilPageCondition(
+          tab.id,
+          extractVerifiedVideoMediaSources,
+          [videoId],
+          'MAIN',
+          DETAIL_DOM_WAIT_MS,
+          (result) => Boolean(result?.videoCandidates?.length),
+        );
+      }
+      const selectedPreview = selectPreviewVideoCandidate(
+        new Map((sources?.videoCandidates || []).map((candidate) => [candidate.url, candidate])),
+      );
+      if (!selectedPreview) {
+        throw new Error('没有取得经过目标视频校验的可用低清播放源');
+      }
+      return {
+        accountId,
+        videoId,
+        sourceVideoUrl: videoUrl,
+        purpose: 'preview',
+        video: { url: selectedPreview.url, metadata: selectedPreview.metadata },
+        page: {
+          observedVideoId: videoIdFromUrl(readiness?.url) || videoId,
+          durationSeconds: null,
+        },
+      };
+    }
     const page = await executeUntilPageCondition(
       tab.id,
       activateVerifiedVideoPlayback,
@@ -1962,6 +2081,9 @@ async function captureFullVideoForAnalysis({
     }
     if (capture.hasVideoCandidate()) capture.stop();
     const selected = await capture.promise;
+    // Media discovery only needs playback to trigger source requests. Stop it
+    // once the target source is selected so the site cannot keep playing.
+    await executeInTab(tab.id, pauseVerifiedVideoPlayback, [videoId]).catch(() => {});
     const finalPage = await executeInTab(tab.id, inspectVerifiedVideoTarget, [videoId]);
     if (!finalPage?.targetMatches) {
       throw new Error(`采集期间页面切换到了 ${finalPage?.observedVideoId || '未知视频'}，已丢弃媒体地址`);
@@ -2187,6 +2309,9 @@ function connectorEventFromCollectionEnvelope(envelope) {
           name: envelope.accountName || null,
           url: envelope.accountUrl || null,
           avatarUrl: envelope.accountAvatarUrl || null,
+          // Only a real observation of this account is forwarded; otherwise the
+          // host keeps the last saved follower values and capture time.
+          ...(envelope.accountFollowers ? { ...envelope.accountFollowers } : {}),
         },
         videos,
         snapshots: videos.map((video) => ({
@@ -2565,6 +2690,79 @@ async function extractAccountPageV3(maxVideos) {
     || document.querySelector('h1')?.textContent?.trim()
     || document.title.replace(/[-_].*$/, '').trim()
     || '抖音账号';
+  // Follower counts arrive either as an exact field on the account's own
+  // profile response or as an abbreviated label in its profile header. Neither
+  // is ever guessed from likes, following counts or unrelated page numbers.
+  const followerReading = (raw) => {
+    if (typeof raw !== 'string' || !raw.trim() || raw.length > 32) return null;
+    const text = raw.trim().replace(/\s+/g, '');
+    const match = text.match(/^(\d+(?:\.\d+)?)(亿|万|w|k)?$/i);
+    if (!match) return null;
+    const multiplier = match[2] === '亿' ? 100_000_000
+      : (match[2] === '万' || match[2] === 'w') ? 10_000
+        : match[2] === 'k' ? 1_000 : 1;
+    const exact = Number(match[1]) * multiplier;
+    if (!Number.isFinite(exact) || exact < 0 || !Number.isSafeInteger(Math.round(exact))) return null;
+    const approximate = Boolean(match[2]) || /[.]/.test(match[1]);
+    return {
+      followerCount: approximate ? null : Math.round(exact),
+      followerDisplayText: text,
+      followerCountIsApproximate: approximate,
+    };
+  };
+  const exactFollowerCount = (value) => {
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number >= 0 ? number : null;
+  };
+  // Followers are auxiliary profile data. They are read from the account's own
+  // public profile data or profile header, and only after the captured
+  // responses are available, so a zero-new-works check still refreshes them.
+  const readFollowers = () => {
+    const observedAt = new Date().toISOString();
+    let exact = null;
+    let text = null;
+    for (const entry of capturedEntries) {
+      const page = entry?.page || entry;
+      const candidates = [page?.user, page?.user_info, page?.userInfo, page?.author]
+        .filter((value) => value && typeof value === 'object');
+      for (const value of candidates) {
+        const key = value.sec_uid || value.secUid || null;
+        if (pageAccountKey && key && key !== pageAccountKey) continue;
+        const reading = exactFollowerCount(value.follower_count ?? value.followerCount);
+        if (reading !== null) { exact = reading; text = String(reading); break; }
+      }
+      if (exact !== null) break;
+    }
+    if (exact === null) {
+      const scopes = [
+        document.querySelector('[data-e2e="user-info"]'),
+        document.querySelector('[data-e2e="user-detail"]'),
+        document.querySelector('#user_detail_element'),
+      ].filter(Boolean);
+      for (const scope of scopes) {
+        const found = [...scope.querySelectorAll('*')]
+          .filter((node) => node.children.length === 0)
+          .map((node) => node.textContent || '')
+          .find((value) => /粉丝/.test(value) && /\d/.test(value));
+        if (!found) continue;
+        const label = found.match(/(?:粉丝|Fans)\s*[:：]?\s*([0-9][0-9.,]*\s*(?:亿|万|w|k)?)/i);
+        const parsed = followerReading(label?.[1]?.replace(/,/g, ''));
+        if (parsed) {
+          text = parsed.followerDisplayText;
+          exact = parsed.followerCount;
+          break;
+        }
+      }
+    }
+    if (text === null) return null;
+    const approximate = text !== String(exact ?? '');
+    return {
+      followerCount: exact,
+      followerDisplayText: text,
+      followerCountIsApproximate: approximate,
+      followerCountCapturedAt: observedAt,
+    };
+  };
   const findAccountRoot = () => {
     const candidates = [
       document.querySelector('#user_detail_element'),
@@ -2582,6 +2780,7 @@ async function extractAccountPageV3(maxVideos) {
   if (!accountRoot) {
     return {
       accountName: domAccountName,
+      accountFollowers: readFollowers(),
       videos: [],
       pageUrl: location.href,
       scoped: false,
@@ -2598,8 +2797,7 @@ async function extractAccountPageV3(maxVideos) {
   const apiOrder = [];
   let apiAccountName = null;
   let apiAccountAvatarUrl = null;
-  let hasMore = false;
-  for (const entry of capturedEntries) {
+  let hasMore = false;  for (const entry of capturedEntries) {
     const page = entry?.page || entry;
     if (!page || page.status_code !== 0 || !Array.isArray(page.aweme_list)) continue;
     hasMore = page.has_more === 1;
@@ -2667,7 +2865,8 @@ async function extractAccountPageV3(maxVideos) {
     }
     return null;
   };
-  const isPinnedCard = (card) => Boolean(card.querySelector('[aria-label*="置顶"]'))
+  const isPinnedCard = (card) => Boolean(card.getAttribute('aria-label')?.includes('置顶')
+    || card.querySelector('[aria-label*="置顶"]'))
     || /(^|\n)\s*置顶\s*(\n|$)/.test(card.innerText || card.textContent || '');
 
   const domItems = new Map();
@@ -2738,6 +2937,7 @@ async function extractAccountPageV3(maxVideos) {
     const item = apiItems.get(id);
     const apiVideo = fromApi(item);
     const domVideo = domItems.get(id);
+    seen.add(id);
     if (apiVideo.isPinned || domVideo?.isPinned) continue;
     if (domVideo) {
       apiVideo.coverUrl ||= domVideo.coverUrl;
@@ -2746,7 +2946,6 @@ async function extractAccountPageV3(maxVideos) {
       apiVideo.likeCount ??= domVideo.likeCount;
       apiVideo.dataComplete = completePublicData(apiVideo);
     }
-    seen.add(id);
     videos.push(apiVideo);
     if (videos.length >= maxVideos) break;
   }
@@ -2777,8 +2976,10 @@ async function extractAccountPageV3(maxVideos) {
     videos.push(video);
   }
 
+  const followers = readFollowers();
   return {
     accountName: apiAccountName || domAccountName,
+    ...(followers ? { accountFollowers: followers } : {}),
     accountAvatarUrl: apiAccountAvatarUrl || urlFrom(
       [...document.querySelectorAll('img')]
         .find((image) => image.getAttribute('alt') === `${domAccountName}头像`)?.currentSrc,
@@ -3045,7 +3246,7 @@ function waitForVideoDetailDom() {
   return inspect();
 }
 
-function extractVideoDetailPage(expectedVideoId = null) {
+function extractVideoDetailPage(expectedVideoId = null, receivedMediaRoots = []) {
   const requestedVideoId = /^\d+$/.test(String(expectedVideoId || '')) ? String(expectedVideoId) : null;
   const observedVideoId = location.pathname.match(/\/video\/(\d+)/)?.[1]
     || new URL(location.href).searchParams.get('modal_id')
@@ -3129,13 +3330,24 @@ function extractVideoDetailPage(expectedVideoId = null) {
     }
     return null;
   })();
-  const metricFrom = (selectors) => {
+  const metricFrom = (selectors, statisticKey = null) => {
     for (const selector of selectors) {
       const element = document.querySelector(selector);
       if (!element) continue;
       for (const value of [element.getAttribute('aria-label'), element.getAttribute('title'), element.textContent]) {
         const parsed = numberOrNull(value);
         if (parsed !== null) return parsed;
+      }
+    }
+    // Zero-count buttons can display only an action label such as "分享".
+    // Reuse an explicit count from this exact video's already-received public
+    // response; a label or a missing response alone must remain unknown.
+    if (statisticKey && targetVideoId && Array.isArray(receivedMediaRoots)) {
+      for (let index = receivedMediaRoots.length - 1; index >= 0; index -= 1) {
+        const record = receivedMediaRoots[index];
+        if (record?.aweme_id !== targetVideoId) continue;
+        const count = record.statistics?.[statisticKey];
+        if (Number.isSafeInteger(count) && count >= 0) return count;
       }
     }
     return null;
@@ -3234,20 +3446,20 @@ function extractVideoDetailPage(expectedVideoId = null) {
     likeCount: metricFrom([
       '[data-e2e="video-player-digg"]',
       '[data-e2e="video-digg"]',
-    ]),
+    ], 'digg_count'),
     commentCount: metricFrom([
       '[data-e2e="feed-comment-icon"]',
       '[data-e2e="video-player-comment"]',
       '[data-e2e="video-comment"]',
-    ]),
+    ], 'comment_count'),
     favoriteCount: metricFrom([
       '[data-e2e="video-player-collect"]',
       '[data-e2e="video-collect"]',
-    ]),
+    ], 'collect_count'),
     shareCount: metricFrom([
       '[data-e2e="video-player-share"]',
       '[data-e2e="video-share"]',
-    ]),
+    ], 'share_count'),
     publishedAt: parsePublishedAt(publishedAtText),
     publishedAtText,
     durationSeconds: parseDurationSeconds(durationText)
@@ -3319,6 +3531,8 @@ function activateVerifiedVideoPlayback(expectedVideoId) {
   }
   video.muted = true;
   video.preload = 'auto';
+  // A long media lookup must not let the site's player advance through its feed.
+  video.loop = true;
   // See activateVideoPlayback: do not let a background-tab play() promise
   // consume the whole page-script deadline.
   try {
@@ -3342,6 +3556,18 @@ function activateVerifiedVideoPlayback(expectedVideoId) {
     videoHeight: Number(video.videoHeight) || null,
     durationSeconds: Number.isFinite(duration) && duration > 0 ? duration : null,
   };
+}
+
+function pauseVerifiedVideoPlayback(expectedVideoId) {
+  const currentId = location.pathname.match(/\/video\/(\d+)/)?.[1]
+    || new URL(location.href).searchParams.get('modal_id');
+  if (currentId !== expectedVideoId) return false;
+  const container = [...document.querySelectorAll('[data-e2e="player-container"]')]
+    .find((candidate) => candidate.classList.contains(`video_${expectedVideoId}`));
+  const video = container?.querySelector('video')
+    || (document.querySelectorAll('video').length === 1 ? document.querySelector('video') : null);
+  video?.pause();
+  return Boolean(video);
 }
 
 function inspectVerifiedVideoTarget(expectedVideoId) {

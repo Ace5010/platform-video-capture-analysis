@@ -33,6 +33,7 @@ from .config import HostConfig
 from .database import CANONICAL_JOB_TYPES, Database, utc_now
 from .douyin_links import resolve_douyin_video_link
 from .media import cleanup_stale_temp
+from .preview import PreviewError, PreviewManager
 from .qwen import QwenClient, analysis_section_status
 from .remote import GATEWAY_PORT, RemoteConnection, TunnelProcess
 from .security import (
@@ -76,12 +77,18 @@ def _private_dashboard_origin(origin: str, dashboard_port: int) -> bool:
         return False
     if parsed.username or parsed.password or parsed.path not in ("", "/") or parsed.query or parsed.fragment:
         return False
-    if hostname in {"localhost", "127.0.0.1", "::1", socket.gethostname().lower(), socket.getfqdn().lower()}:
+    # Resolve known local names and numeric addresses before any DNS lookup.
+    # Building a set containing getfqdn() eagerly performs reverse DNS even
+    # for localhost; a disconnected VPN/DNS server can then stall every API
+    # request (and its CORS response) beyond the browser's connection timeout.
+    if hostname in {"localhost", "127.0.0.1", "::1"}:
         return True
     try:
         address = ipaddress.ip_address(hostname)
     except ValueError:
-        return False
+        if hostname == socket.gethostname().lower():
+            return True
+        return hostname == socket.getfqdn().lower()
     return address.is_private or address.is_loopback
 
 
@@ -120,8 +127,11 @@ class HostHTTPServer(ThreadingHTTPServer):
         self.tunnel: TunnelProcess | None = None
         self.remote_error: str | None = None
         self.browser: BrowserManager | None = None
+        self.previews: PreviewManager | None = None
 
     def server_close(self) -> None:
+        if self.previews:
+            self.previews.shutdown()
         if self.browser and not self.remote_connection:
             self.browser.shutdown()
         super().server_close()
@@ -381,7 +391,17 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._session()
-            if path == "/api/state":
+            if path.startswith("/api/previews/"):
+                status_match = re.fullmatch(r"/api/previews/(\d{1,32})/status", path)
+                if not status_match:
+                    self._serve_preview(path, head=False)
+                elif not self._known_video(status_match.group(1)):
+                    raise ApiError(HTTPStatus.NOT_FOUND, "作品记录不存在")
+                else:
+                    # A plain status read never opens a detail page by itself.
+                    self._send_json(HTTPStatus.OK, {"ok": True,
+                        **self._preview_manager().status(status_match.group(1))})
+            elif path == "/api/state":
                 state = self.database.state()
                 if self.server.browser:
                     state["connector"] = self.server.browser.status()
@@ -427,6 +447,139 @@ class HostRequestHandler(BaseHTTPRequestHandler):
         except Exception as error:
             print(f"[host-service] GET 未预期错误：{type(error).__name__}", flush=True)
             self._error(ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "主机服务发生未预期错误"))
+
+    def do_HEAD(self) -> None:
+        try:
+            self._require_gateway()
+            self._require_browser_origin()
+            self._session()
+            path = urlsplit(self.path).path
+            if path.startswith("/api/previews/"):
+                self._serve_preview(path, head=True)
+            else:
+                raise ApiError(HTTPStatus.NOT_FOUND, "接口不存在")
+        except ApiError as error:
+            self.send_response(error.status)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
+    def _preview_manager(self) -> PreviewManager:
+        manager = self.server.previews
+        if manager is None:
+            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "在线播放服务未启动")
+        return manager
+
+    def _known_video(self, video_id: str) -> bool:
+        if not re.fullmatch(r"\d{1,32}", video_id or ""):
+            return False
+        return bool(self.database.get_video(video_id))
+
+    def _parse_range(self, header: str | None) -> tuple[str, int, int | None]:
+        """Accept only the single byte ranges a media element actually sends."""
+        if not header:
+            return "full", 0, None
+        parsed = re.fullmatch(r"bytes=(\d*)-(\d*)", header.strip())
+        if not parsed or (not parsed.group(1) and not parsed.group(2)):
+            return "unsatisfied", 0, None
+        if not parsed.group(1):
+            suffix = int(parsed.group(2))
+            if suffix <= 0:
+                return "unsatisfied", 0, None
+            return "suffix", suffix, None
+        start = int(parsed.group(1))
+        end = int(parsed.group(2)) if parsed.group(2) else None
+        if end is not None and end < start:
+            return "unsatisfied", 0, None
+        return "bounded", start, end
+
+    def _serve_preview(self, path: str, *, head: bool) -> None:
+        match = re.fullmatch(r"/api/previews/(\d{1,32})/([a-f0-9]{8,64})/media", path)
+        if not match:
+            raise ApiError(HTTPStatus.NOT_FOUND, "播放接口不存在")
+        video_id, generation = match.group(1), match.group(2)
+        if not self._known_video(video_id):
+            raise ApiError(HTTPStatus.NOT_FOUND, "作品记录不存在")
+        kind, start, end = self._parse_range(self.headers.get("Range"))
+        if kind == "unsatisfied":
+            raise ApiError(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE, "无效的媒体读取范围")
+        manager = self._preview_manager()
+        try:
+            # A suffix range needs the total length first; the manager resolves
+            # it from the verified source before any client bytes are sent.
+            if kind == "suffix":
+                _, _, _, total, body = manager.play(video_id, generation, 0, 0)
+                body.close()
+                if start >= total:
+                    self._range_unsatisfied(total)
+                    return
+                start = max(0, total - start)
+                end = None
+            source, resolved_start, resolved_end, total, body = manager.play(video_id, generation, start, end)
+        except PreviewError as error:
+            if error.status == 416:
+                self._range_unsatisfied(self._known_total(video_id, generation))
+                return
+            raise ApiError(error.status, str(error))
+        length = resolved_end - resolved_start + 1
+        status = HTTPStatus.PARTIAL_CONTENT if kind != "full" else HTTPStatus.OK
+        self.send_response(status)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if kind != "full":
+            self.send_header("Content-Range", f"bytes {resolved_start}-{resolved_end}/{total}")
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cross-Origin-Resource-Policy", "same-site")
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Vary", "Origin")
+        self.end_headers()
+        if head:
+            self._close_preview_body(body)
+            return
+        sent = 0
+        try:
+            for chunk in body:
+                if not chunk:
+                    continue
+                self.wfile.write(chunk)
+                sent += len(chunk)
+                if sent >= length:
+                    break
+        except (BrokenPipeError, ConnectionResetError):
+            # The player left or seeked elsewhere: stop reading upstream instead
+            # of finishing the transfer nobody is watching.
+            pass
+        finally:
+            self._close_preview_body(body)
+
+    def _known_total(self, video_id: str, generation: str) -> int:
+        """Best available total length for a 416 answer; 0 only if unknown."""
+        source = self._preview_manager().source_for(video_id, generation)
+        if source is None:
+            return 0
+        entry = self._preview_manager().cache.entry(
+            self._preview_manager()._cache_key(video_id, source.generation))
+        total = entry.total_bytes if entry is not None else None
+        return int(total or source.content_length or 0)
+
+    @staticmethod
+    def _close_preview_body(body: Any) -> None:
+        close = getattr(body, "close", None)
+        if callable(close):
+            close()
+
+    def _range_unsatisfied(self, size: int) -> None:
+        self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+        self.send_header("Content-Range", f"bytes */{size}")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
 
     def do_POST(self) -> None:
         try:
@@ -503,6 +656,21 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                 if len(actual["accounts"]) < counts["accounts"] or len(actual["videos"]) < counts["videos"]:
                     raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "迁移计数校验失败；旧浏览器数据未删除")
                 self._send_json(HTTPStatus.OK, {"ok": True, "counts": counts, "backupCreated": True})
+            elif path == "/api/previews/prepare":
+                # Registering a preview only resolves a low-resolution address for
+                # already-saved works. It never downloads media, never touches the
+                # analysis pipeline and never calls a paid model.
+                raw_ids = payload.get("videoIds")
+                if not isinstance(raw_ids, list) or not raw_ids:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "videoIds 必须是非空数组")
+                candidate_ids = list(dict.fromkeys(str(value) for value in raw_ids))
+                if len(candidate_ids) > self.config.preview_max_prepare_ids:
+                    raise ApiError(HTTPStatus.BAD_REQUEST,
+                                   f"单次最多准备 {self.config.preview_max_prepare_ids} 个播放源")
+                if not all(self._known_video(video_id) for video_id in candidate_ids):
+                    raise ApiError(HTTPStatus.NOT_FOUND, "作品记录不存在")
+                results = self._preview_manager().prepare(candidate_ids)
+                self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "sources": results})
             elif path == "/api/accounts/ack-updates":
                 accounts = payload.get("accounts")
                 if not isinstance(accounts, list):
@@ -799,6 +967,9 @@ def create_server(config: HostConfig | None = None) -> HostHTTPServer:
     if not active_config.testing:
         server.browser = BrowserManager(active_config, database, analysis)
         server.browser.start()
+        # On-demand playback resolves a source through the same dedicated
+        # browser, so both listeners share one manager and one memory budget.
+        server.previews = PreviewManager(active_config, database, server.browser)
     return server
 
 
@@ -807,6 +978,9 @@ def create_remote_gateway(host: HostHTTPServer, connection: RemoteConnection, po
         ("127.0.0.1", port), host.config, host.database, host.secrets, host.analysis, connection,
     )
     gateway.browser = host.browser
+    # One preview manager serves both listeners, so a source resolved on the
+    # local network can be streamed through the remote gateway and back.
+    gateway.previews = host.previews
     return gateway
 
 

@@ -35,6 +35,22 @@ CANONICAL_JOB_TYPES = {
 }
 ACTIVE_JOB_STATUSES = ("queued", "claimed", "running")
 LINK_VIDEO_ACCOUNT_ID = "__video_link_analysis__"
+# A check-discovered video stays in the “新增检查视频” entry for a fixed
+# rolling window. This limits browsing eligibility only; it never expires the
+# saved video, snapshot, transcript, analysis or cost records.
+DISCOVERY_TTL_SECONDS = 259_200
+# Fractional spacing between works found in one check, so every record keeps a
+# distinct discovery time and the feed order is stable and reproducible. The
+# step is far smaller than one second, so separate checks never interleave.
+DISCOVERY_ORDER_STEP = 0.000001
+# New records are stamped this far behind the observed server time, which keeps
+# them strictly after older records without ever claiming a future time.
+DISCOVERY_CLOCK_BACKOFF = 0.5
+DISCOVERY_ORIGIN_MANUAL_LATEST = "manual_latest"
+# Account keys replaced together whenever a real follower observation arrives,
+# so an approximate reading can never keep an older exact integer alive.
+FOLLOWER_FIELD_GROUP = ("followerCount", "followerDisplayText",
+                        "followerCountIsApproximate", "followerCountCapturedAt")
 
 
 def utc_now() -> str:
@@ -186,6 +202,16 @@ class Database:
                     updated_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_videos_account ON videos(account_id, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS video_media (
+                    video_id TEXT PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    relative_path TEXT,
+                    size_bytes INTEGER,
+                    sha256 TEXT,
+                    error TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_video_media_status ON video_media(status, updated_at);
                 CREATE TABLE IF NOT EXISTS snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
@@ -238,6 +264,17 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_analysis_runs_video_created
                     ON analysis_runs(video_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS collection_discoveries (
+                    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                    video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+                    discovered_at INTEGER NOT NULL,
+                    origin_job_id TEXT,
+                    origin_event_id TEXT,
+                    origin TEXT NOT NULL DEFAULT 'manual_latest',
+                    PRIMARY KEY(account_id, video_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_collection_discoveries_time
+                    ON collection_discoveries(discovered_at DESC);
                 """
             )
             connector_columns = {row["name"] for row in connection.execute("PRAGMA table_info(connectors)")}
@@ -254,6 +291,10 @@ class Database:
             if "claim_token" not in job_columns:
                 connection.execute("ALTER TABLE jobs ADD COLUMN claim_token TEXT")
             analysis_run_columns = {row["name"] for row in connection.execute("PRAGMA table_info(analysis_runs)")}
+            # Browsing no longer keeps local video copies, so the retired media
+            # download registry is dropped once and never recreated. Account,
+            # video, snapshot, transcript, analysis and cost rows stay intact.
+            connection.execute("DROP TABLE IF EXISTS video_media")
             if "transcript_raw" not in analysis_run_columns:
                 connection.execute("ALTER TABLE analysis_runs ADD COLUMN transcript_raw TEXT")
             if "usage_json" not in analysis_run_columns:
@@ -541,13 +582,43 @@ class Database:
         return False
 
     @staticmethod
+    def _merge_follower_observation(account: dict[str, Any], incoming: dict[str, Any]) -> None:
+        """Replace the whole follower group, or keep the previous observation.
+
+        ``_upsert_account`` skips ``None`` values, so a verified exact count could
+        otherwise survive next to a new approximate text. Only a payload that
+        carries its own capture time counts as a real observation.
+        """
+        captured = incoming.get("followerCountCapturedAt")
+        if not isinstance(captured, str) or not captured.strip():
+            return
+        previous = account.get("followerCountCapturedAt")
+        if isinstance(previous, str) and previous.strip() and previous > captured:
+            # A delayed status update still carrying an older account snapshot
+            # must never overwrite a newer follower reading.
+            return
+        count = incoming.get("followerCount")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            count = None
+        display = incoming.get("followerDisplayText")
+        display = display.strip()[:64] if isinstance(display, str) and display.strip() else None
+        account.update({
+            "followerCount": count,
+            "followerDisplayText": display,
+            "followerCountIsApproximate": incoming.get("followerCountIsApproximate") is True,
+            "followerCountCapturedAt": captured.strip(),
+        })
+
+    @staticmethod
     def _upsert_account(connection: sqlite3.Connection, raw: dict[str, Any]) -> dict[str, Any]:
         incoming = dict(_object(raw, "account"))
         account_id = _identifier(incoming.get("id"), "account.id")
         current = connection.execute("SELECT data_json FROM accounts WHERE id=?", (account_id,)).fetchone()
         account = json.loads(current["data_json"]) if current else {}
         account.update({key: value for key, value in incoming.items()
-                        if value is not None or key in ("currentSyncMode", "collectionError")})
+                        if (value is not None or key in ("currentSyncMode", "collectionError"))
+                        and key not in FOLLOWER_FIELD_GROUP})
+        Database._merge_follower_observation(account, incoming)
         platform = str(account.get("platform") or "douyin")[:64]
         url = str(account.get("url") or "")[:4096]
         name = str(account.get("name") or "待识别账号")[:512]
@@ -684,6 +755,9 @@ class Database:
                         (LINK_VIDEO_ACCOUNT_ID, _compact_json(video), now, video_id),
                     )
             removed = connection.execute("DELETE FROM accounts WHERE id=?", (account_id,)).rowcount
+            # Removing a monitored account also clears its 72-hour entries so no
+            # dangling rail count survives. Works and analyses are not touched.
+            self._remove_account_discoveries(connection, account_id)
         return bool(removed)
 
     @staticmethod
@@ -770,6 +844,11 @@ class Database:
                     "firstSeenAt": json.loads(row["data_json"]).get("firstSeenAt") or row["created_at"]}))
                 for row in video_rows
             ]
+            # Browsing prepares bytes on demand from the platform CDN, so a
+            # missing local copy is the normal state rather than an error.
+            for _, video in all_videos:
+                video["mediaStatus"] = "online"
+                video["mediaError"] = None
             runs_by_video: dict[str, list[dict[str, Any]]] = {}
             for row in connection.execute(
                 "SELECT id,job_id,video_id,status,usage_json,error,created_at,updated_at "
@@ -787,11 +866,15 @@ class Database:
                     (LINK_VIDEO_ACCOUNT_ID,),
                 )
             ]
+        discoveries, discovery_counts = self.recent_discoveries()
         return {
             "accounts": accounts,
             "videos": videos,
             "linkVideos": link_videos,
             "snapshots": snapshots,
+            "discoveries": discoveries,
+            "discoveryAccountCounts": discovery_counts,
+            "discoveryWindowSeconds": DISCOVERY_TTL_SECONDS,
             "connector": self.connector_status(),
         }
 
@@ -826,6 +909,8 @@ class Database:
             if not row:
                 return None
             video = _normalize_video_transcript(json.loads(row["data_json"]))
+            video["mediaStatus"] = "online"
+            video["mediaError"] = None
             run_rows = connection.execute(
                 "SELECT id,job_id,video_id,status,usage_json,error,created_at,updated_at "
                 "FROM analysis_runs WHERE video_id=? ORDER BY created_at DESC,id DESC",
@@ -833,6 +918,83 @@ class Database:
             ).fetchall()
             video["analysisRuns"] = [_analysis_run_dict(run) for run in run_rows]
         return video
+
+    def _remove_account_discoveries(self, connection: sqlite3.Connection, account_id: str) -> None:
+        connection.execute("DELETE FROM collection_discoveries WHERE account_id=?", (account_id,))
+
+    @staticmethod
+    def _record_discoveries(
+        connection: sqlite3.Connection,
+        account_id: str,
+        video_ids: list[str],
+        *,
+        discovered_at_epoch: int,
+        origin_job_id: str | None = None,
+        origin_event_id: str | None = None,
+        origin: str = DISCOVERY_ORIGIN_MANUAL_LATEST,
+    ) -> int:
+        """Register newly found works in the rolling 72-hour browsing window.
+        The insert order matches the collection order so same-second works keep a
+        deterministic feed. Timestamps stay at or before the observed server
+        time, yet always after everything already registered for this account,
+        which the window comparison and the "keep the first discovery" rule both
+        rely on. Conflict handling deliberately keeps the first valid discovery
+        time: a repeated event, a retry or a later re-check of the same work must
+        not extend or replace its existing window.
+        """
+        inserted = 0
+        previous = connection.execute(
+            "SELECT MAX(discovered_at) AS latest FROM collection_discoveries WHERE account_id=?",
+            (account_id,)).fetchone()
+        latest = previous["latest"] if previous else None
+        # Stay clearly behind the wall clock so no record can look like it was
+        # discovered in the future, while remaining after older records.
+        base = max(discovered_at_epoch - DISCOVERY_CLOCK_BACKOFF,
+                   (float(latest) if latest is not None else 0.0) + DISCOVERY_ORDER_STEP)
+        for position, video_id in enumerate(video_ids):
+            if not str(video_id).isdigit():
+                continue
+            cursor = connection.execute(
+                "INSERT INTO collection_discoveries(account_id,video_id,discovered_at,origin_job_id,origin_event_id,origin) "
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(account_id,video_id) DO NOTHING",
+                (account_id, video_id, base - position * DISCOVERY_ORDER_STEP,
+                 origin_job_id, origin_event_id, origin),
+            )
+            inserted += cursor.rowcount
+        return inserted
+
+    def recent_discoveries(self, window_seconds: int = DISCOVERY_TTL_SECONDS,
+                           now_epoch: int | None = None) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        """Effective discoveries plus per-account counts, using one predicate."""
+        now_epoch = int(time.time()) if now_epoch is None else int(now_epoch)
+        window_seconds = max(1, int(window_seconds))
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                "SELECT d.account_id,d.video_id,d.discovered_at "
+                "FROM collection_discoveries d JOIN videos v ON v.id=d.video_id "
+                "JOIN accounts a ON a.id=d.account_id AND a.id!=? "
+                "WHERE d.discovered_at<=? AND d.discovered_at>? "
+                "ORDER BY d.discovered_at DESC, d.video_id DESC",
+                (LINK_VIDEO_ACCOUNT_ID, now_epoch, now_epoch - window_seconds),
+            ).fetchall()
+        items = [{
+            "accountId": str(row["account_id"]),
+            "videoId": str(row["video_id"]),
+            "discoveredAt": datetime.fromtimestamp(row["discovered_at"], timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "expiresAt": datetime.fromtimestamp(row["discovered_at"] + window_seconds, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        } for row in rows]
+        counts: dict[str, int] = {}
+        for item in items:
+            counts[item["accountId"]] = counts.get(item["accountId"], 0) + 1
+        return items, counts
+
+    def purge_expired_discoveries(self, window_seconds: int = DISCOVERY_TTL_SECONDS) -> int:
+        """Lazy cleanup of expired links only; works and analyses are untouched."""
+        cutoff = int(time.time()) - max(1, int(window_seconds))
+        with self.transaction() as connection:
+            return connection.execute(
+                "DELETE FROM collection_discoveries WHERE discovered_at<=?", (cutoff,)
+            ).rowcount
 
     def normalize_saved_transcripts(self) -> int:
         """Persist punctuation on transcripts created before restoration was enabled."""
@@ -1256,6 +1418,8 @@ class Database:
                 if payload.get("pendingVideos"):
                     raise ValueError("不允许提交未完成的采集结果")
                 account_values = payload.get("accounts") or ([payload["account"]] if isinstance(payload.get("account"), dict) else [])
+                pending_discoveries: list[tuple[str, list[str]]] = []
+                discovered_at_epoch = int(time.time())
                 for account in account_values:
                     normalized = dict(_object(account, "account"))
                     account_id = _identifier(normalized.get("id"), "account.id")
@@ -1271,6 +1435,11 @@ class Database:
                         if str(video.get("accountId") or payload.get("accountId") or "") == account_id
                     ]
                     video_ids = list(dict.fromkeys(str(video.get("id")) for video in account_videos if video.get("id")))
+                    discovered_ids = [str(value) for value in payload.get("discoveredVideoIds") or video_ids if str(value).isdigit()]
+                    if discovered_ids:
+                        normalized["collectedHistoryIds"] = list(dict.fromkeys(
+                            discovered_ids + [str(value) for value in normalized.get("collectedHistoryIds") or normalized.get("latestVideoIds") or []]
+                        ))
                     if video_ids:
                         normalized["latestVideoIds"] = video_ids[:5]
                     if payload.get("mode") in ("initial", "archive", "archive30"):
@@ -1285,12 +1454,23 @@ class Database:
                                 (account_id, *video_ids),
                             )
                         } if video_ids else set()
+                        # Only works that were absent before this write count as
+                        # newly discovered. Snapshot-only changes never qualify.
                         new_video_ids = [video_id for video_id in video_ids if video_id not in existing_video_ids]
                         normalized["latestCheckNewVideoCount"] = len(new_video_ids)
                         normalized["latestCheckNewVideoIds"] = new_video_ids
+                        pending_discoveries.append((account_id, new_video_ids))
                     self._upsert_account(connection, normalized)
                 for video in payload.get("videos") or []:
                     self._upsert_video(connection, _object(video, "video"))
+                # Discovery rows reference the work row, so they are inserted
+                # only after every work of this event is saved.
+                for discovery_account_id, discovery_video_ids in pending_discoveries:
+                    self._record_discoveries(
+                        connection, discovery_account_id, discovery_video_ids,
+                        discovered_at_epoch=discovered_at_epoch,
+                        origin_job_id=job_id, origin_event_id=event_id,
+                    )
                 snapshots = payload.get("snapshots")
                 if snapshots is None:
                     snapshots = []

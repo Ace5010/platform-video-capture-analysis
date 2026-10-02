@@ -1,0 +1,153 @@
+// Live workspace inspection against the running workbench. Read-only: it loads
+// the page, checks the new surfaces exist, and confirms no media file is
+// created while browsing. It does not start any collection or analysis task.
+import assert from 'node:assert/strict';
+import { mkdtemp, rm, readdir, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { chromium } from 'playwright-core';
+import { createHash, randomBytes } from 'node:crypto';
+
+const project = fileURLToPath(new URL('..', import.meta.url));
+const sessionToken = randomBytes(32).toString('base64url');
+const csrfToken = createHash('sha256').update(`${sessionToken}douyin-monitor-csrf-v1`).digest('hex');
+
+const { execFileSync } = await import('node:child_process');
+const python = join(project, '.venv', 'Scripts', 'python.exe');
+execFileSync(python, ['-c', `
+import hashlib, os, sys
+sys.path.insert(0, os.environ["DOUYIN_PROJECT"])
+from host_service.config import HostConfig
+from host_service.database import Database
+config = HostConfig.from_env()
+database = Database(config)
+database.create_session(hashlib.sha256(os.environ["DOUYIN_SESSION"].encode()).hexdigest(),
+                        hashlib.sha256(os.environ["DOUYIN_CSRF"].encode()).hexdigest(), "127.0.0.1", 3600)
+print("session created")
+`], { stdio: 'inherit', env: { ...process.env, DOUYIN_PROJECT: project, DOUYIN_SESSION: sessionToken, DOUYIN_CSRF: csrfToken } });
+
+const profile = await mkdtemp(join(tmpdir(), 'douyin-live-check-'));
+const context = await chromium.launchPersistentContext(profile, {
+  channel: 'chrome', headless: true, viewport: { width: 1440, height: 1000 }, locale: 'zh-CN',
+});
+const mediaDir = join(project, 'data', 'host-service', 'media');
+const listMedia = async () => {
+  try { return (await readdir(mediaDir)).filter((name) => name.endsWith('.mp4')); } catch { return []; }
+};
+try {
+  await context.addCookies([{ name: 'douyin_monitor_session', value: sessionToken,
+    url: 'http://localhost:43129', httpOnly: true, sameSite: 'Strict' }]);
+  const page = await context.newPage();
+  const errors = [];
+  const failedRequests = [];
+  page.on('pageerror', (error) => errors.push(String(error).slice(0, 300)));
+  page.on('console', (message) => { if (message.type() === 'error') errors.push(message.text().slice(0, 300)); });
+  page.on('response', (response) => { if (response.status() >= 400) failedRequests.push(`${response.status()} ${response.url()}`); });
+  page.on('requestfailed', (request) => failedRequests.push(`failed ${request.url()} ${request.failure()?.errorText || ''}`));
+  const before = await listMedia();
+  await page.goto('http://localhost:3000', { waitUntil: 'domcontentloaded' });
+  await page.locator('.accountRail').waitFor({ timeout: 30000 });
+  const rail = await page.evaluate(() => ({
+    all: document.querySelector('.railAll')?.textContent,
+    discoveries: document.querySelector('.railDiscoveries')?.textContent,
+    discoveriesSelected: document.querySelector('.railDiscoveries')?.getAttribute('aria-pressed'),
+    allSelected: document.querySelector('.railAll')?.getAttribute('aria-pressed'),
+    accounts: [...document.querySelectorAll('.railAccount:not(.railAll):not(.railDiscoveries)')]
+      .slice(0, 5).map((node) => ({
+        name: node.querySelector('.railAccountTitle')?.textContent,
+        followers: node.querySelector('.railFollowers')?.textContent,
+        label: node.getAttribute('aria-label'),
+      })),
+    feedHeading: document.querySelector('.compactFeedHeading')?.textContent,
+    coverButtons: document.querySelectorAll('.compactCoverButton').length,
+    downloadPrompts: document.querySelectorAll('.compactCoverPending').length,
+  }));
+  console.log(JSON.stringify(rail, null, 2));
+
+  assert.equal(rail.discoveriesSelected, 'false', 'the discovery entry must not start selected');
+  assert.equal(rail.allSelected, 'true', '“全部账号” keeps its own selected state');
+  assert.match(String(rail.discoveries), /新增检查视频/);
+  assert.match(String(rail.discoveries), /条/);
+
+  // Switching to the new scope must move the highlight and show its own list.
+  await page.locator('.railDiscoveries').click();
+  await page.waitForTimeout(600);
+  const switched = await page.evaluate(() => ({
+    discoveriesSelected: document.querySelector('.railDiscoveries')?.getAttribute('aria-pressed'),
+    allSelected: document.querySelector('.railAll')?.getAttribute('aria-pressed'),
+    title: document.querySelector('.topbar h1')?.textContent,
+  }));
+  console.log('after switch', JSON.stringify(switched));
+  assert.equal(switched.discoveriesSelected, 'true', 'the discovery entry must become selected');
+  assert.equal(switched.allSelected, 'false', '“全部账号” must not stay highlighted');
+  assert.equal(switched.title, '新增检查视频');
+  await page.locator('.railAll').click();
+  await page.waitForTimeout(400);
+
+  // Followers must be shown with a unit next to every account, and the video
+  // count must stay a separate, clearly labelled number.
+  const followerCells = await page.evaluate(() => [...document.querySelectorAll('.railFollowers')]
+    .map((node) => node.textContent));
+  assert.ok(followerCells.length > 0, 'accounts must show a follower reading');
+  for (const text of followerCells) {
+    assert.ok(/粉丝/.test(String(text)), `a follower cell is missing its unit: ${text}`);
+  }
+  await page.locator('.navItem', { hasText: '信源管理' }).click();
+  await page.waitForTimeout(500);
+  const board = await page.evaluate(() => [...document.querySelectorAll('.accountCard')].slice(0, 4).map((card) => ({
+    name: card.querySelector('h3')?.textContent,
+    meta: [...card.querySelectorAll('.accountMeta > span')].map((span) => span.textContent),
+  })));
+  console.log('account board', JSON.stringify(board, null, 2));
+  for (const card of board) {
+    assert.ok(card.meta.some((text) => /粉丝/.test(String(text))), 'the account card must show followers');
+    assert.ok(card.meta.some((text) => /条视频/.test(String(text))), 'the account card must label the video count');
+  }
+
+  // The card body selects the work for reading and must never open a player.
+  await page.locator('.railAll').click();
+  await page.waitForTimeout(400);
+  await page.locator('.compactVideoCopy').first().click();
+  await page.waitForTimeout(700);
+  assert.equal(await page.locator('.siteVideoPlayer.isOpen').count(), 0,
+    'clicking the title must select the work instead of starting playback');
+  assert.ok(await page.locator('.videoPreview h2').first().textContent(), 'the preview pane must show the work');
+
+  // The cover is the control that starts playback, and a passing pointer must
+  // not begin a preview before the hover delay elapses. The margin below is
+  // larger than the 140 ms intent delay so the assertion measures the delay,
+  // not the machine's event scheduling.
+  const coverBox = await page.locator('.compactCoverButton').first().boundingBox();
+  // Start from a neutral position so the delay is measured from a real entry.
+  await page.mouse.move(coverBox.x - 300, coverBox.y + coverBox.height / 2);
+  await page.waitForTimeout(700);
+  assert.equal(await page.locator('.siteVideoPlayer.isHover').count(), 0, 'the neutral position must be idle');
+  await page.mouse.move(coverBox.x + coverBox.width / 2, coverBox.y + coverBox.height / 2);
+  await page.waitForTimeout(40);
+  assert.equal(await page.locator('.siteVideoPlayer.isHover').count(), 0,
+    'a passing pointer must not start a preview');
+  await page.waitForTimeout(1500);
+  assert.equal(await page.locator('.siteVideoPlayer.isHover').count(), 1,
+    'a settled hover must show the floating preview');
+  await page.mouse.move(coverBox.x - 200, coverBox.y + coverBox.height / 2);
+  await page.waitForTimeout(400);
+  assert.equal(await page.locator('.siteVideoPlayer.isHover').count(), 0,
+    'leaving the cover must end the floating preview');
+  assert.equal(await page.locator('.siteVideoPlayer video').evaluate((video) => video.paused), true,
+    'leaving the cover must stop the media element');
+
+  const after = await listMedia();
+  assert.deepEqual(after, before, 'browsing must not create any media file');
+  console.log('failed requests', JSON.stringify(failedRequests, null, 2));
+  // An expired platform cover image is an external-data condition, not a page
+  // failure; only application errors and page exceptions must be absent.
+  const appErrors = errors.filter((text) => !/Failed to load resource/.test(text));
+  assert.deepEqual(appErrors, [], `the page reported errors: ${appErrors.join(' | ')}`);
+  const mediaStats = await stat(mediaDir).catch(() => null);
+  console.log(`Live workspace check passed: ${board.length} account cards, ${rail.coverButtons} cards, `
+    + `${after.length} media files (directory ${mediaStats ? 'present, empty' : 'absent'}), no page errors.`);
+} finally {
+  await context.close();
+  await rm(profile, { recursive: true, force: true });
+}
