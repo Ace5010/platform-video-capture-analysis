@@ -599,17 +599,17 @@ button, input, textarea, select { font-size: 16px; }
 .readerHeader h2 { margin: 0 0 16px; font-size: clamp(22px,2.6vw,32px); line-height: 1.5; overflow-wrap: anywhere; }
 .readerMetadata { display: flex; flex-wrap: wrap; gap: 8px 20px; font-size: 14px; color: #5a5a55; }
 .readerMetadata a { color: #343431; text-underline-offset: 4px; }
-.readerNavigation { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 24px 0; }
+.readerNavigation { display: flex; align-items: center; gap: 8px; margin: 0; }
 .readerNavigation span { margin-left: 4px; color: #62615c; font-size: 14px; }
+.readerNavigation .readerPosition { margin: 0; min-width: 48px; text-align: center; }
+.readerNavigation button { min-width: 44px; min-height: 44px; padding: 6px 10px; font-size: 20px; }
 .readerTabs { display: flex; flex-wrap: wrap; gap: 8px; width: min(1020px,100%); margin: 8px auto 18px; padding: 6px; border-radius: 13px; background: #eeeeea; }
 .readerTabs button { flex: 1; min-width: 150px; min-height: 48px; padding: 10px 16px; font-size: 16px; border: 1px solid transparent; border-radius: 9px; color: #55554f; background: transparent; }
 .readerTabs button[aria-selected="true"] { background: white; color: #171715; font-weight: 700; border-color: #deded6; box-shadow: 0 2px 8px #00009; }
 .readerTabs button:hover { color: #171715; background: #ffffff99; }
 .readerToolbar { width: min(1020px,100%); display: flex; flex-wrap: wrap; gap: 14px 24px; align-items: center; margin: 0 auto 30px; padding-bottom: 22px; border-bottom: 1px solid #e0e0d9; }
-.readingFontControl { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; padding: 0; margin: 0; border: 0; }
-.readingFontControl legend { float: left; margin-right: 10px; font-size: 15px; color: #55554f; }
-.readingFontControl button { padding: 6px 10px; min-width: 42px; min-height: 42px; border: 1px solid #deded7; border-radius: 7px; background: white; font-size: 16px; }
-.readingFontControl button[aria-pressed="true"] { background: #272725; color: white; border-color: #272725; }
+.readingFontControl { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 15px; color: var(--muted); }
+.readingFontControl select { padding: 6px 8px; min-height: 44px; border: 1px solid var(--line); border-radius: 7px; background: var(--paper); color: var(--ink); font-size: 16px; }
 .readerExport { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
 .readerExport button { font-size: 15px; }
 .readerCopyStatus { min-height: 1.5em; font-size: 14px; color: #43433e; }
@@ -709,7 +709,7 @@ button, input, textarea, select { font-size: 16px; }
 
 ::view-transition { pointer-events: none; }
 
-.readerCloseBar { display: flex; align-items: center; justify-content: flex-end; height: 68px; padding: 10px 24px; border-bottom: 1px solid #e6e6df; background: #fff; }
+.readerCloseBar { display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 68px; padding: 10px 24px; border-bottom: 1px solid #e6e6df; background: #fff; }
 .readerCloseBar .readerClose { position: static; }
 .readerScroll { height: calc(100% - 68px); }
 .readerHeader { padding-right: 0; padding-top: 0; }
@@ -760,6 +760,12 @@ button, input, textarea, select { font-size: 16px; }
 .serviceStatus > summary > i { width: 8px; height: 8px; border-radius: 50%; background: #c2c2c2; }
 .serviceStatus > summary > i.connected { background: #a0d2b4; box-shadow: 0 0 0 4px #ccebdc; }
 .servicePopover { position: absolute; top: calc(100% + 12px); right: 0; width: min(300px, calc(100vw - 28px)); border: 1px solid var(--line); border-radius: 12px; padding: 12px; background: #f8fcfa; box-shadow: 0 14px 36px #d5e4df99; animation: surfaceReveal 260ms var(--ease-out); }
+.serviceSettings { display: grid; gap: 10px; margin: 8px 0 12px; }
+.serviceSettings .browserAccessNote { margin: 0; }
+.serviceSettings .browserAccessNote summary { min-height: 44px; padding-block: 8px; }
+.accountTop { gap: 10px; margin-bottom: 12px; }
+.accountTop h3 { flex: 1; min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.accountTop .accountAvatar, .accountTop .statusPill { flex-shrink: 0; }
 .localStatus { padding: 10px; border: 0; background: transparent; }
 .localStatus span, .logoutButton { display: block; }
 .localStatus i { flex-shrink: 0; }
@@ -1101,14 +1107,15 @@ button:hover:active:not(:disabled) { transform: translateY(1px) scale(.98); }
 }
 @media (max-width: 740px) {
   .appShell { display: block; }
-  .sidebar { position: relative; top: auto; display: flex; flex-wrap: wrap; height: auto; gap: 12px; padding: 14px 16px 12px; }
+  .sidebar { position: relative; top: auto; display: flex; flex-wrap: wrap; height: auto; gap: 8px; padding: 8px 16px; }
   .brand { margin: 0 auto 0 0; }
   .brandText strong { font-size: 17px; }
   .sidebarFoot { order: 0; margin: 0; }
   .navigation { order: 1; width: 100%; gap: 4px; }
   .navigation .navItem, .navigation .navItem.active { flex: 1; justify-content: center; padding: 10px 6px; font-size: 14px; }
   .navUpdateBadge { min-width: 16px; padding-inline: 3px; font-size: 12px; }
-  .accountRail { position: static; height: auto; padding: 12px 16px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .accountRail { position: static; height: auto; padding: 8px 16px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .accountRail[data-view="信源管理"] { display: none; }
   .railHeading { display: none; }
   .mobileAccountSwitch { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 46px; width: 100%; padding: 10px 12px; border: 1px solid #bfded1; border-radius: 9px; background: var(--selected-gradient); color: var(--ink); text-align: left; }
   .mobileAccountSwitch b { font-size: 15px; overflow-wrap: anywhere; }
@@ -1121,15 +1128,15 @@ button:hover:active:not(:disabled) { transform: translateY(1px) scale(.98); }
   .railAll { margin: 0; }
   .railAdd { margin-top: 6px; }
   .workspace { width: 100%; margin: 0; padding-top: 0; }
-  .topbar { top: 0; padding: 18px 16px; gap: 12px; }
+  .topbar { position: relative; top: auto; padding: 18px 16px; gap: 8px; }
   .topbar h1 { font-size: 23px; }
   .topActions { width: 100%; flex-wrap: wrap; }
   .settingsEntry { margin-left: auto; }
   .settingsEntry > summary { padding: 8px 12px; font-size: 14px; }
   .workspacePage { padding: 18px 16px; }
-  .collectionWarning { margin: 12px; flex-direction: row; flex-wrap: wrap; gap: 9px; }
-  .collectionWarning p { flex-basis: 200px; }
-  .collectionWarning button { min-height: 38px; padding: 6px 9px; }
+  .collectionWarning { margin: 0; padding: 6px 16px; flex-direction: row; align-items: center; flex-wrap: nowrap; gap: 12px; border-width: 0 0 1px; border-radius: 0; }
+  .collectionWarning p { min-width: 0; }
+  .collectionWarning button { min-height: 44px; padding: 6px 0; border: 0; background: transparent; text-decoration: underline; text-underline-offset: 4px; }
   .collectionSummary { margin: 16px 12px 0; padding: 13px; }
   .compactFeed { height: auto; min-height: 0; }
   .compactFeedScroll { overflow: visible; }
@@ -1151,7 +1158,18 @@ button:hover:active:not(:disabled) { transform: translateY(1px) scale(.98); }
 @media (max-width: 740px) {
   .appShell { padding-bottom: calc(84px + env(safe-area-inset-bottom)); }
   .topbar h1 { display: none; }
-  .topbar { padding: 8px 16px 12px; }
+  .topbar { padding: 8px 16px; }
+  .topbar .workspaceHeading:not(:has(.accountFollowers)) { display: none; }
+  .topbar.linkTopbar { display: none; }
+  .readerCloseBar { padding-inline: 12px; }
+  .readerCloseBar .readerClose { padding-inline: 10px; gap: 6px; }
+  .readerScroll { padding: 16px 16px 32px; }
+  .readerHeader h2 { font-size: 21px; margin-bottom: 10px; }
+  .readerTabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 2px; margin-block: 16px 12px; padding: 3px; }
+  .readerTabs button { min-width: 0; min-height: 44px; padding: 8px 3px; font-size: 15px; }
+  .readerToolbar { gap: 8px; margin-bottom: 20px; padding-bottom: 12px; }
+  .readerExport { margin-left: auto; gap: 6px; }
+  .readerExport button { padding-inline: 10px; min-height: 44px; }
   .sidebar .navigation { position: fixed; inset: auto 0 0; z-index: 25; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); padding: 8px 8px calc(8px + env(safe-area-inset-bottom)); border-top: 1px solid var(--line); background: linear-gradient(110deg, #edf5fc, #f4f9f7 60%, #eef7f1); box-shadow: 0 -4px 18px #a9cbb522; }
   .sidebar .navigation .navItem { flex-direction: column; gap: 3px; font-size: 13px; min-height: 54px; padding: 6px 2px; }
   .sidebar .navigation .navIcon { display: block; font-size: 20px; }

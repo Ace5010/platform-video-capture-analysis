@@ -1815,7 +1815,6 @@ export default function Home() {
         </form>}
         {setupBlocked && <div className="accessNotice">首次密码只能在主机打开 <b>http://localhost:3000</b> 设置。设置完成后，本设备即可使用同一密码登录。</div>}
         {authPhase === 'error' && <><p>正在自动重连，连接恢复后会自动进入工作台。</p><button className="secondaryButton" type="button" onClick={() => window.location.reload()}>立即重试</button></>}
-        <small>主机地址：{apiBase.replace(/^https?:\/\//, '')}</small>
       </section>
     </main>;
   }
@@ -1876,9 +1875,25 @@ export default function Home() {
           ))}
         </nav>
         <details className="sidebarFoot serviceStatus">
-          <summary><i className={hostConnected ? 'connected' : ''} />{hostConnected ? '主机已连接' : '主机未连接'}</summary>
+          <summary title={hostConnected ? '主机已连接' : '主机未连接'}><i className={hostConnected ? 'connected' : ''} aria-label={hostConnected ? '主机已连接' : '主机未连接'} />设置</summary>
           <div className="servicePopover">
           <div className={hostConnected ? 'localStatus connected' : 'localStatus'}><i /><span><b>主机采集服务</b><small>{dedicatedBrowser ? (hostConnected ? '已连接' : '正在连接电脑后台') : !hostConnected ? '服务已连接 · 等待主机 Chrome 自动连接' : isHostLocal ? bridgeNeedsReload ? `Chrome 组件缺少视频分析能力 · 需更新一次到 v${requiredExtensionVersion}` : bridgeReady ? `Chrome 已连接${bridgeVersion ? ` · v${bridgeVersion}` : ''}` : 'Chrome 后台已连接 · 网页桥接自动恢复中' : '已连接 · 任务由主机 Chrome 执行'}</small></span></div>
+          <div className="serviceSettings">
+            {dedicatedBrowser && isHostLocal && <button className="secondaryButton" disabled={openingBrowser} title="在电脑打开专用 Chrome，用于登录抖音和处理验证码" onClick={() => {
+              setOpeningBrowser(true);
+              void hostApi(apiBase, '/api/browser/open', { method: 'POST', body: '{}' }, csrfToken)
+                .then(() => setNotice('正在电脑打开专用浏览器，请完成抖音登录；遇到验证码也在此窗口处理'))
+                .catch((error: Error) => setNotice(error.message))
+                .finally(() => setOpeningBrowser(false));
+            }}>{openingBrowser ? '正在打开…' : '在电脑登录抖音'}</button>}
+            {isHostLocal
+              ? <button className={`qwenControl ${qwenConfigured ? 'ready' : ''}`} type="button" onClick={() => setShowQwenConfig(true)}><b>{qwenConfigured ? 'AI 分析设置' : '配置 AI 分析'}</b></button>
+              : <div className={`qwenControl remote ${qwenConfigured ? 'ready' : ''}`} title="API Key 只能在主机 localhost 页面配置"><b>{qwenConfigured ? 'AI 分析已配置' : 'AI 分析未配置'}</b></div>}
+            {dedicatedBrowser && isHostLocal && <details className="browserAccessNote"><summary>手机访问地址</summary>
+              {lanUrls.length ? lanUrls.map((url) => <p key={url}><a href={url} target="_blank" rel="noreferrer">{url}</a></p>) : <p>暂未检测到局域网地址，请连接 Wi-Fi 后刷新网页。</p>}
+              <small>连接同一个 Wi-Fi，使用工作台访问密码登录。电脑需保持开机并运行服务。</small>
+            </details>}
+          </div>
           <button className="logoutButton" type="button" onClick={logout}>退出当前设备</button>
           </div>
         </details>
@@ -1917,41 +1932,24 @@ export default function Home() {
                   <button className="secondaryButton" onClick={() => requestCheck('')} disabled={isCollecting} title="逐个检查全部已建档账号的新作品并刷新近期互动数据">检查全部账号</button>
                   {checkAccountId && <button className="secondaryButton" onClick={() => requestCheck(checkAccountId)} disabled={isCollecting} title="检查当前账号的新作品并刷新近期互动数据">检查当前账号</button>}
                 </>}
-                <details className="settingsEntry"><summary>设置</summary><div className="settingsActions">
-                {dedicatedBrowser && isHostLocal && <button className="secondaryButton" disabled={openingBrowser} title="在电脑打开专用 Chrome，用于登录抖音和处理验证码" onClick={() => {
-                  setOpeningBrowser(true);
-                  void hostApi(apiBase, '/api/browser/open', { method: 'POST', body: '{}' }, csrfToken)
-                    .then(() => setNotice('正在电脑打开专用浏览器，请完成抖音登录；遇到验证码也在此窗口处理'))
-                    .catch((error: Error) => setNotice(error.message))
-                    .finally(() => setOpeningBrowser(false));
-                }}>{openingBrowser ? '正在打开…' : '在电脑登录抖音'}</button>}
-                {isHostLocal
-                  ? <button className={`qwenControl ${qwenConfigured ? 'ready' : ''}`} type="button" onClick={() => setShowQwenConfig(true)}><b>{qwenConfigured ? 'AI 分析设置' : '配置 AI 分析'}</b></button>
-                  : <div className={`qwenControl remote ${qwenConfigured ? 'ready' : ''}`} title="API Key 只能在主机 localhost 页面配置"><b>{qwenConfigured ? 'AI 分析已配置' : 'AI 分析未配置'}</b></div>}
-                {dedicatedBrowser && isHostLocal && <details className="browserAccessNote"><summary>手机访问地址</summary>
-                  {lanUrls.length ? lanUrls.map((url) => <p key={url}><a href={url} target="_blank" rel="noreferrer">{url}</a></p>) : <p>暂未检测到局域网地址，请连接 Wi-Fi 后刷新网页。</p>}
-                  <small>连接同一个 Wi-Fi，使用工作台访问密码登录。电脑需保持开机并运行服务。</small>
-                </details>}
-                </div></details>
                 {activeNav === '信源管理' && pendingInitialAccounts.length > 0 && <button className="secondaryButton" disabled={initialBatchSubmitting} onClick={() => void queuePendingInitialSync()}>{initialBatchSubmitting ? '正在安排…' : '抓取全部待建档账号'}</button>}
                 {activeNav === '信源管理' && <button className="primaryButton" onClick={() => setShowAddAccount(true)}>添加监控账号</button>}
               </div>
             </header>
 
-            {dedicatedBrowser && (browserError || !isHostLocal) && <div className="browserAccessNote">
+            {dedicatedBrowser && (browserError || collectionPaused) && <div className="browserAccessNote">
 
-              {browserError && <p role="alert">{browserError}。已保存结果仍可阅读。请在电脑打开抖音登录窗口检查。</p>}
+              {browserError && <p role="alert">{browserError}。请在电脑打开抖音登录窗口检查。</p>}
               {collectionPaused && <button className="secondaryButton" type="button" onClick={() => {
                 void hostApi(apiBase, '/api/browser/resume-collection', { method: 'POST', body: '{}' }, csrfToken)
                   .then(() => { setNotice('已恢复读取队列'); return Promise.all([loadHostState(), loadHostJobs()]); })
                   .catch((error: Error) => setNotice(error.message));
               }}>已处理，继续读取</button>}
-              {!isHostLocal && <small>采集和分析由电脑执行；抖音登录和验证码需要在电脑处理。</small>}
             </div>}
 
             {activeNav === '内容浏览' && (
               <section className="homeFeed" aria-label="全部信源内容">
-                {(!browserError && (accounts.some((account) => account.status === 'error') || !hostConnected)) && <div className="collectionWarning" role="status"><p>{!hostConnected ? '主机采集服务暂未连接' : `${accounts.filter((account) => account.status === 'error').length} 个账号采集未完成`}，已保存结果仍可阅读。</p><button type="button" className="secondaryButton" onClick={() => animateChange(() => setActiveNav('信源管理'))}>查看采集状态</button></div>}
+                {(!browserError && (accounts.some((account) => account.status === 'error') || !hostConnected)) && <div className="collectionWarning" role="status"><p>{!hostConnected ? '主机暂未连接' : `${accounts.filter((account) => account.status === 'error').length} 个账号采集未完成`}</p><button type="button" className="secondaryButton" onClick={() => animateChange(() => setActiveNav('信源管理'))}>查看状态</button></div>}
                 {contentView === 'discoveries'
                   ? (effectiveDiscoveryVideos.length
                     ? <VideoBrowser
@@ -1997,8 +1995,7 @@ export default function Home() {
 
             {activeNav === '链接分析' && (
               <div className="workspacePage linkWorkspace">
-                <section className="linkAnalysisEntry" aria-labelledby="link-analysis-title">
-                  <h2 id="link-analysis-title">粘贴抖音视频链接</h2>
+                <section className="linkAnalysisEntry" aria-label="链接分析">
                   <form onSubmit={submitVideoLink}>
                     <textarea
                       value={videoLinkInput}
@@ -2419,7 +2416,7 @@ function WorkspaceRail({ accounts, videos, links, activeNav, selectedAccountId, 
   const currentName = isLinks ? '链接记录'
     : discoveryActive ? '新增检查视频'
       : accounts.find((account) => account.id === selectedAccountId)?.name || '全部账号';
-  return <aside className="accountRail" data-expanded={expanded} aria-label={isLinks ? '链接记录' : '切换监控账号'}>
+  return <aside className="accountRail" data-view={activeNav} data-expanded={expanded} aria-label={isLinks ? '链接记录' : '切换监控账号'}>
     {isLinks && <div className="railHeading"><strong>链接记录</strong><span>{links.length}</span></div>}
     <button className="mobileAccountSwitch" type="button" aria-expanded={expanded} aria-controls="workspace-rail-options" onClick={() => setExpanded((value) => !value)}><b>{currentName}</b><span>{expanded ? '收起 ↑' : isLinks ? '切换记录 ↓' : '切换账号 ↓'}</span></button>
     <div className="railOptions" id="workspace-rail-options">
@@ -2464,14 +2461,13 @@ function AccountBoard({ accounts, videoCounts, onAdd, onRemove, onInitialSync, j
   if (!accounts.length) {
     return <section className="emptyBoard"><div className="emptySymbol">＋</div><h3>添加第一个监控账号</h3><button className="primaryButton" onClick={onAdd}>添加新监控账号</button></section>;
   }
-  return <section className="accountGrid">{accounts.map((account, index) => {
+  return <section className="accountGrid">{accounts.map((account) => {
     const queueState = (account.status === 'checking' || account.initialSyncStatus !== 'complete') ? accountCollectionState(account.id, jobs) : null;
     const statusLabel = queueState === 'queued' ? '排队中' : queueState === 'running' ? '读取中' : account.status === 'checking' ? '检查中'
       : account.initialSyncStatus === 'error' ? '抓取失败' : accountStatusLabels[account.status];
     return <article className="accountCard" key={account.id}>
-      <div className="accountTop"><div className="accountAvatar">{account.avatarUrl ? <img src={account.avatarUrl} alt={`${account.name}头像`} referrerPolicy="no-referrer" /> : <span>{index + 1}</span>}</div><span className={`statusPill ${account.status}`}>{statusLabel}</span></div>
-
-      <h3>{account.name}<small className="accountFollowers">{formatFollowerLabel(account)}</small></h3><a href={account.url} target="_blank" rel="noreferrer">打开原账号主页 ↗</a>
+      <div className="accountTop">{account.avatarUrl && <div className="accountAvatar"><img src={account.avatarUrl} alt="" referrerPolicy="no-referrer" /></div>}<h3>{account.name}</h3><span className={`statusPill ${account.status}`}>{statusLabel}</span></div>
+      <a href={account.url} target="_blank" rel="noreferrer">打开原账号主页 ↗</a>
       {account.status === 'error' && account.collectionError && <p className="accountUpdateNotice" role="status">失败原因：{account.collectionError}</p>}
       {account.status === 'checking' && account.currentSyncMode === 'latest'
         ? <div className="accountUpdateNotice checking">检查中</div>
@@ -3069,7 +3065,6 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
                 <b>{video.title || '未命名视频'}</b>
                 <span className="compactVideoMeta">{video.authorName || '作者未记录'} · {formatPublishedTime(video.publishedAt)}{video.discoveredAt && <span className="compactVideoState discoveryState">发现于 {formatTime(video.discoveredAt)}</span>}<span className={`compactVideoState ${busy ? 'processing' : ''}`}>{result}</span></span>
                 <span className="mobileVideoMetrics">{[['点赞', video.likeCount], ['评论', video.commentCount], ['收藏', video.favoriteCount], ['分享', video.shareCount]].map(([label, value]) => <span key={label}> {label} <b>{formatMetric(value as number | null)}</b></span>)}</span>
-                {discoveryMode && <span className="compactVideoSummary">最近72小时检查发现的新内容；原发布时间 {formatPublishedTime(video.publishedAt)}。</span>}
                 {!discoveryMode && (reading.overview || video.transcript) && <span className="compactVideoSummary">{reading.overview || `口播：${video.transcript}`}</span>}
               </button>
             </div>
@@ -3411,6 +3406,7 @@ function VideoReader({ video, jobs, initialSection, index, total, onClose, onNav
   const failed = analysisStatus === 'error' && latestJob?.status !== 'cancelled';
   const sectionText = section === 'transcript' ? video.transcript || '' : section === 'content' ? videoContentAnalysis(video.analysis) : isRemotionPlan(video.analysis) ? formatRemotionPlan(video.analysis, video.title, video.url, video.transcript) : '';
   const labels: Record<ReadingSection, string> = { transcript: '口播稿', content: '视频内容分析', production: 'Remotion 制作规范' };
+  const tabLabels: Record<ReadingSection, string> = { transcript: '口播稿', content: '内容分析', production: '制作规范' };
   useEffect(() => {
     const element = dialog.current;
     const scheduledTimers = timers.current;
@@ -3457,10 +3453,9 @@ function VideoReader({ video, jobs, initialSection, index, total, onClose, onNav
     changeContent(() => setSection(next), ordered.indexOf(next) > ordered.indexOf(section) ? 1 : -1);
   };
   return <dialog ref={dialog} className={`readingDialog ${closing ? 'isClosing' : ''}`} aria-labelledby="reader-title" onCancel={(event) => { event.preventDefault(); requestClose(); }} onClick={(event) => { if (event.target === event.currentTarget) requestClose(); }}>
-    <div className="readerCloseBar"><button ref={closeButton} type="button" className="readerClose" onClick={requestClose} aria-label="关闭阅读，返回列表">关闭 <span aria-hidden="true">×</span></button></div>
+    <div className="readerCloseBar"><div className="readerNavigation"><button className="secondaryButton" type="button" aria-label="上一条" disabled={index <= 0} onClick={() => changeContent(() => onNavigate(-1), -1)}>←</button><span className="readerPosition">{index + 1} / {total}</span><button className="secondaryButton" type="button" aria-label="下一条" disabled={index >= total - 1} onClick={() => changeContent(() => onNavigate(1), 1)}>→</button></div><button ref={closeButton} type="button" className="readerClose" onClick={requestClose} aria-label="关闭阅读，返回列表">关闭 <span aria-hidden="true">×</span></button></div>
     <div ref={scroller} className="readerScroll" style={{ '--reading-size': `${fontSize}px`, '--reading-direction': direction } as CSSProperties}>
-      <header className="readerHeader"><span className="readerPosition">当前列表 · 第 {index + 1} / {total} 条</span><h2 id="reader-title">{video.title}</h2><div className="readerMetadata"><span>视频发布：{formatPublishedTime(video.publishedAt)}</span><span>首次采集：{formatTime(video.firstSeenAt)}</span><a href={video.url} target="_blank" rel="noreferrer">打开原视频核对 ↗</a></div>
-        <div className="readerNavigation"><button className="secondaryButton" type="button" disabled={index <= 0} onClick={() => changeContent(() => onNavigate(-1), -1)}>← 上一条</button><button className="secondaryButton" type="button" disabled={index >= total - 1} onClick={() => changeContent(() => onNavigate(1), 1)}>下一条 →</button>{complete.length > 0 && complete.length < 3 && <span>{complete.length}/3 个分区已生成</span>}</div>
+      <header className="readerHeader"><h2 id="reader-title">{video.title}</h2><div className="readerMetadata"><span>{formatPublishedTime(video.publishedAt)}</span><a href={video.url} target="_blank" rel="noreferrer">打开原视频 ↗</a>{complete.length > 0 && complete.length < 3 && <span>{complete.length}/3 个分区已生成</span>}</div>
       </header>
       <div className="readerTabs" role="tablist" aria-label="分析结果分区">{(['transcript', 'content', 'production'] as const).map((key) => <button key={key} id={`reader-tab-${key}`} type="button" role="tab" aria-selected={section === key} aria-controls="reader-panel" tabIndex={section === key ? 0 : -1} onClick={() => { if (section !== key) changeTab(key); }} onKeyDown={(event) => {
         const keys: ReadingSection[] = ['transcript', 'content', 'production'];
@@ -3468,8 +3463,8 @@ function VideoReader({ video, jobs, initialSection, index, total, onClose, onNav
         if (!offset && event.key !== 'Home' && event.key !== 'End') return;
         event.preventDefault(); const next = event.key === 'Home' ? keys[0] : event.key === 'End' ? keys[2] : keys[(keys.indexOf(key) + offset + 3) % 3];
         changeTab(next); document.getElementById(`reader-tab-${next}`)?.focus();
-      }}>{labels[key]}</button>)}</div>
-      <div className="readerToolbar"><fieldset className="readingFontControl"><legend>阅读字号</legend>{([18, 20, 22] as const).map((size) => <button type="button" key={size} aria-pressed={fontSize === size} onClick={() => setFontSize(size)}>{size}</button>)}</fieldset><div className="readerExport"><button className="secondaryButton" type="button" disabled={!sectionText} onClick={() => copy(sectionText)}>复制{labels[section]}</button><button className="secondaryButton" type="button" disabled={!sectionText} onClick={() => downloadReading(sectionText, `${section}-${video.id}.md`)}>下载 .md</button></div><span role="status" className="readerCopyStatus">{copyMessage}</span></div>
+      }}>{tabLabels[key]}</button>)}</div>
+      <div className="readerToolbar"><label className="readingFontControl">字号<select value={fontSize} onChange={(event) => setFontSize(Number(event.target.value) as 18 | 20 | 22)}>{([18, 20, 22] as const).map((size) => <option key={size} value={size}>{size}</option>)}</select></label><div className="readerExport"><button className="secondaryButton" type="button" title={`复制${labels[section]}`} disabled={!sectionText} onClick={() => copy(sectionText)}>复制</button><button className="secondaryButton" type="button" title="下载 Markdown 文件" disabled={!sectionText} onClick={() => downloadReading(sectionText, `${section}-${video.id}.md`)}>下载</button></div>{copyMessage && <span role="status" className="readerCopyStatus">{copyMessage}</span>}</div>
       {busy && <div className="readerTask" role="status"><p>{analysisProgress(video, latestJob)}</p>{latestJob && <button type="button" className="secondaryButton" onClick={() => onCancel(latestJob)}>取消任务</button>}</div>}
       {latestJob?.status === 'cancelled' && <p className="readerTask">任务已取消</p>}
       {failed && <section className="readerFailure" aria-label="任务诊断"><h3>本次分析未完成</h3><p>失败阶段：{ANALYSIS_STAGE_LABELS[diagnostics.failedStage || ''] || diagnostics.failedStage || '尚未记录'}{Number.isFinite(diagnostics.attemptCount) ? ` · 实际尝试 ${diagnostics.attemptCount} 次` : ' · 尝试次数未记录'}</p><p>最后错误：{redactDiagnosticText(diagnostics.lastError || latestJob?.error || video.analysisError || '没有详细记录，根因尚未确定')}</p><p>已保存并保留：{complete.join('、') || '暂无已生成结果'}</p>{diagnostics.userAction && <p>{redactDiagnosticText(diagnostics.userAction)}</p>}<button type="button" className="secondaryButton" onClick={() => copy(formatAnalysisDiagnostics({ ...diagnostics, jobId: diagnostics.jobId || latestJob?.id, videoId: video.id, lastError: diagnostics.lastError || latestJob?.error || video.analysisError || '' }))}>复制诊断信息</button></section>}
