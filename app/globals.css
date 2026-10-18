@@ -1167,6 +1167,8 @@ button:hover:active:not(:disabled) { transform: translateY(1px) scale(.98); }
   .readerHeader h2 { font-size: 21px; margin-bottom: 10px; }
   .readerTabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 2px; margin-block: 16px 12px; padding: 3px; }
   .readerTabs button { min-width: 0; min-height: 44px; padding: 8px 3px; font-size: 15px; }
+  .linkResultTabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .linkResultTabs button { min-width: 0; min-height: 44px; padding-inline: 3px; }
   .readerToolbar { gap: 8px; margin-bottom: 20px; padding-bottom: 12px; }
   .readerExport { margin-left: auto; gap: 6px; }
   .readerExport button { padding-inline: 10px; min-height: 44px; }

@@ -56,3 +56,15 @@ __pycache__/
 *.webm
 *.wav
 *.mp3
+
+# Android build products and local signing (never upload)
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/keystore.properties
+*.jks
+*.keystore
+*.apk
+*.aab
+/.runtime/

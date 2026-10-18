@@ -1,0 +1,50 @@
+plugins { id 'com.android.application' }
+
+def remote = new groovy.json.JsonSlurper().parse(rootProject.file('../cloudflare-pages.json'))
+def remoteUri = new URI(remote.publicOrigin)
+if (remoteUri.scheme != 'https' || !remoteUri.host || remoteUri.userInfo || remoteUri.port != -1 || remoteUri.query || remoteUri.fragment || remoteUri.path) {
+    throw new GradleException('cloudflare-pages.json 必须配置无路径的正式 HTTPS 来源。')
+}
+def signing = new Properties()
+def signingFile = rootProject.file('keystore.properties')
+if (signingFile.exists()) signingFile.withInputStream { signing.load(it) }
+def hasSigning = ['storeFile', 'storePassword', 'keyAlias', 'keyPassword'].every { signing.getProperty(it) }
+
+android {
+    namespace 'com.personal.contentworkbench'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'com.personal.contentworkbench'
+        minSdk 26
+        targetSdk 35
+        versionCode 3
+        versionName '0.1.2'
+        buildConfigField 'String', 'WORKBENCH_ORIGIN', '"' + remote.publicOrigin + '"'
+        testInstrumentationRunner 'com.personal.contentworkbench.WorkbenchInstrumentation'
+    }
+    buildFeatures { buildConfig true }
+    // The separate test APK retains framework resources; production has no web assets.
+    androidResources { ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~' }
+    testBuildType project.findProperty('androidTestBuildType') ?: 'debug'
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+    signingConfigs {
+        if (hasSigning) { release {
+            storeFile rootProject.file(signing.getProperty('storeFile'))
+            storePassword signing.getProperty('storePassword')
+            keyAlias signing.getProperty('keyAlias')
+            keyPassword signing.getProperty('keyPassword')
+        } }
+    }
+    buildTypes { release { minifyEnabled false; if (hasSigning) signingConfig signingConfigs.release } }
+    sourceSets.androidTest.assets.srcDir layout.buildDirectory.dir('generated/testAssets')
+}
+tasks.register('prepareTestFixture', Exec) {
+    commandLine 'node', rootProject.file('../scripts/prepare-android-fixture.mjs').absolutePath, layout.buildDirectory.dir('generated/testAssets').get().asFile.absolutePath
+}
+tasks.matching { it.name.endsWith('AndroidTestBuild') }.configureEach { dependsOn 'prepareTestFixture' }
+tasks.register('requireReleaseSigning') { doLast { if (!hasSigning) throw new GradleException('缺少本机独立签名配置 android/keystore.properties。') } }
+tasks.matching { it.name == 'preReleaseBuild' }.configureEach { dependsOn 'requireReleaseSigning' }
+tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+}

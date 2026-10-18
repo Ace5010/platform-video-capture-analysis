@@ -3216,7 +3216,7 @@ function VideoPlaybackDetails({ video }: { video: Video }) {
 
 function VideoPreview({ video, scope, jobs, onOpen, onAnalysis, onCancel, connectorConnected, connectorBusy, linkLayout = false, onBack }: VideoPresentationProps & { video: Video; scope: Video[]; linkLayout?: boolean; onBack?: () => void }) {
   const [linkSection, setLinkSection] = useState<ReadingSection>('content');
-  const linkSections: [ReadingSection, string][] = [['transcript', '口播稿'], ['content', '视频内容分析'], ['production', 'Remotion 制作规范']];
+  const linkSections: [ReadingSection, string][] = [['transcript', '口播稿'], ['content', '内容分析'], ['production', '制作规范']];
   const latestJob = analysisJob(video, jobs);
   const analysisStatus = displayedAnalysisStatus(video, latestJob);
   const busy = analysisStatus === 'queued' || analysisStatus === 'processing';
