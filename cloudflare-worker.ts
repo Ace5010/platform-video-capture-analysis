@@ -7,7 +7,7 @@ type WorkerEnvironment = HostProxyEnvironment & {
 
 const worker = {
   async fetch(request: Request, env: WorkerEnvironment, ctx: ExecutionContext): Promise<Response> {
-    // The JSON gateway does not need React rendering, routing, or response buffering.
+    // The restricted host gateway streams JSON and registered media without React rendering.
     // Keep the existing origin, cookie, CSRF, and path checks in one shared handler.
     if (new URL(request.url).pathname.startsWith('/host/')) {
       return proxyHostRequest(request, env);

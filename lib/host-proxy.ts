@@ -7,7 +7,7 @@ export type HostProxyEnvironment = {
 const COOKIE_NAME = 'douyin_monitor_session';
 const MAX_BODY_BYTES = 64 * 1024;
 const GET_PATHS = new Set(['/health', '/api/auth/status', '/api/state', '/api/jobs', '/api/qwen', '/api/qwen/status']);
-const POST_PATHS = new Set(['/api/auth/login', '/api/auth/logout', '/api/accounts/upsert', '/api/accounts/remove', '/api/accounts/ack-updates', '/api/video-links/analyze', '/api/jobs', '/api/previews/prepare']);
+const POST_PATHS = new Set(['/api/auth/login', '/api/auth/logout', '/api/accounts/upsert', '/api/accounts/remove', '/api/accounts/ack-updates', '/api/discoveries/clear', '/api/video-links/analyze', '/api/jobs', '/api/previews/prepare']);
 // On-demand playback: the host resolves the low-resolution source itself, so
 // the gateway only ever forwards a registered work id and a source generation.
 const PREVIEW_STATUS_PATH = /^\/api\/previews\/\d{1,32}\/status$/;
@@ -111,7 +111,10 @@ export async function proxyHostRequest(request: Request, env: HostProxyEnvironme
         return errorResponse(502, '电脑后台媒体响应无效');
       }
       const mediaHeaders = new Headers({ 'Accept-Ranges': 'bytes', 'Content-Length': upstream.headers.get('Content-Length')!,
-        'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' });
+        'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff',
+        // The remote page reads media across origins, so the range metadata it
+        // needs to seek must be readable there as well.
+        'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Accept-Ranges' });
       if (upstream.status !== 416) mediaHeaders.set('Content-Type', 'video/mp4');
       const contentRange = upstream.headers.get('Content-Range');
       if (contentRange) mediaHeaders.set('Content-Range', contentRange);
