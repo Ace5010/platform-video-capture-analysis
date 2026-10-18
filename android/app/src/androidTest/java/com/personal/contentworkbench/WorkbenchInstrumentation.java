@@ -35,12 +35,26 @@ public final class WorkbenchInstrumentation extends Instrumentation {
     @Override public void onCreate(Bundle args) { super.onCreate(args); arguments = args; start(); }
     @Override public void onStart() {
         Bundle result = new Bundle();
+        long startedAt = SystemClock.elapsedRealtime();
         try {
             Intent intent = new Intent(getTargetContext(), MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             activity = startActivitySync(intent);
             runOnMainSync(() -> activity.getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON));
             java.lang.reflect.Field field = MainActivity.class.getDeclaredField("webView"); field.setAccessible(true); web = (WebView) field.get(activity);
             require(web != null, "WebView created");
+            if ("startup".equals(arguments.getString("mode"))) {
+                // Use the installed release and its existing session unchanged.
+                // Keep the native clients (including fullscreen) in this mode.
+                boolean ready = false;
+                try { await("document.querySelector('.appShell')!==null", 120000); ready = true; }
+                catch (AssertionError ignored) { }
+                String timing = js("JSON.stringify({navigation:performance.getEntriesByType('navigation').map(e=>({start:e.startTime,headers:e.responseStart,end:e.responseEnd,dom:e.domContentLoadedEventEnd})),requests:performance.getEntriesByType('resource').filter(e=>e.name.includes('/host/')).map(e=>({path:new URL(e.name).pathname,start:Math.round(e.startTime),headers:Math.round(e.responseStart),end:Math.round(e.responseEnd),duration:Math.round(e.duration),encoded:e.encodedBodySize,decoded:e.decodedBodySize})),cards:document.querySelectorAll('.compactVideo').length,login:!!document.querySelector('input[type=password]'),heading:document.querySelector('.authGate h1')?.textContent})");
+                saveScreenshot("phone-startup.png");
+                result.putString("stream", (ready ? "PASS" : "FAIL") + ": installed app startup; readyMs=" + (SystemClock.elapsedRealtime()-startedAt) + "; timing=" + timing);
+                runOnMainSync(() -> activity.finish());
+                finish(ready ? Activity.RESULT_OK : Activity.RESULT_CANCELED, result);
+                return;
+            }
             await("document.visibilityState==='visible'", 15000);
             runOnMainSync(() -> web.setWebChromeClient(new android.webkit.WebChromeClient() {
                 @Override public boolean onConsoleMessage(android.webkit.ConsoleMessage message) {

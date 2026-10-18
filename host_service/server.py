@@ -32,6 +32,7 @@ from .compatibility import (
 from .config import HostConfig
 from .database import CANONICAL_JOB_TYPES, Database, utc_now
 from .douyin_links import resolve_douyin_video_link
+from .http_payload import encode_json
 from .media import cleanup_stale_temp
 from .preview import PreviewError, PreviewManager
 from .qwen import QwenClient, analysis_section_status
@@ -222,9 +223,13 @@ class HostRequestHandler(BaseHTTPRequestHandler):
         cookies: list[str] | None = None,
         extra_headers: dict[str, str] | None = None,
     ) -> None:
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        # Auth responses contain per-session secrets and stay uncompressed.
+        compress = status == 200 and self.command == "GET" and urlsplit(self.path).path in ("/api/state", "/api/jobs")
+        body, encoding = encode_json(payload, self.headers.get("Accept-Encoding", ""), compress=compress)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -233,11 +238,14 @@ class HostRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cross-Origin-Resource-Policy", "same-site")
         self.send_header("Connection", "close")
         origin = self._cors_origin()
+        vary = ["Accept-Encoding"] if compress else []
         if origin:
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Access-Control-Allow-Credentials", "true")
             self.send_header("Access-Control-Allow-Private-Network", "true")
-            self.send_header("Vary", "Origin")
+            vary.append("Origin")
+        if vary:
+            self.send_header("Vary", ", ".join(vary))
         for cookie in cookies or []:
             self.send_header("Set-Cookie", cookie)
         for name, value in (extra_headers or {}).items():

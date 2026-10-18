@@ -12,6 +12,7 @@ import { createClientId } from '../lib/client-id';
 import { canonicalDouyinAccountUrl } from '../lib/account-identity';
 import { accountCollectionState, isActiveCollectionJob } from '../lib/collection-queue';
 import { hostApiBase } from '../lib/host-connection';
+import { createWorkspaceRefresh } from '../lib/workspace-refresh';
 import { browseContentVideos, collectionAccountScope } from '../lib/content-browse';
 import { followerDetailText, formatFollowerLabel, normalizeFollowerReading } from '../lib/follower-count';
 import { normalizeAnalysisUsage, formatTokenCount, formatEstimatedCost, formatCloudAudioSeconds, analysisRequestCountLabel, analysisUsageSummary, type AnalysisUsage } from '../lib/analysis-usage';
@@ -253,13 +254,20 @@ async function hostApi<T>(base: string, path: string, options: RequestInit = {},
   const headers = new Headers(options.headers);
   if (options.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
   if (csrfToken && options.method && options.method !== 'GET') headers.set('X-CSRF-Token', csrfToken);
+  const readSignal = (!options.method || options.method === 'GET') ? AbortSignal.timeout(20_000) : undefined;
+  const signal = readSignal ? (options.signal ? AbortSignal.any([options.signal, readSignal]) : readSignal) : options.signal;
   const response = await fetch(`${base}${path}`, {
     ...options,
+    signal,
     headers,
     credentials: 'include',
     cache: 'no-store',
   });
-  const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+  const payload = await response.json().catch((error: unknown) => {
+    // A stalled or truncated body must not turn into an empty workspace.
+    if (response.ok || signal?.aborted) throw error;
+    return {};
+  }) as Record<string, unknown>;
   if (!response.ok) {
     if (response.status === 403 && !retried && String(payload.message || payload.error || '').includes('CSRF')) {
       const auth = await hostApi<Record<string, unknown>>(base, '/api/auth/status');
@@ -686,14 +694,16 @@ export default function Home() {
     setHostWorkerStatus(textValue(connectorState.workerStatus ?? connectorState.status));
   }, []);
 
-  const loadHostState = useCallback(async () => {
-    const payload = await hostApi<Record<string, unknown>>(apiBase, '/api/state');
+  const loadHostState = useCallback(async (signal?: AbortSignal) => {
+    const payload = await hostApi<Record<string, unknown>>(apiBase, '/api/state', { signal });
+    signal?.throwIfAborted();
     applyHostState(payload);
     return payload;
   }, [apiBase, applyHostState]);
 
-  const loadHostJobs = useCallback(async () => {
-    const payload = await hostApi<Record<string, unknown>>(apiBase, '/api/jobs');
+  const loadHostJobs = useCallback(async (signal?: AbortSignal) => {
+    const payload = await hostApi<Record<string, unknown>>(apiBase, '/api/jobs', { signal });
+    signal?.throwIfAborted();
     const rawJobs = Array.isArray(payload.jobs)
       ? payload.jobs
       : payload.data && typeof payload.data === 'object' && Array.isArray((payload.data as Record<string, unknown>).jobs)
@@ -763,8 +773,9 @@ export default function Home() {
     return jobs;
   }, [apiBase]);
 
-  const loadQwenStatus = useCallback(async () => {
-    const payload = await hostApi<Record<string, unknown>>(apiBase, '/api/qwen/status');
+  const loadQwenStatus = useCallback(async (signal?: AbortSignal) => {
+    const payload = await hostApi<Record<string, unknown>>(apiBase, '/api/qwen/status', { signal });
+    signal?.throwIfAborted();
     const status = payload.qwen && typeof payload.qwen === 'object'
       ? payload.qwen as Record<string, unknown>
       : payload;
@@ -885,34 +896,29 @@ export default function Home() {
 
   useEffect(() => {
     if (authPhase !== 'ready') return;
-    let active = true;
-    const bootstrap = async () => {
-      try {
-        await migrateLegacyLocalData();
-        await Promise.all([loadHostState(), loadHostJobs(), loadQwenStatus()]);
-        if (active) setLoaded(true);
-      } catch (error) {
-        if (!active) return;
+    const reader = createWorkspaceRefresh({
+      prepare: migrateLegacyLocalData,
+      state: loadHostState,
+      jobs: loadHostJobs,
+      settings: loadQwenStatus,
+      ready: () => setLoaded(true),
+      failed: (error, initial) => {
+        if (!initial) { setHostConnected(false); return; }
         setLoaded(false);
         setAuthPhase('error');
         setAuthMessage(error instanceof Error ? `加载主机数据失败：${error.message}` : '加载主机数据失败');
-      }
-    };
-    void bootstrap();
-    let refreshing = false;
+      },
+    });
+    void reader.refresh();
     const refresh = () => {
-      if (!active || refreshing || document.visibilityState === 'hidden') return;
-      refreshing = true;
-      void Promise.all([loadHostState(), loadHostJobs(), loadQwenStatus()]).catch(() => {
-        if (active) setHostConnected(false);
-      }).finally(() => { refreshing = false; });
+      if (document.visibilityState !== 'hidden') void reader.refresh();
     };
     const timer = window.setInterval(refresh, 4_000);
     document.addEventListener('visibilitychange', refresh);
     window.addEventListener('focus', refresh);
     window.addEventListener('online', refresh);
     return () => {
-      active = false;
+      reader.stop();
       window.clearInterval(timer);
       document.removeEventListener('visibilitychange', refresh);
       window.removeEventListener('focus', refresh);

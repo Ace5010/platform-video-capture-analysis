@@ -45,6 +45,9 @@ export async function proxyHostRequest(request: Request, env: HostProxyEnvironme
     Origin: env.HOST_PUBLIC_ORIGIN,
     'X-Workbench-Client-IP': request.headers.get('CF-Connecting-IP') || 'unknown',
   });
+  // Compress the large JSON reads on the host-to-edge leg as well as the
+  // edge-to-phone leg. Never change byte ranges or authentication responses.
+  if (request.method === 'GET' && (path === '/api/state' || path === '/api/jobs')) headers.set('Accept-Encoding', 'gzip');
   const cookie = (request.headers.get('Cookie') || '').split(';').map(part => part.trim())
     .find(part => new RegExp(`^${COOKIE_NAME}=[a-zA-Z0-9_-]{32,256}$`).test(part));
   if (cookie) headers.set('Cookie', cookie);
@@ -126,6 +129,10 @@ export async function proxyHostRequest(request: Request, env: HostProxyEnvironme
       return errorResponse(502, '电脑连接通道返回了无效响应，请检查后台与隧道状态');
     }
     const responseHeaders = new Headers({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+    if (upstream.headers.get('Content-Encoding') === 'gzip') {
+      responseHeaders.set('Content-Encoding', 'gzip');
+      responseHeaders.set('Vary', 'Accept-Encoding');
+    }
     // The host emits only its own session cookie. Do not forward any other
     // upstream headers (CORS, internal addresses, tunnel credentials, etc.).
     const setCookie = upstream.headers.get('Set-Cookie');

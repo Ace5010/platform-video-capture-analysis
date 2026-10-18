@@ -11,6 +11,7 @@ const origin = 'https://workbench.test';
 const session = 's'.repeat(43);
 const calls = [];
 let offline = false;
+let compressed = false;
 const largeResult = JSON.stringify({ ok: true, analysis: 'mock history '.repeat(100_000) });
 assert.deepEqual(config.assets.run_worker_first, ['/host/*']);
 const modulePaths = [config.main, ...(await readdir(server, { recursive: true })).filter(file => file.endsWith('.js') && file !== config.main)];
@@ -29,10 +30,11 @@ const runtime = new Miniflare({
   outboundService: () => { throw new Error('External network is forbidden in this test'); },
   serviceBindings: {
     HOST_SERVICE: async request => {
-      calls.push({ url: request.url, method: request.method });
+      calls.push({ url: request.url, method: request.method, encoding: request.headers.get('Accept-Encoding') });
       if (offline) return new Response('mock tunnel unavailable', { status: 502 });
       if (request.headers.get('Cookie') !== `douyin_monitor_session=${session}`) return Response.json({ error: 'login required' }, { status: 401 });
-      return new Response(largeResult, { headers: { 'Content-Type': 'application/json' } });
+      // Miniflare encodes this HTTP response before passing it to the Worker.
+      return new Response(largeResult, { headers: { 'Content-Type': 'application/json', ...(compressed ? { 'Content-Encoding': 'gzip' } : {}) } });
     },
   },
 });
@@ -52,6 +54,11 @@ try {
   assert.equal(response.status, 200);
   assert.equal(await response.text(), largeResult, 'historical results were buffered, truncated, or replaced');
   assert.equal(calls.at(-1).url, 'http://127.0.0.1:43130/api/state');
+  assert.equal(calls.at(-1).encoding, 'gzip', 'large snapshots must request compression before the tunnel');
+  compressed = true;
+  const zipped = await runtime.dispatchFetch(`${origin}/host/api/state`, { headers: { Cookie: `douyin_monitor_session=${session}`, 'Accept-Encoding': 'gzip' } });
+  assert.equal(calls.at(-1).encoding, 'gzip');
+  assert.equal(await zipped.text(), largeResult, 'compressed upstream must decode once and preserve all history');
 
   const count = calls.length;
   for (const url of [`${origin}/host/api/qwen/config`, 'https://preview.test/host/api/state']) {
