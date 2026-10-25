@@ -50,6 +50,27 @@ class GenerationTests(unittest.TestCase):
         self.assertNotIn('private/path',manager.latest(self.day)['error'])
         self.assertEqual(json.loads((self.root/'summaries'/f'{self.day}.json').read_text())['version'],'old')
 
+    def test_publication_failure_keeps_usage_without_exposing_exception_text(self):
+        def runner(day, **kw):
+            save(self.root/'summary-variants'/day/(kw['variant']+'.json'), {'version':'new'})
+            return {'run_id':'paid-fixture', 'credits':.22, 'elapsed_seconds':25}
+        real_save = save
+        def fail_publication(path, value):
+            if path.parent.name == 'summaries' and path.name == f'{self.day}.json':
+                raise OSError('secret-token private/path/chat.txt')
+            real_save(path, value)
+        manager = GenerationManager(self.root, runner)
+        with patch('host_service.wechat.generation.save', side_effect=fail_publication):
+            manager._execute({'id':'c'*32, 'date':self.day, 'model':'fixture', 'effort':'high',
+                              'started_at':'2026-10-21T00:00:00Z'})
+        latest = manager.latest(self.day)
+        self.assertEqual(latest['status'], 'failed')
+        self.assertIn('发布失败（OSError）', latest['error'])
+        self.assertNotIn('secret-token', latest['error'])
+        self.assertNotIn('private/path', latest['error'])
+        self.assertEqual((latest['run_id'], latest['credits'], latest['elapsed_seconds']), ('paid-fixture', .22, 25))
+        self.assertEqual(json.loads((self.root/'summaries'/f'{self.day}.json').read_text())['version'], 'old')
+
     def test_today_can_queue_without_pretending_full_day_and_gap_is_rejected(self):
         manager=GenerationManager(self.root,Mock(side_effect=RuntimeError('fixture')))
         prepared={'complete':False,'summarizable':True,'partial':True,'coverage_end':123,'messages':[{}]}

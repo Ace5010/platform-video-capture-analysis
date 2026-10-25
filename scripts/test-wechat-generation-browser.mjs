@@ -10,7 +10,7 @@ const browser = await chromium.launch({ channel: 'chrome', headless: true });
 const reason = '全天消息存在遗漏或冲突，未发布总结';
 try {
   for (const [name, viewport] of [['desktop', { width: 1440, height: 1000 }],
-    ['mobile', { width: 390, height: 844 }]]) {
+    ['mobile', { width: 390, height: 844 }], ['compact', { width: 720, height: 900 }]]) {
     const context = await browser.newContext({ viewport, locale: 'zh-CN' });
     await context.addInitScript(() => localStorage.setItem('douyin-monitor.sqlite-migration.v1', 'isolated-test'));
     const page = await context.newPage();
@@ -51,6 +51,9 @@ try {
     await page.screenshot({ path: fileURLToPath(new URL(`${name}-failure-reading.png`, output)) });
     await page.getByRole('button', { name: '读取管理', exact: true }).click();
     await page.locator('.wxHistory > summary').click();
+    await page.evaluate(() => Promise.all(document.getAnimations()
+      .filter(animation => animation.effect?.getTiming().iterations !== Infinity)
+      .map(animation => animation.finished.catch(() => {}))));
     const record = page.locator('.wxHistory .wxRecord').first();
     await record.getByText(reason, { exact: true }).waitFor();
     assert.match(await record.innerText(), /0\.22 积分/);
@@ -60,9 +63,21 @@ try {
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
     assert.deepEqual(requests.filter(request => request.method !== 'GET'), []);
     assert.deepEqual(errors, []);
+    if (viewport.width <= 740) {
+      await page.getByRole('button', { name: '内容情报台', exact: true }).click();
+      const accountSwitch = page.locator('.mobileAccountSwitch');
+      await accountSwitch.waitFor({ state: 'visible' });
+      const header = await page.locator('.sidebar').boundingBox();
+      const rail = await page.locator('.accountRail').boundingBox();
+      assert.ok(header && rail && header.y + header.height <= rail.y + 1,
+        'The video header must not overlap the mobile account switch');
+      await accountSwitch.click();
+      await page.locator('.accountRail[data-expanded="true"] .railAll').waitFor({ state: 'visible' });
+      await page.screenshot({ path: fileURLToPath(new URL(`${name}-account-switch.png`, output)) });
+    }
     await context.close();
   }
-  console.log('WeChat summary UI passed: running-to-failed polling, exact reason, retained summary and official credits at desktop/mobile sizes; no host writes.');
+  console.log('WeChat summary UI passed: failure receipts, retained summary, credits, mobile account switching without header overlap at 390/720px; no host writes.');
 } finally {
   await browser.close();
 }
