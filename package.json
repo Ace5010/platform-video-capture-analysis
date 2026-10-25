@@ -13,7 +13,7 @@
     "test:accounts": "node --experimental-strip-types scripts/test-account-identity.ts && .venv\\Scripts\\python.exe scripts/test-account-merge.py",
     "test:connector": "node scripts/test-extension-connector.mjs",
     "test:asr": ".venv\\Scripts\\python.exe scripts/test-local-asr.py",
-    "test:auto-transcription": ".venv\\Scripts\\python.exe scripts/test-auto-transcription.py",
+    "test:auto-transcription": ".venv\\Scripts\\python.exe scripts/test-auto-transcription.py && .venv\\Scripts\\python.exe scripts/test-transcription-recovery.py",
     "test:host": "npm run test:accounts && .venv\\Scripts\\python.exe scripts/test-host-service.py && .venv\\Scripts\\python.exe scripts/test-preview-media.py && .venv\\Scripts\\python.exe scripts/test-preview-codec.py && .venv\\Scripts\\python.exe scripts/test-collection-discoveries.py && .venv\\Scripts\\python.exe scripts/test-remote-host.py && node --experimental-strip-types scripts/test-host-proxy.ts && .venv\\Scripts\\python.exe scripts/test-cloud-asr.py && .venv\\Scripts\\python.exe scripts/test-qwen-upload.py && .venv\\Scripts\\python.exe scripts/test-analysis-reuse.py && .venv\\Scripts\\python.exe scripts/test-initial-queue.py && npm run test:auto-transcription",
     "test:scheduler": "node scripts/test-extension-scheduler.mjs",
     "test:extension-compatibility": "node --experimental-strip-types scripts/test-extension-compatibility.ts",

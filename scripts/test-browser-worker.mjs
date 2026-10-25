@@ -100,12 +100,21 @@ try {
     <video></video><script>window._ROUTER_DATA = {target:{aweme_id:'1234567890123456789',
       music:{play_url:{url_list:['https://test.douyinvod.com/background-only.m4a']}},
       video:{play_addr:{url_list:['https://test.douyinvod.com/complete.mp4'],width:640,height:360},
+        download_addr:{url_list:['https://test.douyinvod.com/with-outro.mp4'],width:480,height:270},
         audio:{play_addr:{url_list:['https://test.douyinvod.com/full-track.m4a']}}}}};</script>` }));
   const audioTranscript = await collector.captureFullVideoForAnalysis({ videoId: '1234567890123456789',
     videoUrl: 'https://www.douyin.com/video/1234567890123456789', purpose: 'transcription' });
   assert.equal(audioTranscript.audio.url, 'https://test.douyinvod.com/full-track.m4a');
   assert.equal(audioTranscript.audio.metadata.targetBound, true);
   assert.equal(audioTranscript.video, null, 'full video audio is preferred over background music');
+  const fallbackTranscript = await collector.captureFullVideoForAnalysis({ videoId: '1234567890123456789',
+    videoUrl: 'https://www.douyin.com/video/1234567890123456789', purpose: 'transcription', preferVideo: true });
+  assert.equal(fallbackTranscript.video.url, 'https://test.douyinvod.com/complete.mp4',
+    'a rejected independent track can fall back to the same target complete video');
+  assert.equal(fallbackTranscript.video.metadata.targetBound, true);
+  assert.equal(fallbackTranscript.video.metadata.sourceRole, 'play',
+    'transcription uses the original timeline even when the download with an outro is smaller');
+  assert.ok(!fallbackTranscript.audio, 'fallback must not return rejected audio or background music');
   await context.unroute('**/*');
   await context.route('**/*', route => route.fulfill({ contentType: 'text/html', body: `
     <script>window._ROUTER_DATA = { target: { aweme_id: '1234567890123456789', video: {

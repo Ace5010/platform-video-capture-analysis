@@ -1,0 +1,79 @@
+--- a/transcribe.py
++++ b/transcribe.py
+@@ -3,12 +3,14 @@
+ from pathlib import Path
+ ROOT=Path(__file__).resolve().parent
+ sys.stdout.reconfigure(encoding='utf-8')
++sys.stderr.reconfigure(encoding='utf-8')
+ os.environ['TEMP']=os.environ['TMP']=str(ROOT/'tmp')
+ os.environ['TRANSCRIBE_LIBRARY']=str(ROOT/'runtime/transcribe-native-windows-x86_64-cpu-vulkan/transcribe.dll')
+ DLL_HANDLE=os.add_dll_directory(str(Path(os.environ['TRANSCRIBE_LIBRARY']).parent))
+ sys.path.insert(0,str(ROOT/'runtime/python'))
+ import transcribe_cpp as tc
+ from domain import prepare_hints
++from qwen_chunks import compact_hints, transcribe_audio
+ 
+ def peak_ram_bytes():
+     class Counters(ctypes.Structure):
+@@ -57,31 +59,47 @@
+             limits=dataclasses.asdict(session.limits)
+             max_s=min(a.chunk_seconds,limits['effective_max_audio_ms']/1000) if limits['effective_max_audio_ms']>0 else a.chunk_seconds
+             if max_s<5: raise RuntimeError(f'Unexpected audio limit: {limits}')
+-            rows=[]; start=0; inference=0
+-            while start<len(pcm):
+-                end=min(len(pcm),start+int(max_s*16000))
+-                # Prefer the quietest 100 ms in the last 2 seconds; no gaps or overlaps.
+-                if end<len(pcm):
+-                    candidates=range(max(start+16000,end-32000),end-800,800)
+-                    end=min(candidates,key=lambda k:sum(x*x for x in pcm[k:k+1600]))+800
+-                t=time.perf_counter()
+-                result=session.run(pcm[start:end],language='zh',timestamps='none',vocabulary=a.vocabulary,
+-                                   prompt=prompt if context_supported else None)
+-                elapsed=time.perf_counter()-t;inference+=elapsed
+-                row={'start_seconds':start/16000,'end_seconds':end/16000,'seconds':elapsed,'text':result.text,'native_timings':dataclasses.asdict(result.timings)}
++            rows=[]; start=0; inference=0; recoveries=[]
++            compact=compact_hints(a.vocabulary, context)
++            def recognize(audio, terms, hint):
++                return session.run(audio,language='zh',timestamps='none',vocabulary=terms,
++                                   prompt=hint if context_supported else None)
++            t=time.perf_counter()
++            parts, unhinted=transcribe_audio(recognize, pcm, int(max_s*16000), a.vocabulary,
++                                             prompt if context_supported else None, compact,
++                                             (tc.OutputTruncated,), recoveries)
++            inference=time.perf_counter()-t
++            for part in parts:
++                result=part['result']
++                row={'start_seconds':part['start']/16000,'end_seconds':part['end']/16000,'seconds':part['seconds'],'text':result.text,'native_timings':dataclasses.asdict(result.timings)}
+                 rows.append(row)
+                 print(json.dumps(row,ensure_ascii=False),flush=True)
+-                start=end
+             data={'model':'Qwen3-ASR-1.7B-Q8_0','runtime':'transcribe.cpp 0.4.0','backend':dataclasses.asdict(selected),'audio_seconds':len(pcm)/16000,'convert_seconds':convert,'model_load_seconds':load,'session_init_seconds':init,'inference_seconds':inference,'total_seconds':time.perf_counter()-started,'realtime_factor':inference/(len(pcm)/16000),'limits':limits,'chunks':rows,'text':'\n'.join(r['text'] for r in rows)}
+             # Remove internal process-local ctypes handle from JSON.
+             data['backend'].pop('_handle',None)
+             data['vocabulary']=a.vocabulary
+             data['context_prompt']=prompt if context_supported else None
+             data['context_prompt_supported']=context_supported
++            data['recovery_attempts']=len(recoveries)
++            data['recovery_errors']=recoveries
++            data['final_hint_mode']='unhinted_full_audio' if unhinted else 'default_with_recovery'
++            data['recovery_vocabulary']=compact[0]
++            data['recovery_context_prompt']=compact[1]
++            data['audio_coverage']=[{'start_seconds':r['start_seconds'],'end_seconds':r['end_seconds'],'characters':len(r['text'])} for r in rows]
+             data['process_peak_ram_bytes']=peak_ram_bytes()
+             a.output.parent.mkdir(parents=True,exist_ok=True)
+             a.output.write_text(json.dumps(data,ensure_ascii=False,indent=2,default=str),encoding='utf-8')
+             a.output.with_suffix('.txt').write_text(data['text'],encoding='utf-8')
+             print(json.dumps({k:v for k,v in data.items() if k not in ('text','chunks')},ensure_ascii=False,default=str),flush=True)
+ 
+-if __name__=='__main__':main()
++if __name__=='__main__':
++    try:
++        main()
++    except Exception as error:
++        # The caller stores a bounded diagnostic. Keep the exception type and
++        # final native status together instead of burying them in a traceback.
++        print(json.dumps({'error_type':type(error).__name__,'reason':str(error)[-350:],
++                          'failed_range':getattr(error,'failed_range',None),
++                          'recovery_trace':getattr(error,'recovery_trace',[])},
++                         ensure_ascii=False),file=sys.stderr,flush=True)
++        raise SystemExit(1)

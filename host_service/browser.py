@@ -393,13 +393,13 @@ class BrowserManager:
             while len(self._transcription_sources) > 512:
                 self._transcription_sources.pop(next(iter(self._transcription_sources)))
 
-    def capture_transcription_media(self, video, *, deadline, check_cancelled, force_refresh=False):
+    def capture_transcription_media(self, video, *, deadline, check_cancelled, force_refresh=False, prefer_video=False):
         """Resolve complete audio, or a small platform video when audio is muxed."""
         video_id = str(video["id"])
         check_cancelled()
         with self._transcription_source_lock:
             cached = self._transcription_sources.pop(video_id, None)
-        if not force_refresh and cached and cached[0] > time.monotonic() and str(cached[1].get('accountId')) == str(video.get('accountId')):
+        if not force_refresh and not prefer_video and cached and cached[0] > time.monotonic() and str(cached[1].get('accountId')) == str(video.get('accountId')):
             return {**cached[1], 'origin': 'collection'}
         # Account collection may own the browser for many minutes. Waiting for
         # that lock is queue time, not a failed media lookup; keep the lease alive.
@@ -409,6 +409,7 @@ class BrowserManager:
             check_cancelled()
             result = self._rpc({"action": "capture", "payload": {
                 "videoId": video_id, "accountId": video.get("accountId"), "purpose": "transcription",
+                "preferVideo": prefer_video,
                 "videoUrl": f"https://www.douyin.com/video/{video_id}",
             }}, timeout=180, check_cancelled=check_cancelled)
         finally:

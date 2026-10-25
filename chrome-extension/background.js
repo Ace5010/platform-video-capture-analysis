@@ -1136,7 +1136,7 @@ async function collectTranscriptionSource(tabId, videoId, accountId) {
   try {
     const sources = await executeInTab(tabId, extractVerifiedVideoMediaSources, [videoId, [], true], 'MAIN');
     const audio = sources?.audioCandidates?.[0];
-    const video = audio ? null : selectPreviewVideoCandidate(new Map((sources?.videoCandidates || [])
+    const video = audio ? null : selectTranscriptionVideoCandidate(new Map((sources?.videoCandidates || [])
       .map(candidate => [candidate.url, { url: candidate.url, metadata: { ...candidate, targetBound: true } }])));
     if (!audio && !video) return null;
     return { videoId, accountId, origin: 'collection',
@@ -1476,10 +1476,12 @@ function extractVerifiedVideoMediaSources(expectedVideoId, receivedMediaRoots = 
       containerFormat: scalarText(value.format, value.containerFormat, inherited.containerFormat) || null,
     };
   };
-  const addCandidate = (kind, rawUrl, metadata) => {
+  const addCandidate = (kind, rawUrl, metadata, sourcePath = '') => {
     const url = normalizedMediaUrl(rawUrl);
     if (!url) return;
-    const candidate = { url, ...metadataFrom(metadata) };
+    const candidate = { url, ...metadataFrom(metadata), sourceRole:
+      /download_addr|downloadaddr|download_url|downloadurl/.test(sourcePath) ? 'download'
+        : /play_addr|playaddr|play_url|playurl/.test(sourcePath) ? 'play' : 'unknown' };
     const score = (candidate.width || 0) * (candidate.height || 0) * 1_000_000
       + (candidate.bitrate || 0) * 1_000
       + (candidate.contentLength || 0);
@@ -1544,7 +1546,7 @@ function extractVerifiedVideoMediaSources(expectedVideoId, receivedMediaRoots = 
       const addressPath = /(?:play_addr|playaddr|play_url|playurl|download_addr|downloadaddr|url_list|urllist|\.urls?$|\.src$)/.test(path);
       if (!imagePath && (addressPath || mime.startsWith('video/') || mime.startsWith('audio/'))) {
         const kind = audioPath && (!videoPath || fullAudioOnly) ? 'audio' : 'video';
-        for (const url of urlsFrom(value)) addCandidate(kind, url, metadata);
+        for (const url of urlsFrom(value)) addCandidate(kind, url, metadata, path);
       }
       for (const [key, child] of Object.entries(value)) {
         const childPath = current.path ? `${current.path}.${key}` : key;
@@ -1557,7 +1559,7 @@ function extractVerifiedVideoMediaSources(expectedVideoId, receivedMediaRoots = 
               && (fullAudioOnly || !/(?:^|\.)(?:video|bit_rate|bitrate)(?:\.|$)/.test(lowered))
               ? 'audio'
               : 'video';
-            addCandidate(kind, child, metadata);
+            addCandidate(kind, child, metadata, lowered);
           }
         } else if (child && typeof child === 'object') {
           queue.push({ value: child, path: childPath, metadata });
@@ -1797,7 +1799,7 @@ function previewCandidateMetadata(candidate) {
     width: candidate?.width, height: candidate?.height, bitrate: candidate?.bitrate,
     contentLength: candidate?.contentLength, codec: candidate?.codec,
     contentType: candidate?.contentType, targetBound: candidate?.targetBound,
-    containerFormat: candidate?.containerFormat,
+    containerFormat: candidate?.containerFormat, sourceRole: candidate?.sourceRole,
   };
 }
 
@@ -1813,6 +1815,15 @@ function previewByteSize(candidate) {
   // Prefer a smaller measured payload, then a lower bitrate. Resolution labels
   // alone never prove a smaller transfer.
   return metadata.contentLength || metadata.bitrate || pixels || 0;
+}
+
+function selectTranscriptionVideoCandidate(videoCandidates) {
+  // Download renditions may append a platform outro. Keep the original play
+  // timeline for transcription, then retain the usual low-size selection.
+  const values = [...videoCandidates.values()];
+  const original = values.filter(candidate => previewCandidateMetadata(candidate).sourceRole === 'play');
+  return selectPreviewVideoCandidate(new Map((original.length ? original : values)
+    .map(candidate => [candidate.url, candidate])));
 }
 
 function selectPreviewVideoCandidate(videoCandidates) {
@@ -2070,6 +2081,7 @@ async function captureFullVideoForAnalysis({
   accountId,
   videoUrl,
   purpose = 'analysis',
+  preferVideo = false,
   requireCompleteMetadata = false,
   savedVideoMetadata = null,
 }) {
@@ -2100,7 +2112,7 @@ async function captureFullVideoForAnalysis({
       [videoId, [], transcriptionPurpose],
       'MAIN',
     );
-    if (transcriptionPurpose && structuredSources?.audioCandidates?.length) {
+    if (transcriptionPurpose && !preferVideo && structuredSources?.audioCandidates?.length) {
       const source = [...structuredSources.audioCandidates].sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
       const target = await executeInTab(tab.id, inspectVerifiedVideoTarget, [videoId]);
       if (!target?.targetMatches) throw new Error('口播音轨目标视频校验失败');
@@ -2115,7 +2127,8 @@ async function captureFullVideoForAnalysis({
           url: candidate.url, metadata: { ...candidate, targetBound: true, sourceKind: 'structured' },
         }));
         const measuredPublished = published.filter(({ metadata }) => metadata.width > 0 && metadata.height > 0);
-        const publishedPreview = selectPreviewVideoCandidate(new Map(measuredPublished.map(candidate => [candidate.url, candidate])));
+        const publishedPreview = (transcriptionPurpose ? selectTranscriptionVideoCandidate : selectPreviewVideoCandidate)(
+          new Map(measuredPublished.map(candidate => [candidate.url, candidate])));
         if (!publishedPreview) return null;
         // These URLs are already bound to the exact target record. The host
         // checks their actual tracks and Range support, so waiting for the
