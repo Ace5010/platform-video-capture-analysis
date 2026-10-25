@@ -7,7 +7,8 @@
 - `app/wechat-workspace.tsx` / `.css`：原生 React 微信工作区；无 iframe、无 ChatLab 整站嵌入。
 - `lib/observe-navigation.ts`：模块与内部入口恢复。地址栏和 localStorage 仅持久化模块/入口，不持久化群名、正文、搜索词。
 - `host_service/wechat/`：从已验证的微信项目接入归档校验、完整话题讨论、总结规范、CodeBuddy 生成与读取任务。`vendor/` 保留固定版本校验及许可证。
-- `/api/wechat/*`：与视频共用主机服务，沿用会话和 CSRF；微信接口在打开归档前检查本机连接与 localhost 来源。共享 `/api/state`、静态页面和远程代理不包含微信内容。
+- `/api/wechat/*`：与视频共用主机服务，沿用密码会话和 CSRF。正式 HTTPS 工作台通过原有私有通道开放已归档的群列表、日期、总结、完整讨论和原文筛选；未登录、其他来源及直接局域网访问不能读取微信归档。管理记录、读取聊天和付费生成继续在打开归档前检查电脑 localhost 权限。
+- 手机与电脑读取同一份归档，不创建云端数据副本。远程群列表排除账号标识、批次和任务记录；正文接口使用 `private, no-store`，不嵌入静态页面或写入浏览器持久存储。筛选仅通过带 CSRF 的 POST 查询，消息按文本渲染，不执行消息中的 HTML。共享 `/api/state` 和匿名静态页面继续不含微信内容。
 - 原有 `scripts/launch.ps1` 即可启动全部工作台。无需 3110 或 3113 服务。
 
 ## 数据和依赖

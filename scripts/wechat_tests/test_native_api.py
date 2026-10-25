@@ -13,7 +13,8 @@ from host_service.wechat.archive import ArchiveError, build_export, save_export
 from host_service.wechat.service import WeChatService
 from host_service.wechat.summaries import day_bounds
 from host_service.wechat.summarize import save
-from host_service.server import create_server, HostRequestHandler
+from host_service.server import create_server, create_remote_gateway, HostRequestHandler
+from types import SimpleNamespace
 spec = importlib.util.spec_from_file_location('api_helpers', Path(__file__).resolve().parents[1] / 'test-host-service.py')
 helpers = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(helpers)
@@ -120,14 +121,48 @@ class NativeWeChatTests(unittest.TestCase):
             self.assertEqual(client.request('GET','/api/wechat/context')[0],200)
             self.assertEqual(client.request('POST','/api/wechat/search',self.query,csrf='bad')[0],403)
             self.assertEqual(client.request('POST','/api/wechat/search',self.query)[1]['total'],120)
-            with patch.object(self.service,'context',side_effect=AssertionError('must not read archive')):
-                self.assertEqual(client.request('GET','/api/wechat/context',origin=helpers.REMOTE_ORIGIN)[0],403)
-                with patch.object(HostRequestHandler,'_remote_ip',return_value='192.168.1.8'):
-                    self.assertEqual(client.request('GET','/api/wechat/context')[0],403)
+            with patch.object(HostRequestHandler,'_remote_ip',return_value='192.168.1.8'):
+                self.assertEqual(client.request('GET','/api/wechat/context')[0],403)
             state=client.request('GET','/api/state')[1]
             self.assertNotIn('测试群',json.dumps(state,ensure_ascii=False))
             self.assertNotIn('话题 apple',json.dumps(state,ensure_ascii=False))
         finally:
             server.shutdown();server.server_close();thread.join(3)
+
+    def test_https_gateway_saved_reads_share_auth_without_management_or_cache(self):
+        server=create_server(helpers.create_test_config(self.root/'host'))
+        origin='https://workbench.example'
+        gateway=create_remote_gateway(server,SimpleNamespace(origin=origin),port=0)
+        gateway.wechat=self.service
+        threads=[threading.Thread(target=s.serve_forever,daemon=True) for s in (server,gateway)]
+        for thread in threads: thread.start()
+        try:
+            local=helpers.ApiClient(*server.server_address)
+            local.request('POST','/api/auth/setup',{'password':'isolated-test-password'},use_cookie=False)
+            remote=helpers.ApiClient(*gateway.server_address)
+            paths=['/api/wechat/context',f'/api/wechat/days?group={self.group}',
+                   f'/api/wechat/summary?group={self.group}&date={self.day}',
+                   f'/api/wechat/original?group={self.group}&date={self.day}']
+            for path in paths:self.assertEqual(remote.request('GET',path,origin=origin)[0],401)
+            remote.cookie,remote.csrf=local.cookie,local.csrf
+            status,result,headers=remote.request('GET',paths[0],origin=origin)
+            self.assertEqual(status,200)
+            self.assertEqual(result['groups'][0]['id'],self.group)
+            self.assertEqual(result['batches'],[]);self.assertEqual(result['read_jobs'],[])
+            self.assertNotIn('account_label',result['groups'][0])
+            self.assertEqual(dict(headers)['Cache-Control'],'private, no-store')
+            for path in paths[1:]:self.assertEqual(remote.request('GET',path,origin=origin)[0],200)
+            self.assertEqual(remote.request('POST','/api/wechat/search',self.query,origin=origin)[1]['total'],120)
+            self.assertEqual(remote.request('POST','/api/wechat/search',self.query,origin=origin,csrf='bad')[0],403)
+            self.assertEqual(remote.request('GET',paths[0],origin='https://untrusted.example')[0],403)
+            self.assertEqual(remote.request('POST','/api/wechat/search',{**self.query,'group':'other'},origin=origin)[0],400)
+            with patch.object(self.service,'get',side_effect=AssertionError('must not open management')):
+                self.assertEqual(remote.request('GET',f'/api/wechat/generation?group={self.group}&date={self.day}',origin=origin)[0],403)
+            with patch.object(self.service,'post',side_effect=AssertionError('must not execute jobs')):
+                for action in ('read','generate','context','unknown'):
+                    self.assertEqual(remote.request('POST','/api/wechat/'+action,{'confirmed':True},origin=origin)[0],403)
+        finally:
+            for s in (gateway,server):s.shutdown();s.server_close()
+            for thread in threads:thread.join(3)
 
 if __name__=='__main__': unittest.main(verbosity=2)

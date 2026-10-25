@@ -8,6 +8,7 @@ const COOKIE_NAME = 'douyin_monitor_session';
 const MAX_BODY_BYTES = 64 * 1024;
 const GET_PATHS = new Set(['/health', '/api/auth/status', '/api/state', '/api/jobs', '/api/qwen', '/api/qwen/status']);
 const POST_PATHS = new Set(['/api/auth/login', '/api/auth/logout', '/api/accounts/upsert', '/api/accounts/remove', '/api/accounts/ack-updates', '/api/discoveries/clear', '/api/video-links/analyze', '/api/jobs', '/api/previews/prepare']);
+const WECHAT_READ_PATHS = new Set(['/api/wechat/context', '/api/wechat/days', '/api/wechat/summary', '/api/wechat/original']);
 // On-demand playback: the host resolves the low-resolution source itself, so
 // the gateway only ever forwards a registered work id and a source generation.
 const PREVIEW_STATUS_PATH = /^\/api\/previews\/\d{1,32}\/status$/;
@@ -31,9 +32,9 @@ export async function proxyHostRequest(request: Request, env: HostProxyEnvironme
   const path = url.pathname.slice('/host'.length);
   const mediaPath = PREVIEW_MEDIA_PATH.test(path);
   const allowed = request.method === 'GET'
-    ? GET_PATHS.has(path) || mediaPath || PREVIEW_STATUS_PATH.test(path) || /^\/api\/jobs\/[a-zA-Z0-9_-]+$/.test(path)
+    ? GET_PATHS.has(path) || WECHAT_READ_PATHS.has(path) || mediaPath || PREVIEW_STATUS_PATH.test(path) || /^\/api\/jobs\/[a-zA-Z0-9_-]+$/.test(path)
     : request.method === 'HEAD' && mediaPath ? true
-    : request.method === 'POST' && (POST_PATHS.has(path) || /^\/api\/jobs\/[a-zA-Z0-9_-]+\/cancel$/.test(path));
+    : request.method === 'POST' && (POST_PATHS.has(path) || path === '/api/wechat/search' || /^\/api\/jobs\/[a-zA-Z0-9_-]+\/cancel$/.test(path));
   if (!allowed) return errorResponse(403, '此操作只能在电脑的 localhost 工作台执行，或接口不受支持');
   const origin = request.headers.get('Origin');
   const site = request.headers.get('Sec-Fetch-Site');
@@ -97,11 +98,23 @@ export async function proxyHostRequest(request: Request, env: HostProxyEnvironme
       headers.set('Content-Length', String(size));
     }
     const target = new URL(`http://127.0.0.1:43130${path}`);
-    // No arbitrary parameters are forwarded; only the existing jobs page limit.
+    // Forward only the query fields needed by the selected read endpoint.
     if (path === '/api/jobs' && request.method === 'GET' && url.searchParams.has('limit')) {
       const limit = url.searchParams.get('limit') || '';
       if (!/^\d{1,3}$/.test(limit) || Number(limit) < 1 || Number(limit) > 100) return errorResponse(400, '任务数量范围无效');
       target.searchParams.set('limit', limit);
+    }
+    if (WECHAT_READ_PATHS.has(path) && path !== '/api/wechat/context') {
+      const fields = path === '/api/wechat/days' ? ['group']
+        : path === '/api/wechat/original' ? ['group', 'date', 'topic'] : ['group', 'date'];
+      for (const field of fields) {
+        if (!url.searchParams.has(field)) continue;
+        const value = url.searchParams.get(field) || '';
+        const valid = field === 'group' ? /^[a-zA-Z0-9_-]{1,80}$/.test(value)
+          : field === 'date' ? /^\d{4}-\d{2}-\d{2}$/.test(value) : /^\d{1,2}$/.test(value);
+        if (!valid || url.searchParams.getAll(field).length !== 1) return errorResponse(400, '微信阅读参数无效');
+        target.searchParams.set(field, value);
+      }
     }
     const upstream = await env.HOST_SERVICE.fetch(new Request(target, { method: request.method, headers, body, redirect: 'manual', signal }));
     if (mediaPath && [200, 206, 416].includes(upstream.status)) {
@@ -128,7 +141,12 @@ export async function proxyHostRequest(request: Request, env: HostProxyEnvironme
       if (upstream.status >= 500) return errorResponse(503, '电脑连接通道暂时不可用，请确认电脑工作台和隧道正在运行。', upstream.status);
       return errorResponse(502, '电脑连接通道返回了无效响应，请检查后台与隧道状态');
     }
-    const responseHeaders = new Headers({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+    const responseHeaders = new Headers({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': path.startsWith('/api/wechat/') ? 'private, no-store' : 'no-store', 'X-Content-Type-Options': 'nosniff' });
+    if (path.startsWith('/api/wechat/')) {
+      responseHeaders.set('X-Frame-Options', 'DENY');
+      responseHeaders.set('Referrer-Policy', 'no-referrer');
+      responseHeaders.set('Cross-Origin-Resource-Policy', 'same-origin');
+    }
     if (upstream.headers.get('Content-Encoding') === 'gzip') {
       responseHeaders.set('Content-Encoding', 'gzip');
       responseHeaders.set('Vary', 'Accept-Encoding');

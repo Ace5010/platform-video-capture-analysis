@@ -98,7 +98,6 @@ export function WeChatWorkspace({ active, local, request, page, onPage, onTaskSt
   }, [active, confirmation, hasOverlay]);
 
   const loadArchive = useCallback(async () => {
-    if (!local) return;
     setError('');
     try {
       const value = await request<ArchiveContext>('context');
@@ -111,10 +110,10 @@ export function WeChatWorkspace({ active, local, request, page, onPage, onTaskSt
       setGroupId(current => value.groups.some(g => g.id === current) ? current : value.groups[0]?.id || '');
       loaded.current = true;
     } catch (e) { setError(errorText(e)); }
-  }, [local, request]);
-  useEffect(() => { if (active && local && !loaded.current) void loadArchive(); }, [active, local, loadArchive]);
+  }, [request]);
+  useEffect(() => { if (active && !loaded.current) void loadArchive(); }, [active, local, loadArchive]);
   useEffect(() => {
-    if (!local || !groupId) return;
+    if (!groupId) return;
     let valid = true;
     void request<{ days: Day[] }>(`days?group=${encodeURIComponent(groupId)}`).then(value => {
       if (!valid) return;
@@ -126,10 +125,10 @@ export function WeChatWorkspace({ active, local, request, page, onPage, onTaskSt
     return () => { valid = false; };
   }, [groupId, local, request, refresh]);
   useEffect(() => {
-    if (!local || !date || !groupId) return;
+    if (!date || !groupId) return;
     const sequence = ++scopeSequence.current;
     setLoading(true); setSummaryError(''); setSummary(null); setTopicIndex(0); setJob(null); setUpdated(false);
-    void Promise.all([request<Summary>(`summary?${query}`), request<{ job: Job | null }>(`generation?${query}`)])
+    void Promise.all([request<Summary>(`summary?${query}`), local ? request<{ job: Job | null }>(`generation?${query}`) : Promise.resolve({ job: null })])
       .then(([result, latest]) => {
         if (sequence !== scopeSequence.current) return;
         setSummary(result); setJob(latest.job);
@@ -163,7 +162,7 @@ export function WeChatWorkspace({ active, local, request, page, onPage, onTaskSt
   }, [job?.status, readBusy, updated, archive?.read_jobs, onTaskStatus]);
 
   const loadMessages = useCallback(async (append = false) => {
-    if (!local || !from || !to || !groupId) return;
+    if (!from || !to || !groupId) return;
     const sequence = ++searchSequence.current;
     setMessagesLoading(true); setMessageError('');
     try {
@@ -173,7 +172,7 @@ export function WeChatWorkspace({ active, local, request, page, onPage, onTaskSt
       setMessagePage(current => append && current ? { ...result, messages: [...current.messages, ...result.messages] } : result);
     } catch (e) { if (sequence === searchSequence.current) setMessageError(errorText(e)); }
     finally { if (sequence === searchSequence.current) setMessagesLoading(false); }
-  }, [local, from, to, groupId, keyword, member, messagePage?.next, request]);
+  }, [from, to, groupId, keyword, member, messagePage?.next, request]);
   useEffect(() => {
     if (mode !== 'messages' || messagePage || !from) return;
     void loadMessages();
@@ -195,7 +194,10 @@ export function WeChatWorkspace({ active, local, request, page, onPage, onTaskSt
     if (messages.current) messages.current.scrollTop = messagePosition.current;
   }, [groupId, date, topicIndex, mode, page, summary]);
 
+  useEffect(() => { if (!local && page !== 'reading') onPage('reading'); }, [local, page, onPage]);
+
   function selectPage(next: 'reading' | 'manage') {
+    if (!local && next === 'manage') return;
     if (page === 'reading') { positions.current.set(`${groupId}:${date}:${topicIndex}`, reading.current?.scrollTop || 0); messagePosition.current = messages.current?.scrollTop || 0; }
     onPage(next);
   }
@@ -239,10 +241,11 @@ export function WeChatWorkspace({ active, local, request, page, onPage, onTaskSt
     } catch (e) { if (sequence === originalSequence.current) setOverlay(current => current && { ...current, error: errorText(e), loading: false }); }
   }
   function confirm(kind: 'generate' | 'sync' | 'import') {
+    if (!local) return;
     requestId.current = crypto.randomUUID().replaceAll('-', ''); setConfirmation(kind); setError('');
   }
   async function execute() {
-    if (!confirmation || submitting) return;
+    if (!local || !confirmation || submitting) return;
     setSubmitting(true);
     try {
       if (confirmation === 'generate') {
@@ -270,11 +273,10 @@ export function WeChatWorkspace({ active, local, request, page, onPage, onTaskSt
   return <section className="wxModule" hidden={!active} aria-label="微信读取">
     <nav className="moduleFunctionBar" aria-label="微信功能">
       <button aria-current={page === 'reading' ? 'page' : undefined} onClick={() => selectPage('reading')}>消息阅读</button>
-      <button aria-current={page === 'manage' ? 'page' : undefined} onClick={() => selectPage('manage')}>读取管理</button>
-      {local && <button className="wxRefresh" onClick={() => { void loadArchive(); setRefresh(n => n + 1); setMessagePage(null); }}>刷新</button>}
+      {local && <button aria-current={page === 'manage' ? 'page' : undefined} onClick={() => selectPage('manage')}>读取管理</button>}
+      <button className="wxRefresh" onClick={() => { void loadArchive(); setRefresh(n => n + 1); setMessagePage(null); }}>刷新</button>
     </nav>
-    {!local ? <div className="wxLocalOnly"><h2>微信归档仅限本机访问</h2><p>请在运行工作台的电脑上打开 localhost。此入口不读取或缓存微信正文。</p></div> :
-      <div className="wxWorkspace">
+    <div className="wxWorkspace">
         <aside className={`wxGroups ${groupsOpen ? 'isExpanded' : ''}`}>
           <button className="wxGroupToggle" onClick={() => setGroupsOpen(v => !v)} aria-expanded={groupsOpen}>{group?.name || '选择群'} ▾</button>
           <div className="wxGroupOptions"><h2>已归档的群</h2>{archive?.groups.map(g => <button key={g.id} aria-current={groupId === g.id ? 'true' : undefined} onClick={() => {
@@ -284,8 +286,8 @@ export function WeChatWorkspace({ active, local, request, page, onPage, onTaskSt
         <main className="wxMain" ref={workspaceMain}>
           <div className="wxMainContent" inert={hasOverlay || Boolean(confirmation)}>
           {error && <div className="wxError" role="alert">{error}<button onClick={() => void loadArchive()}>重试</button></div>}
-          {!archive && !error && <p className="wxEmpty">正在读取本机归档…</p>}
-          {archive && page === 'manage' && <div className="wxManagement">
+          {!archive && !error && <p className="wxEmpty">正在读取归档…</p>}
+          {archive && local && page === 'manage' && <div className="wxManagement">
             <section className="wxReadAction"><h1>{group?.name}</h1>
               <p>{group?.end ? `已读取至 ${timeOf(group.end)}` : '尚未读取聊天'}</p>
               {latestRead && ['unknown', 'failed', 'incomplete', 'saved_pending_import'].includes(latestRead.status) && <p className="wxReadStatus" role="status">{latestRead.error || statusText[latestRead.status]}</p>}
@@ -301,11 +303,11 @@ export function WeChatWorkspace({ active, local, request, page, onPage, onTaskSt
               {archive.read_jobs.map(j => <article className="wxRecord" key={j.id}><header><b>{j.kind === 'import' ? (j.status === 'imported' ? '导入成功' : '重试导入') : readStatus[j.status] || '结果待核实'}</b></header><dl>{j.started_at && <><dt>执行时间</dt><dd>{jobTime(j.started_at)}</dd></>}{j.kind !== 'import' && <><dt>读取范围</dt><dd>{j.days ? `最近 ${j.days} 天` : '从上次位置读取新增聊天'}</dd></>}</dl>{j.error && <p>{j.error}</p>}</article>)}
             </section></details>
           </div>}
-          {archive && page === 'reading' && <>
+          {archive && (!local || page === 'reading') && <>
             <header className="wxHeading"><h1>{group?.name}</h1></header>
             <div className="wxReadingControls"><div className="wxViewTabs"><button aria-pressed={mode === 'summary'} onClick={() => changeMode('summary')}>聊天总结</button><button aria-pressed={mode === 'messages'} onClick={() => changeMode('messages')}>聊天原文</button></div>
               {mode === 'messages' && (from !== date || to !== date) ? <div className="wxDateRange"><span>{from === to ? from : `${from} — ${to}`}</span><button onClick={() => selectDate(date)}>返回单日</button></div> : <label>聊天日期 <select value={date} onChange={e => selectDate(e.target.value)} aria-label="聊天日期">{[...days].reverse().map(d => <option key={d.date}>{d.date}</option>)}</select></label>}
-              {mode === 'summary' ? <button className="wxGenerate" disabled={busy || readBusy || !selectedDay?.summarizable} onClick={() => confirm('generate')}>{summary?.status === 'ready' ? '重新总结' : '生成总结'}</button> : <button onClick={toggleFilters} aria-expanded={filtersOpen}>筛选{member || keyword || from !== date || to !== date ? ' · 已启用' : ''}</button>}
+              {mode === 'summary' ? local && <button className="wxGenerate" disabled={busy || readBusy || !selectedDay?.summarizable} onClick={() => confirm('generate')}>{summary?.status === 'ready' ? '重新总结' : '生成总结'}</button> : <button onClick={toggleFilters} aria-expanded={filtersOpen}>筛选{member || keyword || from !== date || to !== date ? ' · 已启用' : ''}</button>}
             </div>
             {mode === 'messages' && filtersOpen && <form className="wxFilters" onSubmit={e => { e.preventDefault(); setFrom(filterDates.from); setTo(filterDates.to); messagePosition.current = 0; setMessagePage(null); }}>
               <label>开始日期<select aria-label="开始日期" value={filterDates.from} onChange={e => setFilterDates(current => ({ from: e.target.value, to: current.to < e.target.value ? e.target.value : current.to }))}>{days.map(d => <option key={d.date}>{d.date}</option>)}</select></label><label>结束日期<select aria-label="结束日期" value={filterDates.to} onChange={e => setFilterDates(current => ({ ...current, to: e.target.value }))}>{days.filter(d => d.date >= filterDates.from).map(d => <option key={d.date}>{d.date}</option>)}</select></label>
@@ -316,7 +318,7 @@ export function WeChatWorkspace({ active, local, request, page, onPage, onTaskSt
               {job && (job.status !== 'complete' || updated) && <div className="wxJobStatus" role="status">{job.status === 'complete' ? '新总结已完成' : job.error || statusText[job.status]}{updated && <button onClick={() => setRefresh(n => n + 1)}>查看新总结</button>}</div>}
               {summary?.stale && <p className="wxNotice">归档有更新，当前总结尚未包含新增消息。</p>}
               {summary?.partial && summary.coverage_end && <p className="wxNotice">总结截至 {timeOf(summary.coverage_end)}</p>}
-              {loading ? <p className="wxEmpty">正在读取总结…</p> : summaryError ? <p className="wxError">{summaryError}</p> : !summary?.summary ? <p className="wxEmpty">{selectedDay?.partial ? `聊天已读取至 ${clockOf(selectedDay.coverage_end)}，可以生成当前总结。` : selectedDay && !selectedDay.summarizable ? '这一天的聊天未完整读取，请先补充读取。' : '这一天尚无总结。'}</p> :
+              {loading ? <p className="wxEmpty">正在读取总结…</p> : summaryError ? <p className="wxError">{summaryError}</p> : !summary?.summary ? <p className="wxEmpty">{selectedDay?.partial ? `聊天已读取至 ${clockOf(selectedDay.coverage_end)}，${local ? '可以生成当前总结。' : '请在电脑生成总结。'}` : selectedDay && !selectedDay.summarizable ? '这一天的聊天未完整读取，请在电脑补充读取。' : '这一天尚无总结。'}</p> :
                 <div className="wxSummaryGrid"><nav className="wxTopics" aria-label="当日话题"><button className="wxTopicToggle" onClick={() => setDirectoryOpen(v => !v)} aria-expanded={directoryOpen}>切换话题 ▾</button><div className={directoryOpen ? 'wxTopicOptions isOpen' : 'wxTopicOptions'}>{summary.summary.topics.map((t, index) => <button key={index} aria-current={topicIndex === index ? 'true' : undefined} onClick={() => selectTopic(index)}>{t.navigation_title || t.title}</button>)}</div></nav>
                   <div className="wxTopicReading" ref={reading} tabIndex={0}>{topic && <article><h2><Prose text={topic.title} people={people} /></h2><p className="wxTopicLead"><Prose text={topic.summary} people={people} /></p>
                     {topic.blocks?.map((block, index) => <section key={index} className="wxDiscussion"><h3>{block.heading}</h3>{block.speaker && <Person name={people[block.speaker] || block.speaker} />}<p><Prose text={block.text} people={people} /></p>
@@ -340,6 +342,6 @@ export function WeChatWorkspace({ active, local, request, page, onPage, onTaskSt
             {error && <p className="wxError">{error}</p>}<div className="wxActions"><button disabled={submitting} onClick={() => setConfirmation(null)}>取消</button><button disabled={submitting} onClick={() => void execute()}>{submitting ? '正在提交…' : '确认执行'}</button></div>
           </section></div>}
         </main>
-      </div>}
+      </div>
   </section>;
 }

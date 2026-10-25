@@ -116,3 +116,27 @@ respond = async () => new Response(null, { status: 200, headers: {
 assert.equal((await proxyHostRequest(request(previewMediaPath, { method: 'HEAD' }), env)).status, 200);
 assert.equal((await proxyHostRequest(request('/api/previews/1234567890123456789/status', { method: 'HEAD' }), env)).status, 403);
 console.log('HTTPS 主机网关检查通过：来源、白名单、Cookie、凭据隔离、请求限制、按需播放路由与失败不重发。');
+
+respond = async () => Response.json({ ok: true, messages: [] });
+for (const [path, query] of [
+  ['/api/wechat/context', ''],
+  ['/api/wechat/days', '?group=group_test'],
+  ['/api/wechat/summary', '?group=group_test&date=2026-10-24'],
+  ['/api/wechat/original', '?group=group_test&date=2026-10-24&topic=2'],
+]) {
+  assert.equal((await proxyHostRequest(request(path+query+(query?'&':'?')+'target=private'), env)).status, 200);
+  assert.equal(requests.at(-1)?.url, 'http://127.0.0.1:43130'+path+query);
+}
+assert.equal((await proxyHostRequest(request('/api/wechat/search', post({'X-CSRF-Token':'c'.repeat(64)})), env)).status,200);
+assert.equal(requests.at(-1)?.headers.get('X-CSRF-Token'),'c'.repeat(64));
+const beforeRestrictedWeChat=requests.length;
+for (const path of ['/api/wechat/read','/api/wechat/generate','/api/wechat/generation','/api/wechat/config','/api/wechat/export']) {
+  assert.equal((await proxyHostRequest(request(path), env)).status,403);
+  assert.equal((await proxyHostRequest(request(path, post()), env)).status,403);
+}
+assert.equal(requests.length,beforeRestrictedWeChat);
+for (const query of ['?group=../private','?group=group_test&date=invalid','?group=group_test&date=2026-10-24&topic=-1','?group=group_test&group=other']) {
+  assert.equal((await proxyHostRequest(request('/api/wechat/original'+query),env)).status,400);
+}
+assert.equal((await proxyHostRequest(request('/api/wechat/search',post({Origin:'https://untrusted.example'})),env)).status,403);
+console.log('WeChat gateway passed: exact saved-read routes, preserved group/date/topic, CSRF search and blocked management.');

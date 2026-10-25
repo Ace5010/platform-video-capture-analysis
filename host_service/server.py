@@ -216,9 +216,15 @@ class HostRequestHandler(BaseHTTPRequestHandler):
             raise ApiError(HTTPStatus.FORBIDDEN, message)
 
     def _wechat_request(self, action, payload=None):
-        # Enforce this before importing the module or opening any archive. The
-        # remote gateway and LAN sessions never inherit access to WeChat data.
-        self._require_local_dashboard('微信归档仅允许在这台电脑的 localhost 工作台访问')
+        local = self._local_dashboard()
+        # Authenticated remote readers share the saved archive. Capture,
+        # generation and management remain local, checked before opening it.
+        read_only = (self.command == 'GET' and action in {'context', 'days', 'summary', 'original'}
+                     or self.command == 'POST' and action == 'search')
+        if not local and not self.server.remote_connection:
+            raise ApiError(HTTPStatus.FORBIDDEN, '请通过已登录的正式 HTTPS 工作台阅读微信归档')
+        if not local and not read_only:
+            raise ApiError(HTTPStatus.FORBIDDEN, '微信读取管理和生成总结仅允许在电脑的 localhost 工作台执行')
         from .wechat.archive import ArchiveError
         from .wechat.service import WeChatService
         with self.server.wechat_guard:
@@ -229,6 +235,11 @@ class HostRequestHandler(BaseHTTPRequestHandler):
             if payload is None:
                 query = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
                 result = service.get(action, query)
+                if not local and action == 'context':
+                    result = {'groups': [{key: group[key] for key in
+                              ('id', 'name', 'start', 'end', 'message_count', 'status') if key in group}
+                              for group in result['groups']], 'members': result['members'],
+                              'batches': [], 'read_jobs': []}
             else:
                 result = service.post(action, payload)
         except ArchiveError as exc:
@@ -267,7 +278,7 @@ class HostRequestHandler(BaseHTTPRequestHandler):
         if encoding:
             self.send_header("Content-Encoding", encoding)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "private, no-store" if urlsplit(self.path).path.startswith('/api/wechat/') else "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")

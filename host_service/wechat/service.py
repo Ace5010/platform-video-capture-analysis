@@ -1,4 +1,4 @@
-"""Local-only facade. Reads archives; capture and paid generation are explicit jobs."""
+"""Shared archive reads; local capture and paid generation are explicit jobs."""
 from datetime import datetime, timezone
 import json
 import os

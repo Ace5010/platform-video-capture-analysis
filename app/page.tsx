@@ -879,6 +879,7 @@ export default function Home() {
       ?? (auth.configured === false),
     );
     const authenticated = Boolean(auth.authenticated ?? auth.loggedIn);
+    if (auth.localHost === false) setIsHostLocal(false);
     setCsrfToken(textValue(auth.csrfToken ?? auth.csrf_token));
     if (setupRequired) {
       setAuthPhase('setup');

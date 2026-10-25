@@ -60,6 +60,20 @@ try {
   assert.equal(calls.at(-1).encoding, 'gzip');
   assert.equal(await zipped.text(), largeResult, 'compressed upstream must decode once and preserve all history');
 
+  const summaryPath='/host/api/wechat/summary?group=group_fixture&date=2026-10-24';
+  assert.equal((await runtime.dispatchFetch(origin+summaryPath)).status,401);
+  const summary=await runtime.dispatchFetch(origin+summaryPath,{headers:{Cookie:`douyin_monitor_session=${session}`}});
+  assert.equal(summary.status,200);
+  assert.equal(summary.headers.get('Cache-Control'),'private, no-store');
+  assert.equal(summary.headers.get('X-Frame-Options'),'DENY');
+  assert.equal(summary.headers.get('Referrer-Policy'),'no-referrer');
+  assert.equal(calls.at(-1).url,'http://127.0.0.1:43130/api/wechat/summary?group=group_fixture&date=2026-10-24');
+  const wechatCallCount=calls.length;
+  for(const action of ['read','generate','generation','config']){
+    assert.equal((await runtime.dispatchFetch(`${origin}/host/api/wechat/${action}`,{method:'POST',headers:{Origin:origin,'Content-Type':'application/json'},body:'{}'})).status,403);
+  }
+  assert.equal(calls.length,wechatCallCount,'WeChat management was forwarded by the built Worker');
+
   const count = calls.length;
   for (const url of [`${origin}/host/api/qwen/config`, 'https://preview.test/host/api/state']) {
     assert.equal((await runtime.dispatchFetch(url)).status, 403);
