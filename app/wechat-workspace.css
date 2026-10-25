@@ -130,6 +130,11 @@
   .wxReadingControls { padding-top: 12px; }
   .wxWorkspace { grid-template-rows: auto minmax(0,1fr); }
 }
+@media(max-width:740px) {
+  .observeContent .sidebar { top: auto; height: auto; min-height: 60px; }
+  .observeContent .accountRail { height: auto; top: auto; }
+  .observeContent .topbar { top: auto; }
+}
 @media(max-width:700px) {
   .observeGlobalBar { padding: 0 12px; gap: 12px; }
   .observeBrand { font-size: 17px; }
@@ -138,10 +143,7 @@
   .observeGlobalBar nav small { display: none; }
   .observeSettings { font-size: 12px; }
   .observeSettings summary { list-style: none; }
-  .observeContent .sidebar { height: auto; min-height: 60px; }
   .observeContent .appShell { display: block; }
-  .observeContent .accountRail { height: auto; top: auto; }
-  .observeContent .topbar { top: auto; }
   .observeContent .readingDialog { top: 56px; width: calc(100% - 16px); max-height: calc(100dvh - 72px); }
   .moduleFunctionBar { height: 52px; padding: 6px 12px; gap: 6px; }
   .wxModule .moduleFunctionBar button { padding: 7px 8px; font-size: 13px; }
