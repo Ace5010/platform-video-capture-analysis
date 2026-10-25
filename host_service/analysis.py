@@ -28,6 +28,7 @@ from .media import (
 )
 from .qwen import QwenAnalysisValidationError, QwenBudgetExceeded, QwenClient, QwenPartialAnalysisError, QwenUploadLimitExceeded, analysis_section_status
 from .security import SecretStore
+from .codebuddy import CodeBuddyClient
 from .recovery import AnalysisCancelled, requires_user_action, safe_error, user_action_for
 
 
@@ -256,7 +257,7 @@ class AnalysisManager:
         input_evidence: dict[str, Any] = {}
         diagnostics = {"jobId": job_id, "videoId": str(payload.get("videoId") or ""), "failedStage": "capture",
                        "attemptCount": 0, "attempts": [], "completedSteps": [], "lastError": "", "userAction": "",
-                       "versions": {"host": __version__, "analysisModel": self.config.qwen_model, "asrModel": CLOUD_ASR_MODEL}}
+                       "versions": {"host": __version__, "analysisModel": "minimax-m3" if self.config.analysis_provider == "codebuddy" else self.config.qwen_model, "asrModel": CLOUD_ASR_MODEL}}
         stage = "capture"
         model_attempt = 0
         analysis = None
@@ -315,9 +316,26 @@ class AnalysisManager:
                 if ready:
                     diagnostics["completedSteps"].append("content" if section == "contentAnalysis" else "remotion")
             transcript = self._saved_transcript(diagnostics["videoId"])
+            # Collection's local queue owns no paid requests. Give an already
+            # queued local task priority and a bounded chance to finish before
+            # considering the existing user-triggered cloud ASR path.
+            local_state = getattr(self.database, "transcription_state", lambda _: None)
+            state = local_state(diagnostics["videoId"])
+            wait_until = time.monotonic()+120
+            if transcript is None and getattr(self, "local_transcriber", None) and state and state["status"] in {"queued", "processing"}:
+                self.database.prioritize_transcription(diagnostics["videoId"])
+                while transcript is None and time.monotonic() < wait_until:
+                    self._check_cancelled(job_id)
+                    state = local_state(diagnostics["videoId"])
+                    if not state or state["status"] not in {"queued", "processing"}:
+                        break
+                    time.sleep(.25)
+                    transcript = self._saved_transcript(diagnostics["videoId"])
             if transcript is not None:
                 diagnostics["completedSteps"].append("transcript")
             payload, analysis_media, video_probe, actual_duration = self._obtain_media(job_id, payload, task_dir, capture_media, diagnostics)
+            if transcript is None:
+                transcript = self._saved_transcript(diagnostics["videoId"])
             video_id = str(payload["videoId"])
             source_hash = sha256_file(analysis_media)
             video_stream = next((stream for stream in video_probe.get("streams", []) if stream.get("codec_type") == "video"), {})
@@ -335,7 +353,7 @@ class AnalysisManager:
                 "nominalFrameRate": video_stream.get("r_frame_rate"),
             }
             secret = self.secrets.load()
-            qwen = QwenClient(self.config, secret)
+            qwen = CodeBuddyClient(self.config) if self.config.analysis_provider == "codebuddy" else QwenClient(self.config, secret)
             qwen.check_cancelled = lambda: self._check_cancelled(job_id)
             last_model_phase = ""
 
@@ -345,6 +363,8 @@ class AnalysisManager:
                 if phase == "request" and transcript is not None:
                     self._check_cancelled(job_id)
                     save(lambda: self.database.save_analysis_transcript(job_id, transcript, usage_summary()))
+                if phase == "fallback":
+                    self.database.update_job_progress(job_id, "analysis_model_fallback", message="MiniMax 额度已用尽，已切换 GLM-5.3-Flash")
                 if phase in ("reasoning", "content") and phase != last_model_phase:
                     self.database.update_job_progress(job_id, "qwen_receiving_output" if phase == "content" else "qwen_reasoning")
                     last_model_phase = phase

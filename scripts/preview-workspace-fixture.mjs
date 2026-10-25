@@ -88,6 +88,12 @@ const data = {
 };
 
 function browserFixture(fixtureData) {
+  const markPreview = () => {
+    const title = '隔离测试页 · 不会保存数据';
+    if (document.title !== title) document.title = title;
+  };
+  new MutationObserver(markPreview).observe(document.head, { childList: true, subtree: true, characterData: true });
+  markPreview();
   const nativeFetch = window.fetch.bind(window);
   const connectionFailures = Number(new URL(window.location.href).searchParams.get('connectionFailures')) || 0;
   let authChecks = 0;
@@ -148,6 +154,19 @@ function browserFixture(fixtureData) {
 }
 
 const fixtureScript = `;(${browserFixture.toString()})(${JSON.stringify(data)});`;
+// Keep the isolated preview visibly distinct even while a modal is open. The
+// generated notice does not add nodes inside React's hydrated application.
+const fixtureNotice = `<style id="workspace-fixture-notice">
+html::before {
+  content: "隔离测试页：添加、抓取等操作均为模拟，不会保存数据。日常使用：http://localhost:3000/";
+  position: fixed; inset: 0 0 auto; z-index: 2147483647;
+  box-sizing: border-box; padding: 12px 20px;
+  color: #422006; background: #fef08a; border-bottom: 2px solid #a16207;
+  font: 600 16px/1.5 system-ui, sans-serif; text-align: center;
+}
+body { padding-top: 50px !important; }
+@media (max-width: 720px) { body { padding-top: 98px !important; } }
+</style>`;
 const respondMock = (res) => {
   res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Workspace-Fixture': 'true' });
   res.end(JSON.stringify({ ok: true, mocked: true, message: '隔离服务未转发此请求。' }));
@@ -187,7 +206,9 @@ const server = http.createServer((req, res) => {
       delete responseHeaders.etag;
       responseHeaders['content-security-policy'] = `connect-src 'self' http://127.0.0.1:3000 http://localhost:3000 ws://127.0.0.1:3000 ws://localhost:3000 ws://127.0.0.1:${port}`;
       res.writeHead(incoming.statusCode || 502, responseHeaders);
-      res.end(html.replace(/<head\b[^>]*>/i, (head) => `${head}<script src="/__workspace_fixture.js"></script>`));
+      res.end(html
+        .replace(/<title>[^<]*<\/title>/i, '<title>隔离测试页 · 不会保存数据</title>')
+        .replace(/<head\b[^>]*>/i, (head) => `${head}${fixtureNotice}<script src="/__workspace_fixture.js"></script>`));
     });
   });
   upstream.setTimeout(30_000, () => upstream.destroy(new Error('前端代理超时')));
@@ -214,6 +235,6 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 server.listen(0, '127.0.0.1', () => {
-  console.log(`http://127.0.0.1:${server.address().port}`);
-  console.log('模拟接口，无真实采集/模型/数据库');
+  console.log(`隔离测试页：http://127.0.0.1:${server.address().port}`);
+  console.log('所有操作均为模拟，不会保存数据。真实工作台：http://localhost:3000/');
 });

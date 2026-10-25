@@ -69,8 +69,14 @@ class HostConfig:
     preview_prefetch_max_ratio: float
     preview_max_prepare_ids: int
     preview_resolve_timeout_seconds: int
+    preview_probe_bytes: int
+    preview_candidate_probe_limit: int
+    preview_playable_codecs: tuple[str, ...]
     testing: bool
     mock_qwen: bool
+    auto_transcribe: bool = True
+    local_asr_dir: Path = Path("D:/AI/Qwen3-ASR-1.7B")
+    analysis_provider: str = "qwen"
 
     @classmethod
     def from_env(cls) -> "HostConfig":
@@ -112,15 +118,25 @@ class HostConfig:
             # development starting points; adjust them with tests, not guesses.
             preview_purpose="preview",
             preview_cache_bytes=_env_int("DOUYIN_PREVIEW_CACHE_BYTES", 32 * 1024 * 1024, 1024 * 1024, 512 * 1024 * 1024),
-            preview_cache_idle_seconds=_env_int("DOUYIN_PREVIEW_CACHE_IDLE_SECONDS", 120, 10, 3600),
+            preview_cache_idle_seconds=_env_int("DOUYIN_PREVIEW_CACHE_IDLE_SECONDS", 900, 10, 3600),
             preview_prefetch_initial_bytes=_env_int("DOUYIN_PREVIEW_PREFETCH_CHUNK_BYTES", 512 * 1024, 32 * 1024, 4 * 1024 * 1024),
             preview_prefetch_max_bytes=_env_int("DOUYIN_PREVIEW_PREFETCH_MAX_BYTES", 2 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024),
-            preview_prefetch_seconds=_env_int("DOUYIN_PREVIEW_PREFETCH_SECONDS", 3, 1, 30),
+            preview_prefetch_seconds=_env_int("DOUYIN_PREVIEW_PREFETCH_SECONDS", 5, 1, 30),
             preview_prefetch_max_ratio=0.2,
             preview_max_prepare_ids=2,
             preview_resolve_timeout_seconds=_env_int("DOUYIN_PREVIEW_RESOLVE_TIMEOUT_SECONDS", 90, 10, 300),
+            # Read only a bounded prefix for real tracks. Long videos can have
+            # a larger front track table; short and unknown headers stay small.
+            preview_probe_bytes=_env_int("DOUYIN_PREVIEW_PROBE_BYTES", 4 * 1024 * 1024, 32 * 1024, 4 * 1024 * 1024),
+            preview_candidate_probe_limit=_env_int("DOUYIN_PREVIEW_PROBE_LIMIT", 10, 1, 24),
+            # Prefer the platform's H.264 variants: normal Windows Chrome can
+            # accept an HEVC container as audio-only despite headless decoding it.
+            preview_playable_codecs=("h264", "avc1"),
             testing=_env_bool("DOUYIN_HOST_TESTING"),
             mock_qwen=_env_bool("DOUYIN_QWEN_MOCK"),
+            auto_transcribe=_env_bool("DOUYIN_AUTO_TRANSCRIBE", True),
+            local_asr_dir=Path(os.environ.get("DOUYIN_LOCAL_ASR_DIR", "D:/AI/Qwen3-ASR-1.7B")),
+            analysis_provider=os.environ.get("DOUYIN_ANALYSIS_PROVIDER", "qwen").strip(),
         )
 
     def ensure_directories(self) -> None:

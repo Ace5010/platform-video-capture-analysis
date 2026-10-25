@@ -1,10 +1,19 @@
-﻿param([switch]$NoBrowser)
+﻿param([switch]$NoBrowser, [switch]$Console)
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'launcher-lock.ps1')
 $launchMutex = New-Object System.Threading.Mutex($false, 'Local\DouyinMonitorLauncher')
 $locked = $false
+if ($Console) {
+    $Host.UI.RawUI.WindowTitle = 'Observe - 启动命令行'
+    Write-Host 'Observe：正在启动本机工作台' -ForegroundColor Cyan
+    Write-Host "项目目录：$projectRoot"
+}
+
+function Write-StartupStatus([string]$Message) {
+    if ($Console) { Write-Host $Message }
+}
 
 function Test-HostReady {
     try {
@@ -50,6 +59,7 @@ function Assert-PortFree([int]$Port) {
 }
 
 try {
+    Write-StartupStatus '正在检查后台与网页服务……'
     $locked = $launchMutex.WaitOne(60000)
     if (-not $locked) { throw '另一个启动任务尚未完成，请稍后再次双击快捷方式。' }
     $python = Join-Path $projectRoot '.venv\Scripts\python.exe'
@@ -57,15 +67,27 @@ try {
     if (-not (Test-Path -LiteralPath $python) -or -not (Test-Path -LiteralPath $vinext)) {
         throw '项目运行依赖缺失，请勿移动或删除项目中的 .venv 和 node_modules 文件夹。'
     }
+    $logDirectory = Join-Path $projectRoot 'outputs'
+    [IO.Directory]::CreateDirectory($logDirectory) | Out-Null
     if (-not (Test-HostReady)) {
         Assert-PortFree 43129
-        Start-Process -FilePath $python -ArgumentList @('-m', 'host_service.server') -WorkingDirectory $projectRoot -WindowStyle Hidden
+        Write-StartupStatus "启动后台：`"$python`" -m host_service.server"
+        Start-Process -FilePath $python -ArgumentList @('-m', 'host_service.server') -WorkingDirectory $projectRoot -WindowStyle Hidden `
+            -RedirectStandardOutput (Join-Path $logDirectory 'launcher-host.stdout.log') `
+            -RedirectStandardError (Join-Path $logDirectory 'launcher-host.stderr.log')
+    } else {
+        Write-StartupStatus '后台已运行，继续使用现有服务。'
     }
     if (-not (Test-WebReady)) {
         Assert-PortFree 3000
         Repair-DevLock $projectRoot
         $nodePath = (Get-Command node.exe -ErrorAction Stop).Source
-        Start-Process -FilePath $nodePath -ArgumentList @(('"' + $vinext + '"'), 'dev', '--hostname', '0.0.0.0', '--port', '3000') -WorkingDirectory $projectRoot -WindowStyle Hidden
+        Write-StartupStatus "启动网页：`"$nodePath`" `"$vinext`" dev --hostname 0.0.0.0 --port 3000"
+        Start-Process -FilePath $nodePath -ArgumentList @(('"' + $vinext + '"'), 'dev', '--hostname', '0.0.0.0', '--port', '3000') -WorkingDirectory $projectRoot -WindowStyle Hidden `
+            -RedirectStandardOutput (Join-Path $logDirectory 'launcher-web.stdout.log') `
+            -RedirectStandardError (Join-Path $logDirectory 'launcher-web.stderr.log')
+    } else {
+        Write-StartupStatus '网页已运行，继续使用现有服务。'
     }
     $deadline = (Get-Date).AddSeconds(60)
     do {
@@ -74,6 +96,8 @@ try {
         Start-Sleep -Milliseconds 500
     } while ((Get-Date) -lt $deadline)
     if (-not $ready) { throw '启动超过 60 秒仍未就绪，请稍后重试，或将此提示发给我排查。' }
+    Write-StartupStatus '后台与网页均已就绪：http://localhost:3000'
+    Write-StartupStatus "启动日志：$logDirectory\launcher-*.log"
     if (-not $NoBrowser) {
         $chromePaths = @(
             (Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe'),
@@ -83,15 +107,21 @@ try {
         $chrome = $chromePaths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
         if (-not $chrome) { throw '服务已启动，但未找到 Chrome。请在浏览器中打开 http://localhost:3000 。' }
         Start-Process -FilePath $chrome -ArgumentList 'http://localhost:3000'
+        Write-StartupStatus '已打开 Chrome 工作台；后台持续运行，再次双击不会重复启动服务。'
     }
     # Open the already-ready local workbench immediately; remote checking must
     # not add a wait before the user can read existing content.
-    $remoteWarning = Get-RemoteStartupWarning
-    if ($remoteWarning) { throw $remoteWarning }
+    $remoteWarning = if ($Console) { Get-RemoteStartupWarning -TimeoutSeconds 0 } else { Get-RemoteStartupWarning }
+    if ($remoteWarning) { Write-Warning $remoteWarning }
 } catch {
+    if ($Console) {
+        Write-Host "启动失败：$($_.Exception.Message)" -ForegroundColor Red
+        Write-Host '命令行窗口会保留，可以直接查看错误或将提示发给我。'
+        return
+    }
     if ($NoBrowser) { throw }
     Add-Type -AssemblyName PresentationFramework
-    [System.Windows.MessageBox]::Show($_.Exception.Message, '信源抓取与分析：启动提示', 'OK', 'Warning') | Out-Null
+    [System.Windows.MessageBox]::Show($_.Exception.Message, 'Observe：启动提示', 'OK', 'Warning') | Out-Null
     exit 1
 } finally {
     if ($locked) { $launchMutex.ReleaseMutex() }

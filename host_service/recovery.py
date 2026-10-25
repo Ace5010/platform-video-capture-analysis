@@ -35,6 +35,8 @@ def requires_user_action(error: Any) -> bool:
 
 def user_action_for(error: Any, stage: str) -> str:
     value = str(error)
+    if "CodeBuddy" in value:
+        return "在电脑 CodeBuddy 核对登录、模型额度和用量记录后重试；已完成结果和口播稿继续保留。"
     if any(word in value for word in ("登录", "验证码", "私密", "访问权限")):
         return "在电脑的抖音登录窗口核对登录、验证码与该视频的访问权限，再重试。"
     if any(word in value for word in ("删除", "不存在")):

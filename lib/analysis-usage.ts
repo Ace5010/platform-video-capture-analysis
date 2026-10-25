@@ -30,6 +30,8 @@ export type AnalysisUsage = {
   cloudAsr: CloudAsrUsage | null;
   totalEstimatedCostCny: number | null;
   billingNote: string;
+  credits: number | null;
+  knownCredits: number;
   pricing: {
     currency: string;
     region: string;
@@ -123,6 +125,8 @@ export function normalizeAnalysisUsage(value: unknown): AnalysisUsage | null {
     cloudAsr,
     totalEstimatedCostCny: totalEstimatedCost,
     billingNote: String(raw.billingNote || '实际扣款以百炼账单为准。'),
+    credits: nonnegativeAmount(raw.credits),
+    knownCredits: nonnegativeAmount(raw.knownCredits) ?? 0,
     pricing: pricingRaw ? {
       currency: String(pricingRaw.currency || 'CNY'),
       region: String(pricingRaw.region || ''),
@@ -158,6 +162,16 @@ export function analysisRequestCountLabel(usage: AnalysisUsage) {
 export function analysisUsageSummary(usage: AnalysisUsage | null, status: string): string {
   if (['queued', 'processing', 'claimed', 'running'].includes(status)) return '本次用量统计中';
   if (!usage) return '用量未记录';
+  if (usage.provider === 'CodeBuddy') return formatAnalysisCost(usage);
   if (usage.totalEstimatedCostCny === null) return '本次费用待核对';
   return `本次估算 ${formatEstimatedCost(usage.totalEstimatedCostCny)}`;
+}
+
+export function formatAnalysisCost(usage: AnalysisUsage): string {
+  if (usage.provider !== 'CodeBuddy') return formatEstimatedCost(usage.totalEstimatedCostCny);
+  const points = (value: number) => new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 6 }).format(value);
+  const visual = usage.credits === null
+    ? usage.knownCredits > 0 ? `${points(usage.knownCredits)} 积分起，部分待核对` : '积分待核对'
+    : `${points(usage.credits)} 积分`;
+  return usage.cloudAsr ? `${visual} + 口播 ${formatEstimatedCost(usage.cloudAsr.estimatedCostCny)}` : visual;
 }

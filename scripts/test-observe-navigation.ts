@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import { resolveObserveNavigation, observeSearch } from '../lib/observe-navigation.ts';
+const saved = {module:'wechat' as const, contentView:'链接分析',wechatView:'manage' as const};
+assert.deepEqual(resolveObserveNavigation('',saved),saved);
+assert.deepEqual(resolveObserveNavigation('?module=content&view=browse',saved),{module:'content',contentView:'内容浏览',wechatView:'manage'});
+assert.deepEqual(resolveObserveNavigation('?module=wechat&view=reading',saved),{...saved,wechatView:'reading'});
+assert.equal(observeSearch({...saved,contentView:'敏感查询'}),'?module=wechat&view=manage');
+assert.equal(observeSearch({...saved,module:'content'}),'?module=content&view=links');
+assert.equal(resolveObserveNavigation('?module=unknown&view=unknown').module,'content');
+console.log('Observe navigation: saved entry, explicit deep links, invalid values and safe URL passed.');

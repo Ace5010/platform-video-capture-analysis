@@ -1,15 +1,21 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, copyFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { createWebsiteEntry } from '../lib/pages-entry.mjs';
 
 const root = new URL('../', import.meta.url);
 const website = JSON.parse(await readFile(new URL('cloudflare-pages.json', root), 'utf8'));
 const host = JSON.parse(await readFile(new URL('cloudflare-host.json', root), 'utf8'));
-const config = { websiteOrigin: website.publicOrigin, upstreamOrigin: host.publicOrigin };
+const brand = JSON.parse(await readFile(new URL('public/app-icons/brand.json', root), 'utf8'));
+const config = { websiteOrigin: website.publicOrigin, upstreamOrigin: host.publicOrigin, brand };
 createWebsiteEntry(config); // Validate both origins before emitting a deployable entry.
 if (website.publicOrigin !== `https://${website.projectName}.pages.dev`) throw new Error('Pages project and origin differ');
 const output = new URL('outputs/cloudflare-pages/', root);
 await mkdir(output, { recursive: true });
+for (const file of Object.keys(brand.files)) {
+  const target = new URL(file.slice(1), output);
+  await mkdir(new URL('./', target), { recursive: true });
+  await copyFile(new URL('public' + file, root), target);
+}
 const source = await readFile(new URL('lib/pages-entry.mjs', root), 'utf8');
 await writeFile(new URL('_worker.js', output), source + `\nexport default createWebsiteEntry(${JSON.stringify(config)});\n`);
 await writeFile(new URL('_routes.json', output), JSON.stringify({ version: 1, include: ['/*'], exclude: [] }));

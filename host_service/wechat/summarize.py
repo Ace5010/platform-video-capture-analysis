@@ -1,0 +1,234 @@
+"""单次、可审计的官方 Buddy CLI 总结；不自动重试付费请求。"""
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+import re
+import hashlib
+from pathlib import Path
+import subprocess
+import time
+import uuid
+
+from .archive import ArchiveError
+from .summaries import prepare_day, validate_summary, model_messages
+
+ROOT = Path(__file__).resolve().parent
+from .paths import runtime_root, data_root
+RUNTIME = runtime_root()
+
+
+class SummaryFailure(ArchiveError):
+    """A safe explanation plus the original receipt, including incurred usage."""
+    def __init__(self, reason, receipt):
+        super().__init__(reason)
+        self.receipt = receipt
+
+
+def save(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix('.tmp')
+    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
+    os.replace(temp, path)
+
+
+def result_record(raw):
+    try:
+        outer = json.loads(raw)
+    except (ValueError, TypeError):
+        raise ArchiveError('CLI 返回的执行记录不是有效 JSON') from None
+    if isinstance(outer, list):
+        results = [item for item in outer if isinstance(item, dict) and item.get('type') == 'result']
+        if len(results) != 1:
+            raise ArchiveError('CLI 结果事件数量无效')
+        outer = results[0]
+    if not isinstance(outer, dict):
+        raise ArchiveError('CLI 返回格式无效')
+    return outer
+
+
+def parse_result(raw, prepared):
+    outer = result_record(raw)
+    if outer.get('is_error') or outer.get('subtype') not in (None, 'success'):
+        raise ArchiveError('CLI 未成功完成；已保留执行记录，不自动重试')
+    result = outer.get('structured_output') or outer.get('result')
+    if isinstance(result, str):
+        result = result.strip()
+        if result.startswith('```') and result.endswith('```'):
+            result = result.split('\n', 1)[1].rsplit('```', 1)[0].strip()
+        try:
+            result = json.loads(result)
+        except ValueError:
+            raise ArchiveError('模型返回的总结不是有效 JSON') from None
+    checked = validate_summary(result, prepared)
+    for topic in checked['topics']:
+        for view in topic['views']:
+            if any(prepared['sources'][ref]['speaker'] != view['speaker'] for ref in view['refs']):
+                raise ArchiveError('单列观点混用了不同发言者的引用，已阻止发布')
+    return outer, checked
+
+
+def billing_metadata(raw):
+    events = json.loads(raw)
+    if not isinstance(events, list):
+        return {}
+    rows = []
+    for event in events:
+        if event.get('role') != 'assistant':
+            continue
+        provider = event.get('providerData', {})
+        usage = provider.get('rawUsage', {})
+        if usage:
+            rows.append({'request_id': provider.get('conversationRequestId'),
+                         'model': provider.get('model'), 'usage': usage})
+    result = {'provider_usage': rows}
+    if rows and all(isinstance(row['usage'].get('credit'), (int, float)) for row in rows):
+        result.update(credits=round(sum(row['usage']['credit'] for row in rows), 6),
+                      credit_source='official_provider_rawUsage.credit')
+    return result
+
+
+def check_effort(model, effort):
+    product = json.loads((RUNTIME / 'buddy-runtime/node_modules/@tencent-ai/codebuddy-code/product.internal.json').read_text(encoding='utf-8'))
+    item = next((m for m in product['models'] if m.get('id') == model), None)
+    reasoning = (item or {}).get('reasoning', {})
+    supported = reasoning.get('supportedEfforts', [])
+    # Some official models declare only their default effort. Permit that exact
+    # default; do not infer other levels or let the CLI silently clamp them.
+    if not supported and reasoning.get('effort'):
+        supported = [reasoning['effort']]
+    if not supported or effort not in supported:
+        raise ArchiveError(f'{model} 不支持已确认的 {effort} 思考档位，已在调用前停止；可用档位：' + '、'.join(supported))
+
+
+def run(day, model='hy4-preview', data_dir=None, effort='high', variant=None):
+    data_dir = Path(data_dir) if data_dir is not None else data_root().resolve()
+    prepared = prepare_day(data_dir, day)
+    if not prepared['summarizable'] or not prepared['messages']:
+        raise ArchiveError('归档存在缺口或没有聊天，请先补充读取')
+    if effort not in ('minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
+        raise ArchiveError('思考强度无效')
+    if variant is not None and not re.fullmatch(r'[a-z0-9-]{1,60}', variant):
+        raise ArchiveError('总结版本名称无效')
+    destination = data_dir / 'summaries' / (day + '.json') if variant is None else data_dir / 'summary-variants' / day / (variant + '.json')
+    if destination.exists():
+        previous = json.loads(destination.read_text(encoding='utf-8'))
+        if previous['source_hash'] == prepared['source_hash']:
+            validate_summary(previous['summary'], prepared)
+            return {'status': 'cached', 'date': day, 'run_id': previous['run_id']}
+        raise ArchiveError('当天已有总结且来源发生变化，需要明确安排更新')
+    check_effort(model, effort)
+    runs = data_dir / 'summary-runs'
+    runs.mkdir(exist_ok=True)
+    lock = runs / (day + '.lock')
+    # 锁在失败时保留，阻止不知情的重复计费。
+    try:
+        with lock.open('x', encoding='utf-8') as f:
+            f.write(datetime.now(timezone.utc).isoformat())
+    except FileExistsError:
+        raise ArchiveError('该日期已有执行或待核实的失败记录，未再次调用') from None
+    run_id = datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8]
+    folder = runs / run_id
+    folder.mkdir()
+    record = {'run_id': run_id, 'date': day, 'model_requested': model, 'effort_requested': effort, 'variant': variant,
+              'source_hash': prepared['source_hash'], 'message_count': prepared['message_count'],
+              'started_at': datetime.now(timezone.utc).isoformat(), 'status': 'running',
+              'credits': None, 'credit_source': 'pending_official_usage', 'cli_version': '2.172.1',
+              'editorial_contract': 'topic-synthesis-v3',
+              'partial': prepared['partial'], 'coverage_end': prepared['coverage_end']}
+    save(folder / 'receipt.json', record)
+    payload = json.dumps({'task': '微信群单日总结验证 ' + day,
+                          'date': day, 'timezone': 'Asia/Shanghai',
+                          'coverage': {'full_day': prepared['complete'], 'end_exclusive': prepared['coverage_end'],
+                                       'instruction': '仅总结输入覆盖的时段；未结束的一天不能描述成全天结论。'},
+                          'messages': model_messages(prepared)}, ensure_ascii=False)
+    record['input_sha256'] = hashlib.sha256(payload.encode('utf-8')).hexdigest()
+    prompt_bytes = (ROOT / 'summary-prompt.txt').read_bytes()
+    record['prompt_sha256'] = hashlib.sha256(prompt_bytes).hexdigest()
+    (folder / 'system-prompt.txt').write_bytes(prompt_bytes)
+    cli = RUNTIME / 'buddy-runtime/node_modules/@tencent-ai/codebuddy-code/bin/codebuddy'
+    args = ['node', str(cli), '-p', '--output-format', 'json', '--model', model, '--effort', effort,
+            '--tools', '', '--strict-mcp-config', '--setting-sources', '',
+            '--no-session-persistence', '--permission-mode', 'dontAsk',
+            '--max-turns', '1', '--system-prompt-file', str(folder / 'system-prompt.txt')]
+    env = dict(os.environ)
+    for key in list(env):
+        if key.startswith(('CODEBUDDY_API_', 'ANTHROPIC_', 'OPENAI_')) or key in ('CODEBUDDY_BASE_URL', 'CODEBUDDY_MODEL'):
+            del env[key]
+    env['CODEBUDDY_INTERNET_ENVIRONMENT'] = 'internal'
+    working = data_dir / 'buddy-jobs'
+    working.mkdir(exist_ok=True)
+    started = time.monotonic()
+    stage = 'execute'
+    try:
+        with (folder / 'stdout.json').open('wb') as out, (folder / 'stderr.txt').open('wb') as err:
+            process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=out, stderr=err,
+                                       cwd=working, env=env, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            record['pid'] = process.pid
+            save(folder / 'receipt.json', record)
+            try:
+                process.communicate(payload.encode('utf-8'), timeout=600)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                raise ArchiveError('CLI 超时，已停止该次执行；消耗待核实，不自动重试') from None
+        record['exit_code'] = process.returncode
+        stage = 'read_result'
+        raw = (folder / 'stdout.json').read_text(encoding='utf-8-sig')
+        # 即使内容校验失败，也保留实际用量。
+        try:
+            outer = result_record(raw)
+            record.update(billing_metadata(raw))
+            for key in ('usage', 'modelUsage', 'duration_ms', 'duration_api_ms', 'num_turns', 'session_id', 'subtype', 'is_error'):
+                if key in outer:
+                    record[key] = outer[key]
+        except (ArchiveError, ValueError, TypeError):
+            pass
+        if process.returncode:
+            raise ArchiveError(f'CLI 执行失败（退出码 {process.returncode}），已保留执行记录与用量')
+        stage = 'validate'
+        _, summary = parse_result(raw, prepared)
+        if summary.get('format_version') != 3:
+            raise ArchiveError('模型未遵守话题整合规范 v3，已保留回执，不自动重试')
+        stage = 'save'
+        save(destination, {'date': day, 'source_hash': prepared['source_hash'],
+                           'run_id': run_id, 'summary': summary,
+                           'partial': prepared['partial'], 'coverage_end': prepared['coverage_end']})
+        record['status'] = 'complete'
+        record['topic_count'] = len(summary['topics'])
+        lock.unlink()
+    except Exception as error:
+        record['status'] = 'failed'
+        record['error_type'] = type(error).__name__
+        record['error_stage'] = stage
+        if isinstance(error, ArchiveError):
+            reason = str(error)
+        else:
+            reason = {'execute': '总结进程无法完成执行，请检查本机运行环境',
+                      'read_result': '总结执行记录无法读取，请检查本机文件',
+                      'validate': '总结结果结构异常，无法完成校验',
+                      'save': '总结结果保存失败，请检查目录权限与磁盘空间'}[stage]
+            reason += f'（{type(error).__name__}）'
+        record['error'] = reason
+        # Only controlled explanations reach the UI, never raw CLI output,
+        # exception text, chat content, credentials or filesystem paths.
+        raise SummaryFailure(reason, record) from None
+    finally:
+        record['elapsed_seconds'] = round(time.monotonic() - started, 2)
+        record['finished_at'] = datetime.now(timezone.utc).isoformat()
+        save(folder / 'receipt.json', record)
+    return record
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--date', required=True)
+    parser.add_argument('--model', default='hy4-preview')
+    parser.add_argument('--effort', choices=['minimal','low','medium','high','xhigh','max'], default='high')
+    parser.add_argument('--variant')
+    args = parser.parse_args()
+    try:
+        print(json.dumps(run(args.date, args.model, effort=args.effort, variant=args.variant), ensure_ascii=False))
+    except ArchiveError as error:
+        print(str(error))
+        raise SystemExit(1)

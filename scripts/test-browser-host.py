@@ -140,7 +140,76 @@ with tempfile.TemporaryDirectory(prefix='douyin-browser-host-') as directory:
         assert status == 200 and cancelled['job']['status'] == 'cancelled'
         server.database.update_job_progress(analysis_job['id'], 'downloading_original_video')
         assert server.database.get_job(analysis_job['id'])['status'] == 'cancelled'
+
+        # A running batch holds an old account list. Removing a pending/current
+        # account must survive both successful and failed late browser replies.
+        for removal_stage in ('before_turn', 'during_success', 'during_error'):
+            subjects = [{**account, 'id': f'{removal_stage}-{name}',
+                         'url': f'https://www.douyin.com/user/{removal_stage}-{name}',
+                         'name': name} for name in ('first', 'removed', 'last')]
+            for subject in subjects:
+                server.database.upsert_account(subject)
+            removal_job, _ = server.database.create_job('collect_latest',
+                {'accountIds': [subject['id'] for subject in subjects]})
+            removal_claim = server.database.claim_job(manager.connector_id, CAPABILITIES)
+            assert removal_claim['id'] == removal_job['id']
+            visited = []
+            def capture_after_removal(command, **_kwargs):
+                current = command['account']
+                visited.append(current['id'])
+                if removal_stage == 'before_turn' and current['id'] == subjects[0]['id']:
+                    assert server.database.remove_account(subjects[1]['id'])
+                if removal_stage != 'before_turn' and current['id'] == subjects[1]['id']:
+                    assert server.database.remove_account(current['id'])
+                    if removal_stage == 'during_error':
+                        raise RuntimeError('late capture failure after removal')
+                return {'videos': [{**videos[0], 'id': f'{current["id"]}-video'}],
+                        'accountName': current['name']}
+            manager._rpc = Mock(side_effect=capture_after_removal)
+            manager.execute(removal_claim)
+            after_removal = server.database.state()
+            assert not any(item['id'] == subjects[1]['id'] for item in after_removal['accounts']), \
+                f'{removal_stage}: background capture resurrected the removed account'
+            assert not any(item['accountId'] == subjects[1]['id'] for item in after_removal['videos'])
+            assert not any(item['accountId'] == subjects[1]['id'] for item in after_removal['discoveries'])
+            assert any(item['accountId'] == subjects[2]['id'] for item in after_removal['videos']), \
+                'removal must not interrupt the remaining batch'
+            summary = server.database.get_job(removal_claim['id'])
+            assert summary['status'] == 'succeeded' and summary['result']['succeeded'] == 2
+            assert summary['result']['skipped'] == 1 and summary['result']['failed'] == 0
+            if removal_stage == 'before_turn':
+                assert subjects[1]['id'] not in visited, 'do not open a removed pending account'
+
+        # The persistence boundary also discards delayed results, including a
+        # mixed event whose other account is still monitored. Receipts dedupe.
+        removed, retained = [{**account, 'id': f'late-{name}',
+            'url': f'https://www.douyin.com/user/late-{name}', 'name': name}
+            for name in ('removed', 'retained')]
+        for subject in (removed, retained):
+            server.database.upsert_account(subject)
+        late_job, _ = server.database.create_job('collect_latest',
+            {'accountIds': [removed['id'], retained['id']]})
+        late_claim = server.database.claim_job(manager.connector_id, CAPABILITIES)
+        assert late_claim['id'] == late_job['id']
+        manager._event(late_claim, 'started', {})
+        assert server.database.remove_account(removed['id'])
+        late_videos = [{**videos[0], 'id': f'{subject["id"]}-video', 'accountId': subject['id']}
+                       for subject in (removed, retained)]
+        late_result = {'mode': 'latest', 'accounts': [removed, retained], 'videos': late_videos,
+            'snapshots': [{'videoId': item['id'], 'accountId': item['accountId'],
+                           'capturedAt': '2026-10-07T00:00:00Z'} for item in late_videos]}
+        manager._event(late_claim, 'collection_result', late_result)
+        duplicate, _ = manager._event(late_claim, 'collection_result', late_result)
+        assert duplicate is True
+        late_state = server.database.state()
+        assert not any(item['id'] == removed['id'] for item in late_state['accounts'])
+        assert not any(item['accountId'] == removed['id'] for item in late_state['videos'])
+        assert not any(item['accountId'] == removed['id'] for item in late_state['snapshots'])
+        assert not any(item['accountId'] == removed['id'] for item in late_state['discoveries'])
+        assert any(item['id'] == late_videos[1]['id'] for item in late_state['videos'])
+        manager._event(late_claim, 'job_completed', {})
         print('LAN browser host passed: mobile-origin queue, host-only login controls, legacy extension blocked, five-video deduplication and repeat idempotency.')
+        print('Account removal passed: pending/current removal, late success/failure, mixed events, receipts and remaining batch.')
     finally:
         server.shutdown()
         server.server_close()

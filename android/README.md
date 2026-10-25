@@ -1,6 +1,6 @@
 # 内容工作台 Android
 
-当前版本 `0.1.2`（versionCode 3），应用 ID `com.personal.contentworkbench`，最低 Android 8.0。
+当前版本 `0.1.3`（versionCode 4），应用 ID `com.personal.contentworkbench`，最低 Android 8.0。应用图标与本地、在线工作台统一使用红橙渐变无圆环版，资源由 `node scripts/generate-brand-icons.mjs` 从同一张原图导出。Android 自适应图标跟随桌面圆形或圆角裁切，兼容位图四角透明。覆盖安装须使用相同发布签名。
 
 ## 安装和使用
 
@@ -29,7 +29,7 @@ node scripts/build-pages-entry.mjs
 node --experimental-strip-types scripts/test-pages-entry.mjs
 ```
 
-将 `outputs/cloudflare-pages/` 中的 `_worker.js`、`_routes.json`、`index.html` 打包后，通过该 Pages 项目的直接上传入口发布。仅上传这三份部署文件。预览网址被入口代码拒绝，验收应使用 `cloudflare-pages.json` 中的正式网址。原 `cloudflare-host.json` 及受限后台的来源配置保持对应原 Worker，不需要重配隧道凭据。
+将 `outputs/cloudflare-pages/` 的完整内容上传到该 Pages 项目，包含入口文件、图标、手机桌面清单与品牌样式。入口继续转接原网站，只在首页添加图标引用并独立提供公开图标资源；应用脚本与后台接口继续使用原有上游。预览网址被入口代码拒绝，验收应使用 `cloudflare-pages.json` 中的正式网址。原 `cloudflare-host.json` 及受限后台的来源配置保持对应原 Worker，不需要重配隧道凭据。
 
 ## 构建
 
@@ -43,6 +43,8 @@ node --experimental-strip-types scripts/test-pages-entry.mjs
 
 独立签名文件保存在当前用户的 `%LOCALAPPDATA%/ContentWorkbench/signing/`，配置为 `android/keystore.properties`。应私下备份，后续版本使用同一签名；不要提交或公开这些文件。
 
+2026-10-25 经用户授权，原签名丢失后重新签名并重装。自 `0.1.3` 起必须保留本机新签名继续覆盖升级。密钥及配置已有两份 Windows 当前用户 DPAPI 加密备份，位于 `%USERPROFILE%/.local/share/observe/signing-backups/` 和项目忽略目录 `.runtime/signing-backups/`；两份均已解密比对验证。不得重新生成其他密钥代替。
+
 ```powershell
 ./scripts/build-android.ps1 -Validate
 ```
@@ -50,6 +52,14 @@ node --experimental-strip-types scripts/test-pages-entry.mjs
 脚本构建 APK，运行单元测试与 Lint，并确认正式包没有内置网页及测试数据。正式包输出到 `outputs/android/content-workbench-release.apk`，构建时复用本机原签名。
 
 需要隔离安卓运行验收时，先执行 `npm run build`，再运行 `./scripts/build-android.ps1 -Validate -BuildInstrumentation`。只有独立的测试 APK 包含构建网页与模拟数据；正式包始终从网站加载。测试模式隔离业务 API，`mode=live` 仅访问正式网站登录页，不输入密码或发起付费分析。
+
+## 2026-10-25 验证记录（0.1.3）
+
+- 无线连接一加 PJA110，备份旧 APK 和主机 SQLite 后，按用户授权卸载旧签名 App、安装新签名 Release。真机应用详情显示 `0.1.3` 及红色圆角图标；首页成功加载正式网站。
+- 用户在手机输入原密码后，已核对账号列表、视频列表、链接记录和一条既有分析正文；关闭进程重新打开后仍保持登录，未提交采集、转写或分析任务。
+- SQLite 一致性备份：`data/host-service/migration-backups/pre-android-reinstall-20261025.sqlite3`，完整性检查为 `ok`。重装后逐行比对账号 29、视频 954、分析记录 37、互动快照 2211、任务 97、转写队列 941，全部原记录保留且内容未变。界面展示 28 个监控账号及 950 条普通视频，另有 1 个隐藏链接账号和 4 条独立链接视频。
+- Release 构建、APK v2 签名验证、4 项单元测试、Lint 和资源打包检查通过。真机记录位于 `outputs/android/mobile-rollout-20261025/`。
+- 当前 APK SHA256：`03850B543BCBC659C7124FCA9FDBA9BB753F36F518D0ACC27042A1A059F5B016`。当前签名证书 SHA256：`9499f382b43f846ef4c16ceaf347a478da220f2a004ecd9f5e9ec81290a6eebe`。
 
 ## 2026-10-18 验证记录（0.1.2）
 

@@ -35,16 +35,28 @@ const mediaDir = join(project, 'data', 'host-service', 'media');
 const listMedia = async () => {
   try { return (await readdir(mediaDir)).filter((name) => name.endsWith('.mp4')); } catch { return []; }
 };
+const redactUrls = text => String(text).replace(/https?:\/\/[^\s'"<>]+/g, value => {
+  try { const url = new URL(value); return `${url.origin}${url.pathname}`; } catch { return '[url]'; }
+});
 try {
   await context.addCookies([{ name: 'douyin_monitor_session', value: sessionToken,
     url: 'http://localhost:43129', httpOnly: true, sameSite: 'Strict' }]);
   const page = await context.newPage();
   const errors = [];
   const failedRequests = [];
-  page.on('pageerror', (error) => errors.push(String(error).slice(0, 300)));
-  page.on('console', (message) => { if (message.type() === 'error') errors.push(message.text().slice(0, 300)); });
-  page.on('response', (response) => { if (response.status() >= 400) failedRequests.push(`${response.status()} ${response.url()}`); });
-  page.on('requestfailed', (request) => failedRequests.push(`failed ${request.url()} ${request.failure()?.errorText || ''}`));
+  const externalImageErrors = [];
+  page.on('pageerror', (error) => errors.push(redactUrls(error).slice(0, 300)));
+  page.on('console', (message) => {
+    if (message.type() !== 'error') return;
+    const text = message.text();
+    const imageUrl = /^Access to image at '([^']+)'/.exec(text)?.[1];
+    const imageHost = imageUrl ? new URL(imageUrl).hostname : '';
+    if ((imageHost === 'douyinpic.com' || imageHost.endsWith('.douyinpic.com')) && /CORS policy/.test(text)) {
+      externalImageErrors.push(redactUrls(text).slice(0, 300));
+    } else errors.push(redactUrls(text).slice(0, 300));
+  });
+  page.on('response', (response) => { if (response.status() >= 400) failedRequests.push(`${response.status()} ${redactUrls(response.url())}`); });
+  page.on('requestfailed', (request) => failedRequests.push(`failed ${redactUrls(request.url())} ${request.failure()?.errorText || ''}`));
   const before = await listMedia();
   await page.goto('http://localhost:3000', { waitUntil: 'domcontentloaded' });
   await page.locator('.accountRail').waitFor({ timeout: 30000 });
@@ -56,7 +68,6 @@ try {
     accounts: [...document.querySelectorAll('.railAccount:not(.railAll):not(.railDiscoveries)')]
       .slice(0, 5).map((node) => ({
         name: node.querySelector('.railAccountTitle')?.textContent,
-        followers: node.querySelector('.railFollowers')?.textContent,
         label: node.getAttribute('aria-label'),
       })),
     feedHeading: document.querySelector('.compactFeedHeading')?.textContent,
@@ -85,13 +96,19 @@ try {
   await page.locator('.railAll').click();
   await page.waitForTimeout(400);
 
-  // Followers must be shown with a unit next to every account, and the video
-  // count must stay a separate, clearly labelled number.
-  const followerCells = await page.evaluate(() => [...document.querySelectorAll('.railFollowers')]
-    .map((node) => node.textContent));
-  assert.ok(followerCells.length > 0, 'accounts must show a follower reading');
-  for (const text of followerCells) {
-    assert.ok(/粉丝/.test(String(text)), `a follower cell is missing its unit: ${text}`);
+  // Account options only contain the name and work count. Followers belong to
+  // the selected account's workspace heading and must update on each switch.
+  const accountOptions = page.locator('.railAccount:not(.railAll):not(.railDiscoveries)');
+  assert.equal(await page.locator('.accountRail .railFollowers').count(), 0);
+  assert.equal(await page.locator('.topbar .accountFollowers').count(), 0,
+    'all-account browsing has no individual follower reading');
+  for (let index = 0; index < Math.min(await accountOptions.count(), 4); index++) {
+    const option = accountOptions.nth(index);
+    const name = await option.locator('.railAccountTitle').textContent();
+    assert.doesNotMatch(await option.getAttribute('aria-label'), /粉丝/);
+    await option.press('Enter');
+    assert.equal(await page.locator('.topbar h1').textContent(), name);
+    assert.match(await page.locator('.topbar .accountFollowers').textContent(), /粉丝/);
   }
   await page.locator('.navItem', { hasText: '信源管理' }).click();
   await page.waitForTimeout(500);
@@ -112,22 +129,23 @@ try {
   await page.waitForTimeout(700);
   assert.equal(await page.locator('.siteVideoPlayer.isOpen').count(), 0,
     'clicking the title must select the work instead of starting playback');
-  assert.ok(await page.locator('.videoPreview h2').first().textContent(), 'the preview pane must show the work');
+  assert.ok(await page.locator('.readingDialog #reader-title').textContent(), 'the reader must show the selected work');
+  await page.getByRole('button', { name: '关闭阅读，返回列表' }).click();
+  await page.locator('.readingDialog').waitFor({ state: 'hidden' });
 
-  // The cover is the control that starts playback, and a passing pointer must
-  // not begin a preview before the hover delay elapses. The margin below is
-  // larger than the 140 ms intent delay so the assertion measures the delay,
-  // not the machine's event scheduling.
+  // Hover starts loading immediately. Wait for the real first frame instead
+  // of asserting the retired 140 ms delay or assuming a cold source is ready
+  // within a fixed short interval.
   const coverBox = await page.locator('.compactCoverButton').first().boundingBox();
-  // Start from a neutral position so the delay is measured from a real entry.
+  // Start from a neutral position so this is a real pointer entry.
   await page.mouse.move(coverBox.x - 300, coverBox.y + coverBox.height / 2);
   await page.waitForTimeout(700);
   assert.equal(await page.locator('.siteVideoPlayer.isHover').count(), 0, 'the neutral position must be idle');
   await page.mouse.move(coverBox.x + coverBox.width / 2, coverBox.y + coverBox.height / 2);
-  await page.waitForTimeout(40);
-  assert.equal(await page.locator('.siteVideoPlayer.isHover').count(), 0,
-    'a passing pointer must not start a preview');
-  await page.waitForTimeout(1500);
+  await page.waitForFunction(() => {
+    const video = document.querySelector('.siteVideoPlayer.isHover video');
+    return video && !video.paused && video.readyState >= 2 && video.currentTime > 0;
+  }, null, { timeout: 45000 });
   assert.equal(await page.locator('.siteVideoPlayer.isHover').count(), 1,
     'a settled hover must show the floating preview');
   await page.mouse.move(coverBox.x - 200, coverBox.y + coverBox.height / 2);
@@ -140,6 +158,7 @@ try {
   const after = await listMedia();
   assert.deepEqual(after, before, 'browsing must not create any media file');
   console.log('failed requests', JSON.stringify(failedRequests, null, 2));
+  console.log('external image errors', JSON.stringify(externalImageErrors, null, 2));
   // An expired platform cover image is an external-data condition, not a page
   // failure; only application errors and page exceptions must be absent.
   const appErrors = errors.filter((text) => !/Failed to load resource/.test(text));

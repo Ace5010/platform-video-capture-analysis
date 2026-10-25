@@ -7,15 +7,18 @@ import { flushSync } from 'react-dom';
 // The local workbench keeps this client mounted while editing. Include its
 // stylesheet in the client graph so CSS updates accompany player markup updates.
 import './globals.css';
+import { ColorThemePicker } from './color-theme-picker';
+import { WeChatWorkspace, type WeChatRequest } from './wechat-workspace';
+import { OBSERVE_NAV_KEY, resolveObserveNavigation, observeSearch, type ObserveModule, type WeChatPage } from '../lib/observe-navigation';
 import { ANALYSIS_STAGE_LABELS, formatAnalysisDiagnostics, redactDiagnosticText, type AnalysisDiagnostics } from '../lib/analysis-diagnostics';
 import { createClientId } from '../lib/client-id';
 import { canonicalDouyinAccountUrl } from '../lib/account-identity';
 import { accountCollectionState, isActiveCollectionJob } from '../lib/collection-queue';
 import { hostApiBase } from '../lib/host-connection';
 import { createWorkspaceRefresh } from '../lib/workspace-refresh';
-import { browseContentVideos, collectionAccountScope } from '../lib/content-browse';
+import { browseContentVideos, collectionAccountScope, contentSourceDescription, orderContentVideosNewestFirst } from '../lib/content-browse';
 import { followerDetailText, formatFollowerLabel, normalizeFollowerReading } from '../lib/follower-count';
-import { normalizeAnalysisUsage, formatTokenCount, formatEstimatedCost, formatCloudAudioSeconds, analysisRequestCountLabel, analysisUsageSummary, type AnalysisUsage } from '../lib/analysis-usage';
+import { normalizeAnalysisUsage, formatTokenCount, formatEstimatedCost, formatCloudAudioSeconds, analysisRequestCountLabel, analysisUsageSummary, formatAnalysisCost, type AnalysisUsage } from '../lib/analysis-usage';
 
 import {
   analyticsMetricValue,
@@ -38,7 +41,7 @@ import {
 import { formatRemotionPlan, isRemotionPlan, videoContentAnalysis, videoContentReading, REMOTION_PLAN_SECTIONS, type RemotionPlan } from '../lib/remotion-plan';
 
 type AccountStatus = 'waiting' | 'checking' | 'ready' | 'error';
-type TranscriptStatus = 'idle' | 'processing' | 'ready' | 'error';
+type TranscriptStatus = 'idle' | 'queued' | 'processing' | 'paused' | 'ready' | 'error';
 type AnalysisStatus = 'idle' | 'queued' | 'processing' | 'ready' | 'error';
 type SyncMode = 'initial' | 'latest';
 type InitialSyncStatus = 'pending' | 'complete' | 'error';
@@ -414,7 +417,7 @@ function normalizeVideo(raw: Partial<Video>, capturedAt = new Date().toISOString
     firstSeenAt: raw.firstSeenAt || seenAt,
     lastSeenAt: raw.lastSeenAt || seenAt,
     transcript: previousTranscript,
-    transcriptStatus: previousTranscript ? 'ready' : (raw.transcriptStatus === 'processing' ? 'idle' : (raw.transcriptStatus || 'idle')),
+    transcriptStatus: previousTranscript ? 'ready' : (raw.transcriptStatus || 'idle'),
     transcriptUpdatedAt: raw.transcriptUpdatedAt || null,
     transcriptError: raw.transcriptError || null,
     analysis,
@@ -554,6 +557,8 @@ export default function Home() {
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [csrfToken, setCsrfToken] = useState('');
   const [qwenConfigured, setQwenConfigured] = useState(false);
+  const [analysisProvider, setAnalysisProvider] = useState('qwen');
+  const [cloudAsrConfigured, setCloudAsrConfigured] = useState(false);
   const [showQwenConfig, setShowQwenConfig] = useState(false);
   const [qwenApiKey, setQwenApiKey] = useState('');
   const [qwenSaving, setQwenSaving] = useState(false);
@@ -570,6 +575,51 @@ export default function Home() {
   const [hostConnectorCapabilities, setHostConnectorCapabilities] = useState<string[]>([]);
   const [hostWorkerStatus, setHostWorkerStatus] = useState('');
   const [activeNav, setActiveNav] = useState('内容浏览');
+  const [activeModule, setActiveModule] = useState<ObserveModule>('content');
+  const [wechatPage, setWechatPage] = useState<WeChatPage>('reading');
+  const [wechatVisited, setWechatVisited] = useState(false);
+  const [wechatTask, setWechatTask] = useState('');
+  const [navigationReady, setNavigationReady] = useState(false);
+  const contentScroll = useRef(0);
+  const globalHeader = useRef<HTMLElement>(null);
+  const previousModule = useRef<ObserveModule>('content');
+  const wechatRequest = useCallback<WeChatRequest>((path, payload) => hostApi(apiBase, '/api/wechat/' + path,
+    payload === undefined ? {} : { method: 'POST', body: JSON.stringify(payload) }, csrfToken), [apiBase, csrfToken]);
+  useEffect(() => {
+    const restore = () => {
+      if (previousModule.current === 'content') contentScroll.current = window.scrollY;
+      const navigation = resolveObserveNavigation(window.location.search, readStored(OBSERVE_NAV_KEY, {}));
+      setActiveModule(navigation.module); setActiveNav(navigation.contentView); setWechatPage(navigation.wechatView);
+      if (navigation.module === 'wechat') setWechatVisited(true);
+    };
+    const frame = requestAnimationFrame(() => { restore(); setNavigationReady(true); });
+    window.addEventListener('popstate', restore);
+    return () => { cancelAnimationFrame(frame); window.removeEventListener('popstate', restore); };
+  }, []);
+  useEffect(() => {
+    if (!navigationReady) return;
+    const navigation = { module: activeModule, contentView: activeNav, wechatView: wechatPage };
+    localStorage.setItem(OBSERVE_NAV_KEY, JSON.stringify(navigation));
+    const search = observeSearch(navigation);
+    if (window.location.search !== search) window.history.replaceState(null, '', search);
+    if (previousModule.current !== activeModule) {
+      window.dispatchEvent(new CustomEvent('observe:module-change', { detail: activeModule }));
+      requestAnimationFrame(() => {
+        window.scrollTo({ top: activeModule === 'content' ? contentScroll.current : 0, behavior: 'instant' });
+        globalHeader.current?.querySelector<HTMLButtonElement>(`[data-module="${activeModule}"]`)?.focus({ preventScroll: true });
+      });
+      previousModule.current = activeModule;
+    }
+  }, [activeModule, activeNav, wechatPage, navigationReady]);
+  const navigateObserve = (module: ObserveModule, view?: string) => {
+    if (activeModule === 'content') contentScroll.current = window.scrollY;
+    const contentView = module === 'content' && view ? view : activeNav;
+    const wechatView = module === 'wechat' && view ? view as WeChatPage : wechatPage;
+    window.history.pushState(null, '', observeSearch({ module, contentView, wechatView }));
+    setActiveModule(module); setActiveNav(contentView); setWechatPage(wechatView);
+    if (module === 'wechat') setWechatVisited(true);
+  };
+
   useEffect(() => { window.scrollTo({ top: 0, left: 0, behavior: 'instant' }); }, [activeNav]);
   const [activePlatform, setActivePlatform] = useState<Platform>(() => {
     const stored = readStored<string>(activePlatformStoreKey, '');
@@ -780,6 +830,8 @@ export default function Home() {
       ? payload.qwen as Record<string, unknown>
       : payload;
     setQwenConfigured(Boolean(status.configured ?? status.apiKeyConfigured ?? status.ready));
+    setAnalysisProvider(String(status.analysisProvider || 'qwen'));
+    setCloudAsrConfigured(Boolean(status.cloudAsrConfigured ?? status.configured));
   }, [apiBase]);
 
   const migrateLegacyLocalData = useCallback(async () => {
@@ -1319,25 +1371,22 @@ export default function Home() {
   const headingAccount = activeNav === '内容浏览' && contentView === 'accounts'
     ? homeAccount : activeNav === '互动数据' ? selectedAccount : null;
   // “新增检查视频” aggregates every discovery that is still inside the rolling
-  // window, by discovery time, across all monitored accounts. It is a browsing
+  // window across all monitored accounts, ordered by publication time. It is a browsing
   // scope of its own and is never sent to collection or analysis as an account id.
   // The clock re-evaluates when the oldest entry is due to expire, so an open
   // page stops listing an entry without a reload.
   const [discoveryClock, setDiscoveryClock] = useState(() => Date.now());
   const discoveryVideos = useMemo(() => {
     const byId = new Map(videos.map((video) => [video.id, video]));
-    return discoveries
+    return orderContentVideosNewestFirst(discoveries
       .filter((item) => Date.parse(item.expiresAt || '') > discoveryClock && byId.has(item.videoId))
-      .sort((left, right) => right.discoveredAt.localeCompare(left.discoveredAt)
-        || (byId.get(right.videoId)?.publishedAt || '').localeCompare(byId.get(left.videoId)?.publishedAt || '')
-        || right.videoId.localeCompare(left.videoId))
       .map((item) => ({
         ...(byId.get(item.videoId) as Video),
         discoveredAt: item.discoveredAt,
         discoveryExpiresAt: item.expiresAt,
         authorName: byId.get(item.videoId)?.authorName
           || accounts.find((account) => account.id === item.accountId)?.name || null,
-      }));
+      })));
   }, [discoveries, videos, accounts, discoveryClock]);
   useEffect(() => {
     if (!discoveries.length) return;
@@ -1567,6 +1616,19 @@ export default function Home() {
     setLinkVideos(apply);
   };
 
+  const requestTranscription = async (video: Video) => {
+    updateVideoEverywhere(video.id, (item) => ({ ...item, transcriptStatus: 'queued', transcriptError: null }));
+    try {
+      await hostApi(apiBase, '/api/jobs', { method: 'POST', body: JSON.stringify({
+        type: 'transcribe_video', payload: { videoId: video.id, retry: ['error', 'paused'].includes(video.transcriptStatus) },
+      }) }, csrfToken);
+      await loadHostState();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '口播识别未能入队';
+      updateVideoEverywhere(video.id, (item) => ({ ...item, transcriptStatus: 'error', transcriptError: message }));
+    }
+  };
+
   const submitVideoLink = async (event: FormEvent) => {
     event.preventDefault();
     if (!videoLinkInput.trim()) {
@@ -1618,7 +1680,8 @@ export default function Home() {
       return;
     }
     if (!qwenConfigured) {
-      if (isHostLocal) { setReader(null); setShowQwenConfig(true); }
+      if (analysisProvider === 'codebuddy') setNotice('电脑上的 CodeBuddy 视频分析组件尚未就绪，请检查组件与登录状态');
+      else if (isHostLocal) { setReader(null); setShowQwenConfig(true); }
       else setNotice('主机尚未配置 Qwen API Key，请先在主机 localhost 页面完成配置');
       return;
     }
@@ -1794,7 +1857,7 @@ export default function Home() {
         body: JSON.stringify({ apiKey: qwenApiKey.trim() }),
       }, csrfToken);
       setQwenApiKey('');
-      setQwenConfigured(true);
+      await loadQwenStatus();
       setShowQwenConfig(false);
       setNotice('Qwen API Key 已由主机安全保存');
     } catch (error) {
@@ -1809,10 +1872,10 @@ export default function Home() {
     const setupBlocked = authPhase === 'setup' && !isHostLocal;
     return <main className="accessGate">
       <section className="accessCard" aria-live="polite">
-        <div className="accessMark"><PlatformIcon platform="douyin" alt="抖音" /></div>
+        <div className="observeBrand">Observe</div>
 
-        <h1>{authPhase === 'setup' ? '设置工作台访问密码' : authPhase === 'login' ? '登录监控工作台' : authPhase === 'error' ? '主机服务未连接' : '正在载入共享数据'}</h1>
-        <p>{authMessage || '正在加载账号、视频和分析结果。'}</p>
+        <h1>{authPhase === 'setup' ? '设置工作台访问密码' : authPhase === 'login' ? '登录 Observe' : authPhase === 'error' ? '主机服务未连接' : '正在打开工作台'}</h1>
+        <p>{authMessage || '正在连接主机服务…'}</p>
         {(authPhase === 'setup' || authPhase === 'login') && !setupBlocked && <form onSubmit={submitAuth}>
           <label htmlFor="access-password">访问密码</label>
           <input id="access-password" type="password" autoComplete={authPhase === 'login' ? 'current-password' : 'new-password'} minLength={10} value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} autoFocus />
@@ -1826,6 +1889,14 @@ export default function Home() {
   }
 
   return (
+    <div className="observeShell">
+      <header className="observeGlobalBar" ref={globalHeader}>
+        <strong className="observeBrand">Observe</strong>
+        <nav aria-label="模块导航"><button data-module="content" aria-current={activeModule === 'content' ? 'page' : undefined} onClick={() => navigateObserve('content')}>内容情报台{hostJobs.some(j => ['queued', 'processing', 'running'].includes(j.status)) && <span className="observeTaskDot" aria-label="视频任务执行中" />}</button>
+          <button data-module="wechat" aria-current={activeModule === 'wechat' ? 'page' : undefined} onClick={() => navigateObserve('wechat')}>微信读取{wechatTask && <small>{wechatTask}</small>}</button></nav>
+        <details className="observeSettings"><summary>配色</summary><div><ColorThemePicker /><button className="logoutButton" onClick={logout}>退出当前设备</button></div></details>
+      </header>
+      <div className="observeContent" hidden={activeModule !== 'content'} inert={activeModule !== 'content'}>
     <main className="appShell">
       <header className="sidebar">
         <div className="brand">
@@ -1866,13 +1937,13 @@ export default function Home() {
               </div>
             )}
           </div>
-          <div className="brandText"><strong>{PLATFORMS[activePlatform].name}工作台</strong></div>
+          <div className="brandText"><strong>{PLATFORMS[activePlatform].name}</strong></div>
         </div>
-        <nav className="navigation" aria-label="主导航">
+        <nav className="navigation" aria-label="内容情报台功能">
 
           {navItems.map(([icon, label]) => (
             <button className={activeNav === label ? 'navItem active' : 'navItem'} aria-current={activeNav === label ? 'page' : undefined} key={label} onClick={() => {
-              animateChange(() => setActiveNav(label));
+              navigateObserve('content', label);
               if (label === '信源管理') dismissAccountBadge();
             }}>
               <span className="navIcon" aria-hidden="true">{icon}</span><span className="navText">{label}</span>
@@ -1881,7 +1952,7 @@ export default function Home() {
           ))}
         </nav>
         <details className="sidebarFoot serviceStatus">
-          <summary title={hostConnected ? '主机已连接' : '主机未连接'}><i className={hostConnected ? 'connected' : ''} aria-label={hostConnected ? '主机已连接' : '主机未连接'} />设置</summary>
+          <summary title={hostConnected ? '主机已连接' : '主机未连接'}><i className={hostConnected ? 'connected' : ''} aria-label={hostConnected ? '主机已连接' : '主机未连接'} />视频设置</summary>
           <div className="servicePopover">
           <div className={hostConnected ? 'localStatus connected' : 'localStatus'}><i /><span><b>主机采集服务</b><small>{dedicatedBrowser ? (hostConnected ? '已连接' : '正在连接电脑后台') : !hostConnected ? '服务已连接 · 等待主机 Chrome 自动连接' : isHostLocal ? bridgeNeedsReload ? `Chrome 组件缺少视频分析能力 · 需更新一次到 v${requiredExtensionVersion}` : bridgeReady ? `Chrome 已连接${bridgeVersion ? ` · v${bridgeVersion}` : ''}` : 'Chrome 后台已连接 · 网页桥接自动恢复中' : '已连接 · 任务由主机 Chrome 执行'}</small></span></div>
           <div className="serviceSettings">
@@ -1900,7 +1971,6 @@ export default function Home() {
               <small>连接同一个 Wi-Fi，使用工作台访问密码登录。电脑需保持开机并运行服务。</small>
             </details>}
           </div>
-          <button className="logoutButton" type="button" onClick={logout}>退出当前设备</button>
           </div>
         </details>
       </header>
@@ -1958,9 +2028,10 @@ export default function Home() {
                 {(!browserError && (accounts.some((account) => account.status === 'error') || !hostConnected)) && <div className="collectionWarning" role="status"><p>{!hostConnected ? '主机暂未连接' : `${accounts.filter((account) => account.status === 'error').length} 个账号采集未完成`}</p><button type="button" className="secondaryButton" onClick={() => animateChange(() => setActiveNav('信源管理'))}>查看状态</button></div>}
                 {contentView === 'discoveries'
                   ? (effectiveDiscoveryVideos.length
-                    ? <VideoBrowser
+                    ? <VideoBrowser moduleActive={activeModule === 'content'}
                       key="discoveries"
                       videos={effectiveDiscoveryVideos}
+                      accounts={accounts}
                       feedTitle="新增检查视频"
                       feedNote="最近72小时检查发现的新内容"
                       discoveryMode
@@ -1974,9 +2045,10 @@ export default function Home() {
                     />
                     : <EmptyData title="暂无新增检查视频" detail="下次检查发现的新作品会出现在这里，保留72小时。" />)
                   : homeVideos.length
-                    ? <VideoBrowser
+                    ? <VideoBrowser moduleActive={activeModule === 'content'}
                       key={homeAccountId || 'all'}
                       videos={homeVideos}
+                      accounts={accounts}
                       feedTitle={homeAccount?.name || '全部视频'}
                       feedNote={`共 ${homeVideos.length} 条`}
                       csrfToken={csrfToken}
@@ -2014,9 +2086,10 @@ export default function Home() {
                   </form>
                 </section>
                 {selectedLink
-                  ? <VideoBrowser
+                  ? <VideoBrowser moduleActive={activeModule === 'content'}
                     key={selectedLink.id}
                     videos={linkVideos}
+                    accounts={accounts}
                     inlineVideo={selectedLink}
                     csrfToken={csrfToken}
                     feedTitle="链接记录"
@@ -2060,11 +2133,11 @@ export default function Home() {
         )}
       </section>
 
-      {reader && readerVideo && <VideoReader video={readerVideo} jobs={hostJobs} initialSection={reader.section} index={reader.videoIds.indexOf(reader.videoId)} total={reader.videoIds.length} onClose={closeReader} onNavigate={(offset) => setReader((current) => {
+      {reader && readerVideo && <VideoReader active={activeModule === 'content'} video={readerVideo} jobs={hostJobs} initialSection={reader.section} index={reader.videoIds.indexOf(reader.videoId)} total={reader.videoIds.length} onClose={closeReader} onNavigate={(offset) => setReader((current) => {
         if (!current) return current;
         const id = current.videoIds[current.videoIds.indexOf(current.videoId) + offset];
         return id ? { ...current, videoId: id } : current;
-      })} onAnalysis={requestAnalysis} onCancel={cancelAnalysis} />}
+      })} onAnalysis={requestAnalysis} onTranscribe={requestTranscription} onCancel={cancelAnalysis} />}
 
       {showAddAccount && (
         <div className="modalBackdrop" role="presentation" onMouseDown={() => closeOverlay(() => setShowAddAccount(false))}>
@@ -2099,12 +2172,12 @@ export default function Home() {
         <div className="modalBackdrop" role="presentation" onMouseDown={() => closeOverlay(() => { setQwenApiKey(''); setShowQwenConfig(false); })}>
           <form className="modal" role="dialog" aria-modal="true" aria-labelledby="qwen-config-title" onSubmit={saveQwenKey} onMouseDown={(event) => event.stopPropagation()}>
             <button className="modalClose" type="button" aria-label="关闭" onClick={() => closeOverlay(() => { setQwenApiKey(''); setShowQwenConfig(false); })}>×</button>
-            <h2 id="qwen-config-title">配置 Qwen 视频分析</h2>
-            <p>API Key 只会交给主机服务，并使用当前 Windows 用户加密保存；不会写入浏览器、SQLite、Git 或日志。其他设备只能看到是否已配置。</p>
-            <label htmlFor="qwen-api-key">Qwen API Key</label>
-            <input id="qwen-api-key" type="password" autoComplete="off" value={qwenApiKey} onChange={(event) => setQwenApiKey(event.target.value)} placeholder={qwenConfigured ? '输入新 Key 可替换现有配置' : '请输入 API Key'} autoFocus />
-            <div className="modalNote">视频分析使用 qwen3.8-flash，口播识别使用 qwen3-asr-flash-filetrans。开始分析后，完整视频与完整音轨会分别发送至云端；已有口播稿直接复用。</div>
-            <div className="modalActions"><button className="secondaryButton" type="button" onClick={() => closeOverlay(() => { setQwenApiKey(''); setShowQwenConfig(false); })}>取消</button><button className="primaryButton" type="submit" disabled={qwenSaving}>{qwenSaving ? '保存中…' : qwenConfigured ? '替换配置' : '安全保存'}</button></div>
+            <h2 id="qwen-config-title">AI 分析设置</h2>
+            <p>{analysisProvider === 'codebuddy' ? '视频分析使用 MiniMax-M3，额度用尽后切换 MiniMax-M3.1-Flash。' : '视频分析使用 Qwen。'}</p>
+            <label htmlFor="qwen-api-key">{analysisProvider === 'codebuddy' ? '云端口播 Qwen API Key' : 'Qwen API Key'}</label>
+            <input id="qwen-api-key" type="password" autoComplete="off" value={qwenApiKey} onChange={(event) => setQwenApiKey(event.target.value)} placeholder={cloudAsrConfigured ? '输入新 Key 可替换现有配置' : '请输入 API Key'} autoFocus />
+            <div className="modalNote">已有口播稿直接复用；缺失时使用云端识别。密钥只保存在电脑。</div>
+            <div className="modalActions"><button className="secondaryButton" type="button" onClick={() => closeOverlay(() => { setQwenApiKey(''); setShowQwenConfig(false); })}>取消</button><button className="primaryButton" type="submit" disabled={qwenSaving}>{qwenSaving ? '保存中…' : cloudAsrConfigured ? '替换配置' : '安全保存'}</button></div>
           </form>
         </div>
       )}
@@ -2114,6 +2187,9 @@ export default function Home() {
         {discoveryNotice !== null && effectiveDiscoveryVideos.length > 0 && <button type="button" className="toastAction" onClick={() => { setNotice(''); selectDiscoveryView(); }}>查看“新增检查视频”（72小时内 {effectiveDiscoveryVideos.length} 条）</button>}
       </div>}
     </main>
+      </div>
+      {wechatVisited && <WeChatWorkspace active={activeModule === 'wechat'} local={isHostLocal} request={wechatRequest} page={wechatPage} onPage={page => navigateObserve('wechat', page)} onTaskStatus={setWechatTask} />}
+    </div>
   );
 }
 
@@ -2504,6 +2580,14 @@ function savedSections(video: Video) {
   return [video.transcriptStatus === 'ready' || Boolean(video.transcript) ? '口播稿' : '', videoContentReading(video.analysis).complete ? '视频内容分析' : '', isRemotionPlan(video.analysis) ? 'Remotion 制作规范' : ''].filter(Boolean);
 }
 
+function transcriptPendingText(video: Video) {
+  return video.transcriptStatus === 'paused' ? '口播识别已暂停'
+    : video.transcriptStatus === 'queued' ? '口播识别排队中'
+    : video.transcriptStatus === 'processing' ? '正在识别口播'
+      : video.transcriptStatus === 'ready' ? '未识别到清晰口播'
+        : video.transcriptStatus === 'error' ? `口播识别未完成：${redactDiagnosticText(video.transcriptError || '请重试')}` : '暂无口播稿';
+}
+
 function analysisProgress(video: Video, job?: HostJob) {
   const stage = String(job?.progress?.stage || '');
   return textValue(job?.progress?.message) || ({
@@ -2511,6 +2595,7 @@ function analysisProgress(video: Video, job?: HostJob) {
     local_asr_and_secure_upload: '正在识别口播并准备视频', cloud_asr_and_secure_upload: '正在识别完整音轨，并准备视频分析',
     cloud_asr: '正在识别完整音轨', secure_video_upload: '正在上传完整视频',
     qwen_full_video_analysis: '视频已提交，等待模型返回', qwen_reasoning: '模型正在分析完整视频',
+    analysis_model_fallback: 'MiniMax 额度已用尽，已切换 MiniMax-M3.1-Flash',
     qwen_receiving_output: '正在接收内容分析和制作规范', lossless_continuous_segmentation: '正在无损分段处理完整视频',
   } as Record<string, string>)[stage] || (displayedAnalysisStatus(video, job) === 'queued' ? '任务已排队，等待主机处理' : '正在处理分析任务');
 }
@@ -2532,15 +2617,17 @@ function previewMediaUrl(videoId: string, generation: string) {
   return `${getHostApiBase()}/api/previews/${videoId}/${generation}/media`;
 }
 
-function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrfToken, inlineVideo, ...presentation }: VideoPresentationProps & {
-  videos: Video[]; feedTitle: string; feedNote: string; discoveryMode?: boolean; csrfToken: string; inlineVideo?: Video;
+function VideoBrowser({ videos, accounts, feedTitle, feedNote, discoveryMode = false, csrfToken, inlineVideo, moduleActive, ...presentation }: VideoPresentationProps & {
+  videos: Video[]; accounts: Account[]; feedTitle: string; feedNote: string; discoveryMode?: boolean; csrfToken: string; inlineVideo?: Video; moduleActive: boolean;
 }) {
+  const authorsById = useMemo(() => new Map(accounts.map(account => [account.id, account])), [accounts]);
   const [selectedId, setSelectedId] = useState('');
   const [page, setPage] = useState(0);
-  const [mobileReading, setMobileReading] = useState(false);
   const feedRef = useRef<HTMLDivElement>(null);
-  const previewRef = useRef<HTMLDivElement>(null);
   const mediaRef = useRef<HTMLVideoElement>(null);
+  const moduleActiveRef = useRef(moduleActive);
+  useEffect(() => { moduleActiveRef.current = moduleActive; }, [moduleActive]);
+  const modulePlaybackPosition = useRef(0);
   const initialInlineVideoRef = useRef(inlineVideo);
   const playerRef = useRef<HTMLDivElement>(null);
   const playerOpenRef = useRef(Boolean(inlineVideo));
@@ -2560,9 +2647,13 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
   const [hoverBounds, setHoverBounds] = useState<DOMRect | null>(null);
   const [playError, setPlayError] = useState('');
   const [renderedMediaUrl, setRenderedMediaUrl] = useState('');
+  const [decodedHoverUrl, setDecodedHoverUrl] = useState('');
   const [playbackRate, setPlaybackRate] = useState(1);
   const [playbackVolume, setPlaybackVolume] = useState(1);
   const [playbackMuted, setPlaybackMuted] = useState(false);
+  const playbackMutedRef = useRef(false);
+  const presentedSourceRef = useRef('');
+  const frameWaitRef = useRef<{ source: string; cancel: () => void } | null>(null);
   const [previews, setPreviews] = useState<Record<string, PreviewState>>({});
   const hoveredIdRef = useRef('');
   const interruptedHoverRef = useRef('');
@@ -2575,8 +2666,10 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
   const mountedRef = useRef(true);
   const activeMediaId = playerId || hoverId;
   const activePreview = activeMediaId && previews[activeMediaId]?.status === 'ready' ? previews[activeMediaId] : null;
+  const playerError = playError || (playerId && previews[playerId]?.status === 'error'
+    ? previews[playerId].message || '视频源加载失败，请重新打开视频' : '');
   const mediaUrl = activePreview && activeMediaId ? previewMediaUrl(activeMediaId, activePreview.generation) : '';
-  const showHover = Boolean(hoverId && !playerId && hoverBounds && mediaUrl && renderedMediaUrl === mediaUrl);
+  const showHover = Boolean(hoverId && !playerId && hoverBounds && mediaUrl && decodedHoverUrl === mediaUrl);
 
   const stopPreviewPolling = useCallback((videoId: string) => {
     pendingPolls.current.delete(videoId);
@@ -2597,7 +2690,7 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
   // One prepare request per work; every later read only checks the stored
   // status, so polling never opens another detail page.
   const prepareVideo = useCallback((video: Video) => {
-    if (requestedRef.current.has(video.id)) return;
+    if (!moduleActiveRef.current || requestedRef.current.has(video.id)) return;
     requestedRef.current.add(video.id);
     setPreviews((current) => ({ ...current, [video.id]: { generation: '', status: 'pending' } }));
 
@@ -2665,33 +2758,117 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
   // of analysis completion; later metadata/results refreshes keep this source.
   useEffect(() => {
     const video = initialInlineVideoRef.current;
-    if (video) prepareVideo(video);
-  }, [prepareVideo]);
+    if (video && moduleActive) prepareVideo(video);
+  }, [prepareVideo, moduleActive]);
 
   const clearMedia = useCallback(() => {
+    frameWaitRef.current?.cancel();
+    frameWaitRef.current = null;
+    presentedSourceRef.current = '';
     setRenderedMediaUrl('');
+    setDecodedHoverUrl('');
+    setPlayerPaused(true);
     const element = mediaRef.current;
     if (!element) return;
+    element.muted = true;
     element.pause();
     // Pausing alone would leave the transfer running. load() aborts the current
     // media request so the host stops reading from the platform CDN.
     element.removeAttribute('src');
     element.load();
-  }, [setRenderedMediaUrl]);
+  }, [setRenderedMediaUrl, setDecodedHoverUrl, setPlayerPaused]);
 
   const requestPlayback = useCallback((element: HTMLVideoElement) => {
     const source = element.getAttribute('src');
-    if (!source) return;
-    void element.play().catch((error: unknown) => {
-      const name = error instanceof Error ? error.name : '';
-      // A cleared/replaced source and an interrupted play are normal during
-      // switching, closing and pausing; their old promises cannot set a banner.
-      if (!mountedRef.current || element !== mediaRef.current || !playerOpenRef.current
-        || element.getAttribute('src') !== source || !element.paused || name === 'AbortError') return;
-      setPlayError(name === 'NotAllowedError' ? '浏览器限制了自动播放，请点击播放'
-        : name === 'NotSupportedError' ? '视频加载或解码失败，请重新打开视频'
-          : '视频播放失败，请重新打开视频');
-    });
+    if (!source || !moduleActiveRef.current) return;
+    const play = () => {
+      if (!mountedRef.current || element !== mediaRef.current || element.getAttribute('src') !== source
+        || (!playerOpenRef.current && !hoveredIdRef.current) || !startPlaybackRef.current) return;
+      element.muted = !playerOpenRef.current || playbackMutedRef.current;
+      void element.play().catch((error: unknown) => {
+        const name = error instanceof Error ? error.name : '';
+        // A cleared/replaced source and an interrupted play are normal during
+        // switching, closing and pausing; their old promises cannot set a banner.
+        if (!mountedRef.current || element !== mediaRef.current || !playerOpenRef.current
+          || element.getAttribute('src') !== source || !element.paused || name === 'AbortError') return;
+        setPlayError(name === 'NotAllowedError' ? '浏览器限制了自动播放，请点击播放'
+          : name === 'NotSupportedError' ? '视频加载或解码失败，请重新打开视频'
+            : '视频播放失败，请重新打开视频');
+      });
+    };
+    if (presentedSourceRef.current === source && element.readyState >= 2) { play(); return; }
+    // Keep both the audio and clock stopped until a real video frame reaches
+    // the compositor. `playing`/`canplay` alone can precede that frame.
+    element.muted = true;
+    if (frameWaitRef.current?.source === source) return;
+    frameWaitRef.current?.cancel();
+    let cancelled = false;
+    let frame = 0;
+    let raf = 0;
+    let timer = 0;
+    let frameConfirmed = false;
+    const cancel = () => {
+      cancelled = true;
+      if (frame) element.cancelVideoFrameCallback(frame);
+      window.cancelAnimationFrame(raf);
+      window.clearTimeout(timer);
+      element.removeEventListener('canplay', watchForMissingFrame);
+      element.removeEventListener('loadeddata', fallbackFrame);
+      element.removeEventListener('loadeddata', finishPresentedFrame);
+    };
+    const isCurrent = () => !cancelled && mountedRef.current && element === mediaRef.current
+      && element.getAttribute('src') === source && (playerOpenRef.current || Boolean(hoveredIdRef.current));
+    const presented = () => {
+      if (!isCurrent() || !element.videoWidth || !element.videoHeight || element.readyState < 2) return;
+      cancel();
+      frameWaitRef.current = null;
+      presentedSourceRef.current = source;
+      flushSync(() => { setRenderedMediaUrl(source); setPlayerBuffering(false); });
+      play();
+    };
+    // Chrome can deliver the compositor callback just before readyState is
+    // advanced to HAVE_CURRENT_DATA. Retain that confirmation until loadeddata.
+    const finishPresentedFrame = () => { if (frameConfirmed) presented(); };
+    const watchForMissingFrame = () => {
+      if (timer || !isCurrent()) return;
+      timer = window.setTimeout(() => {
+        if (!isCurrent()) return;
+        cancel();
+        frameWaitRef.current = null;
+        element.pause();
+        setPlayerPaused(true);
+        if (playerOpenRef.current) {
+          setPlayerBuffering(false);
+          setPlayError('视频画面加载超时，请重新打开或查看原视频');
+        }
+      }, 15_000);
+    };
+    // A paused first frame may already be decoded before the compositor
+    // callback is subscribed. Do not wait for a second frame while paused.
+    const hasDecodedFrame = () => {
+      if (element.readyState < 2 || !element.videoWidth || !element.videoHeight) return false;
+      if (typeof element.getVideoPlaybackQuality !== 'function') return true;
+      const quality = element.getVideoPlaybackQuality();
+      return quality.totalVideoFrames > quality.droppedVideoFrames;
+    };
+    const fallbackFrame = () => {
+      window.cancelAnimationFrame(raf);
+      const waitForPaint = () => {
+        if (!isCurrent()) return;
+        if (!hasDecodedFrame()) { raf = window.requestAnimationFrame(waitForPaint); return; }
+        raf = window.requestAnimationFrame(() => { if (hasDecodedFrame()) presented(); else fallbackFrame(); });
+      };
+      raf = window.requestAnimationFrame(waitForPaint);
+    };
+    frameWaitRef.current = { source, cancel };
+    if (typeof element.requestVideoFrameCallback === 'function') {
+      element.addEventListener('loadeddata', finishPresentedFrame);
+      frame = element.requestVideoFrameCallback(() => { frameConfirmed = true; presented(); });
+    }
+    if (element.readyState >= 2) fallbackFrame();
+    else element.addEventListener('loadeddata', fallbackFrame, { once: true });
+    element.addEventListener('canplay', watchForMissingFrame, { once: true });
+    if (element.readyState >= 3) watchForMissingFrame();
   }, [setPlayError]);
 
   // The floating preview is an overlay with pointer-events disabled, so it can
@@ -2704,7 +2881,7 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
     if (!pointer) return true;
     const row = rowFor(videoId);
     if (!row) return false;
-    const bounds = row.getBoundingClientRect();
+    const bounds = (row.querySelector<HTMLElement>('.compactCover') || row).getBoundingClientRect();
     return pointer.x >= bounds.left && pointer.x <= bounds.right
       && pointer.y >= bounds.top && pointer.y <= bounds.bottom;
   }, [rowFor]);
@@ -2718,6 +2895,7 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
     const bounds = target.getBoundingClientRect();
     if (!bounds.width || !bounds.height || !pointerOnRow(video.id)) return;
     prepareVideo(video);
+    startPlaybackRef.current = true;
     mediaRetries.current.delete(video.id);
     interruptedHoverRef.current = '';
     hoveredIdRef.current = video.id;
@@ -2739,10 +2917,11 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
     startPlaybackRef.current = true;
     setPlayError('');
     setPlaybackMuted(false);
+    playbackMutedRef.current = false;
     const volume = playbackVolume > 0 ? playbackVolume : 0.8;
     setPlaybackVolume(volume);
     const element = mediaRef.current;
-    if (element) { element.muted = false; element.volume = volume; }
+    if (element) { element.muted = presentedSourceRef.current !== element.getAttribute('src'); element.volume = volume; }
     const continuing = hoverId === video.id && previews[video.id]?.status === 'ready';
     if (!continuing) {
       // Removing the React src prop alone does not abort the previous resource.
@@ -2789,7 +2968,7 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
     const bounds = playerRef.current?.getBoundingClientRect();
     const margin = 8;
     return { x: Math.max(margin, Math.min(x, window.innerWidth - (bounds?.width || 0) - margin)),
-      y: Math.max(margin, Math.min(y, window.innerHeight - (bounds?.height || 0) - margin)) };
+      y: Math.max(64, Math.min(y, window.innerHeight - (bounds?.height || 0) - margin)) };
   }, []);
   const startPlayerDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0 || !playerRef.current) return;
@@ -2818,7 +2997,7 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
     const right = left + bounds.width;
     const bottom = top + bounds.height;
     const maxWidth = Math.max(0, west ? right - 8 : window.innerWidth - left - 8);
-    const maxHeight = Math.max(0, north ? bottom - 8 : window.innerHeight - top - 8);
+    const maxHeight = Math.max(0, north ? bottom - 64 : window.innerHeight - top - 8);
     const nextWidth = Math.max(Math.min(360, maxWidth), Math.min(width, maxWidth));
     const nextHeight = Math.max(Math.min(280, maxHeight), Math.min(height, maxHeight));
     setPlayerSize({ width: nextWidth, height: nextHeight });
@@ -2903,7 +3082,7 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
     return () => document.removeEventListener('fullscreenchange', onFullscreen);
   }, []);
   useEffect(() => {
-    if (!activeMediaId || !mediaUrl) return;
+    if (!moduleActive || !activeMediaId || !mediaUrl) return;
     const element = mediaRef.current;
     if (!element) return;
     // Scroll cleanup can remove the source just before a click on the same
@@ -2917,10 +3096,12 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
     // source must preserve any later mute choice made in the open player.
     if (!playerOpenRef.current) element.muted = true;
     requestPlayback(element);
-  }, [activeMediaId, mediaUrl, playerId, requestPlayback]);
+  }, [activeMediaId, mediaUrl, playerId, requestPlayback, moduleActive]);
   useEffect(() => {
-    if (mediaRef.current) mediaRef.current.muted = !playerId || playbackMuted;
-  }, [playerId, playbackMuted]);
+    playbackMutedRef.current = playbackMuted;
+    const element = mediaRef.current;
+    if (element) element.muted = !playerId || playbackMuted || presentedSourceRef.current !== element.getAttribute('src');
+  }, [playerId, playbackMuted, renderedMediaUrl]);
   useEffect(() => {
     if (!mediaRef.current) return;
     mediaRef.current.playbackRate = playbackRate;
@@ -3001,7 +3182,31 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
     return () => window.removeEventListener('focus', resumeInterruptedHover);
   }, [pointerOnRow, rowFor]);
   useEffect(() => {
+    const onModule = (event: Event) => {
+      moduleActiveRef.current = (event as CustomEvent<string>).detail === 'content';
+      if (!moduleActiveRef.current) {
+
+        interruptedHoverRef.current = ''; hoveredIdRef.current = '';
+        setHoverId(''); setHoverBounds(null);
+        modulePlaybackPosition.current = mediaRef.current?.currentTime || modulePlaybackPosition.current;
+        startPlaybackRef.current = false; resumeInlineRef.current = false;
+        clearMedia();
+      } else {
+        const element = mediaRef.current;
+        if (element && mediaUrl && playerOpenRef.current) {
+          element.src = mediaUrl; element.preload = 'metadata'; element.load();
+          element.addEventListener('loadedmetadata', () => {
+            if (moduleActiveRef.current) element.currentTime = modulePlaybackPosition.current;
+          }, { once: true });
+        }
+      }
+    };
+    window.addEventListener('observe:module-change', onModule);
+    return () => window.removeEventListener('observe:module-change', onModule);
+  });
+  useEffect(() => {
     const onVisibility = () => {
+      if (!moduleActiveRef.current) return;
       if (!inlineVideo) { if (document.hidden) { stopHover(); closePlayer(); } return; }
       if (document.hidden) { resumeInlineRef.current = Boolean(mediaRef.current && !mediaRef.current.paused); clearMedia(); return; }
       // Restore the same prepared generation after returning to the page.
@@ -3023,6 +3228,8 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
     for (const resume of Array.from(pendingPolls.current.values())) resume();
     return () => {
       mountedRef.current = false;
+      frameWaitRef.current?.cancel();
+      frameWaitRef.current = null;
       for (const timer of timers.values()) window.clearTimeout(timer);
       timers.clear();
     };
@@ -3032,59 +3239,80 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
   const currentPage = Math.min(page, pages - 1);
   const pageVideos = videos.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
   const selected = inlineVideo || pageVideos.find((video) => video.id === selectedId) || pageVideos[0];
-  const readyCount = Object.values(previews).filter((state) => state.status === 'ready').length;
   const changePage = (next: number) => {
     stopHover();
     if (playerOpenRef.current) closePlayer();
-    animateChange(() => { setPage(next); setSelectedId(''); setMobileReading(false); });
+    animateChange(() => { setPage(next); setSelectedId(''); });
     feedRef.current?.scrollTo({ top: 0 });
   };
   const activeVideo = activeMediaId ? videos.find((video) => video.id === activeMediaId) : undefined;
-  return <div className={inlineVideo ? 'linkPlaybackWorkspace' : 'contentBrowser'} data-reading={mobileReading}>
-    {!inlineVideo && <section className="compactFeed" aria-label="视频列表">
-      <div className="compactFeedHeading"><strong>{feedTitle}</strong><span>{feedNote}{readyCount ? ` · 已准备 ${readyCount} 条` : ''}</span></div>
+  return <div className={inlineVideo ? 'linkPlaybackWorkspace' : 'contentBrowser'}>
+    {!inlineVideo && <section className="compactFeed" aria-label={discoveryMode ? '新增检查视频列表' : '视频列表'}>
+      <div className="compactFeedHeading"><strong>{feedTitle}</strong><span>{feedNote}</span></div>
       <div className="compactFeedScroll" ref={feedRef} key={currentPage}>
-        {pageVideos.map((video, index) => {
+        {pageVideos.map((video) => {
           const reading = videoContentReading(video.analysis);
           const job = analysisJob(video, presentation.jobs);
           const status = displayedAnalysisStatus(video, job);
           const busy = status === 'queued' || status === 'processing';
-          const result = busy ? status === 'queued' ? '等待分析' : '正在分析' : job?.status === 'cancelled' ? '任务已取消'
-            : status === 'error' ? '本次分析未完成' : reading.available ? '已有内容分析' : video.transcript ? '已有口播稿' : '尚未分析';
+          const sourceDescription = contentSourceDescription(video);
+          const author = authorsById.get(video.accountId);
+          const authorName = video.authorName || author?.name || '作者未记录';
+          const hasTranscript = Boolean(video.transcript?.trim());
+          const hasAnalysis = reading.available || isRemotionPlan(video.analysis);
+          const transcriptState = hasTranscript ? '有口播稿' : video.transcriptStatus === 'queued' ? '口播排队中'
+            : video.transcriptStatus === 'processing' ? '口播识别中' : video.transcriptStatus === 'paused' ? '口播已暂停' : '无口播稿';
+          const analysisState = busy ? status === 'queued' ? '分析排队中' : '分析中'
+            : hasAnalysis ? '已分析' : status === 'error' ? '分析未完成' : '未分析';
           const preview = previews[video.id];
           const previewLoading = activeMediaId === video.id && preview?.status !== 'error'
             && (!mediaUrl || renderedMediaUrl !== mediaUrl);
           const enterRow = (event: React.MouseEvent<HTMLDivElement>) => {
             pointerRef.current = { x: event.clientX, y: event.clientY };
+            if (window.matchMedia('(hover: hover) and (pointer: fine)').matches
+              && selected?.id !== video.id) {
+              setSelectedId(video.id);
+            }
+          };
+          const enterCover = (event: React.MouseEvent<HTMLButtonElement>) => {
+            pointerRef.current = { x: event.clientX, y: event.clientY };
             hoverVideo(video, event.currentTarget.querySelector<HTMLElement>('.compactCover') || event.currentTarget);
           };
-          return <div className="compactVideoRow" data-selected={selected?.id === video.id} data-video-id={video.id} key={video.id} style={{ '--card-order': Math.min(index, 7) } as CSSProperties}
-            onMouseEnter={enterRow} onMouseMove={enterRow} onMouseLeave={stopHover}>
+          return <div className="compactVideoRow" data-selected={selected?.id === video.id} data-video-id={video.id} key={video.id}
+            onMouseEnter={enterRow} onMouseMove={enterRow} onMouseLeave={stopHover}
+            onFocusCapture={() => setSelectedId(video.id)} onClick={() => setSelectedId(video.id)}>
             <div className="compactVideo">
-              <button type="button" className="compactCoverButton" aria-label={`播放：${video.title || '未命名视频'}`} onClick={() => openPlayer(video)}>
+              <button type="button" className="compactCoverButton" aria-label={`播放：${video.title || '未命名视频'}`} onClick={() => openPlayer(video)}
+                onMouseEnter={enterCover} onMouseMove={enterCover} onMouseLeave={stopHover}>
                 <span className="compactCover">{video.coverUrl ? <img src={video.coverUrl} alt="" loading="lazy" referrerPolicy="no-referrer" /> : <span aria-hidden="true">▷</span>}{previewLoading && <span className="compactCoverPending">正在加载</span>}<small>{formatDuration(video.durationSeconds) || '视频'}</small></span>
               </button>
-              <button type="button" className="compactVideoCopy" aria-pressed={selected?.id === video.id} onClick={() => {
-                animateChange(() => { setSelectedId(video.id); setMobileReading(true); });
-                if (window.matchMedia('(max-width: 980px)').matches) requestAnimationFrame(() => previewRef.current?.querySelector<HTMLElement>('h2')?.focus());
-              }}>
-                <b>{video.title || '未命名视频'}</b>
-                <span className="compactVideoMeta">{video.authorName || '作者未记录'} · {formatPublishedTime(video.publishedAt)}{video.discoveredAt && <span className="compactVideoState discoveryState">发现于 {formatTime(video.discoveredAt)}</span>}<span className={`compactVideoState ${busy ? 'processing' : ''}`}>{result}</span></span>
-                <span className="mobileVideoMetrics">{[['点赞', video.likeCount], ['评论', video.commentCount], ['收藏', video.favoriteCount], ['分享', video.shareCount]].map(([label, value]) => <span key={label}> {label} <b>{formatMetric(value as number | null)}</b></span>)}</span>
-                {!discoveryMode && (reading.overview || video.transcript) && <span className="compactVideoSummary">{reading.overview || `口播：${video.transcript}`}</span>}
-              </button>
+              <div className="compactVideoText">
+                <div className="compactVideoAuthor">
+                  <strong className="compactAuthorName" title={authorName}>{authorName}</strong>
+                  <span className="compactAuthorFollowers" title={followerDetailText(author, formatTime(author?.followerCountCapturedAt || null))}>{formatFollowerLabel(author)}</span>
+                </div>
+                <button type="button" className="compactVideoCopy" aria-pressed={selected?.id === video.id} onClick={() => presentation.onOpen(video, reading.available ? 'content' : 'transcript', videos)}>{video.title || '未命名视频'}</button>
+                {sourceDescription && <p className="compactVideoSummary">{sourceDescription}</p>}
+                <div className="compactVideoFooter">
+                  <div className="compactRowInfo">
+                    <VideoInteractionMetrics video={video} className="compactVideoMetrics" />
+                    <div className="compactVideoMeta">{formatPublishedTime(video.publishedAt)}{video.discoveredAt && <span className="compactVideoState discoveryState">发现于 {formatTime(video.discoveredAt)}</span>}</div>
+                    <div className="compactVideoStatus" aria-label="口播与分析状态">
+                      <span data-ready={hasTranscript}>{transcriptState}</span>
+                      <span data-ready={hasAnalysis}>{analysisState}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>;
         })}
       </div>
       <div className="feedPagination" aria-label="视频分页"><button type="button" className="secondaryButton" disabled={currentPage === 0} onClick={() => changePage(currentPage - 1)}>上一页</button><span>{currentPage + 1} / {pages}</span><button type="button" className="secondaryButton" disabled={currentPage >= pages - 1} onClick={() => changePage(currentPage + 1)}>下一页</button></div>
     </section>}
-    <div className="videoPreviewPane" ref={previewRef} key={selected?.id}>
-      {selected && <VideoPreview video={selected} scope={videos} {...presentation} linkLayout={Boolean(inlineVideo)} onBack={inlineVideo ? undefined : () => {
-        setMobileReading(false);
-        requestAnimationFrame(() => feedRef.current?.querySelector<HTMLElement>('[aria-pressed="true"]')?.focus());
-      }} />}
-    </div>
+    {inlineVideo && <div className="videoPreviewPane" key={inlineVideo.id}>
+      <VideoPreview video={inlineVideo} scope={videos} {...presentation} linkLayout />
+    </div>}
     <div ref={playerRef} className={`siteVideoPlayer ${inlineVideo ? 'isInline' : playerId ? `isOpen${mediaAspect < 1 ? ' isPortrait' : ''}${playerDragging ? ' isDragging' : ''}${playerSize ? ' isResized' : ''}${playerResizing ? ' isResizing' : ''}` : showHover ? 'isHover' : ''}`}
       style={showHover && hoverBounds ? { top: hoverBounds.top, left: hoverBounds.left, width: hoverBounds.width, height: hoverBounds.height }
         : playerId ? { '--player-aspect': mediaAspect, ...(!inlineVideo && playerSize ? playerSize : {}), ...(playerPosition ? { left: playerPosition.x, top: playerPosition.y, right: 'auto', bottom: 'auto' } : {}) } as CSSProperties : undefined}
@@ -3102,37 +3330,55 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
             setPlayerPosition(boundPlayerPosition(bounds.left + move[0] * step, bounds.top + move[1] * step));
           }}>
           <svg className="siteVideoGrip" viewBox="0 0 16 24" fill="currentColor" aria-hidden="true">{[5, 12, 19].map(y => <g key={y}><circle cx="4" cy={y} r="1.6" /><circle cx="11" cy={y} r="1.6" /></g>)}</svg>
-          <strong>视频预览</strong>
+          <strong title={activeVideo?.title}>{activeVideo?.title || '视频预览'}</strong>
         </div>
         <button className="siteVideoClose" type="button" onClick={closePlayer} aria-label="关闭视频" title="关闭视频"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg><span>关闭</span></button>
       </div>}
       <div className="siteVideoBody">
       <div className="siteVideoMediaColumn">
       <div className="siteVideoStage">
-      <video key="online-preview" ref={mediaRef} src={mediaUrl || undefined} poster={activeVideo?.coverUrl || undefined} crossOrigin="use-credentials" playsInline autoPlay muted={!playerId || playbackMuted} preload="auto"
+      <video key="online-preview" ref={mediaRef} src={moduleActive ? mediaUrl || undefined : undefined} poster={activeVideo?.coverUrl || undefined} crossOrigin="use-credentials" playsInline muted={!playerId || playbackMuted || renderedMediaUrl !== mediaUrl} preload={moduleActive ? 'auto' : 'none'}
+        onLoadStart={(event) => {
+          // The source effect can subscribe before loadstart is dispatched.
+          // Keep that subscription so a fast paused first frame is not lost.
+          if (frameWaitRef.current?.source !== event.currentTarget.getAttribute('src')) {
+            frameWaitRef.current?.cancel();
+            frameWaitRef.current = null;
+          }
+          presentedSourceRef.current = '';
+          setRenderedMediaUrl('');
+          setDecodedHoverUrl('');
+          event.currentTarget.muted = true;
+          requestPlayback(event.currentTarget);
+        }}
         onLoadedMetadata={(event) => {
           const element = event.currentTarget;
           if (element.videoWidth && element.videoHeight) setMediaAspect(element.videoWidth / element.videoHeight);
           setPlayerTime({ current: element.currentTime, duration: Number.isFinite(element.duration) ? element.duration : 0 });
         }}
-        onTimeUpdate={(event) => setPlayerTime({ current: event.currentTarget.currentTime, duration: Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0 })}
+        onTimeUpdate={(event) => { if (moduleActive && event.currentTarget.currentTime > 0) modulePlaybackPosition.current = event.currentTarget.currentTime; setPlayerTime({ current: event.currentTarget.currentTime, duration: Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0 }); }}
         onLoadedData={(event) => {
-          // A paused inline player returning from a hidden tab still has a
-          // decoded frame; it must not stay behind a loading overlay.
-          if (inlineVideo && mediaUrl && event.currentTarget.currentSrc === mediaUrl && event.currentTarget.readyState >= 2) setRenderedMediaUrl(mediaUrl);
+          // Expose the decoded hover frame so the compositor can present it;
+          // audible playback still waits for the frame callback.
+          if (!playerOpenRef.current && mediaUrl && event.currentTarget.currentSrc === mediaUrl && event.currentTarget.readyState >= 2) setDecodedHoverUrl(mediaUrl);
         }}
-        onPlay={() => setPlayerPaused(false)} onPause={() => setPlayerPaused(true)} onWaiting={() => setPlayerBuffering(true)}
+        onPlay={() => { startPlaybackRef.current = true; setPlayerPaused(false); }}
+        onPause={(event) => {
+          if (presentedSourceRef.current === event.currentTarget.getAttribute('src')) startPlaybackRef.current = false;
+          setPlayerPaused(true);
+        }} onWaiting={() => setPlayerBuffering(true)}
         onCanPlay={(event) => {
-          setPlayerBuffering(false);
           if (playerOpenRef.current && startPlaybackRef.current) {
-            event.currentTarget.muted = playbackMuted;
             requestPlayback(event.currentTarget);
           }
         }}
-        onVolumeChange={(event) => { if (playerOpenRef.current) { setPlaybackMuted(event.currentTarget.muted); setPlaybackVolume(event.currentTarget.volume); } }}
+        onVolumeChange={(event) => { if (playerOpenRef.current) {
+          // The startup gate's temporary mute is separate from user intent.
+          if (presentedSourceRef.current === event.currentTarget.getAttribute('src')) setPlaybackMuted(event.currentTarget.muted);
+          setPlaybackVolume(event.currentTarget.volume);
+        } }}
         onPlaying={(event) => {
           setPlayError('');
-          startPlaybackRef.current = false;
           setPlayerPaused(false);
           setPlayerBuffering(false);
           if (mediaUrl && event.currentTarget.currentSrc === mediaUrl && event.currentTarget.readyState >= 2) {
@@ -3162,7 +3408,7 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
           if (playerOpenRef.current) setPlayError(errorCode === 3
             ? '当前浏览器无法解码该视频，请打开原视频' : '视频加载失败，请重新打开视频');
         }} />
-        {playerId && (!mediaUrl || renderedMediaUrl !== mediaUrl || playerBuffering) && previews[playerId]?.status !== 'error' && <div className="siteVideoLoading" role="status"><span aria-hidden="true" />正在加载</div>}
+        {playerId && !playerError && (!mediaUrl || renderedMediaUrl !== mediaUrl || playerBuffering) && previews[playerId]?.status !== 'error' && <div className="siteVideoLoading" role="status"><span aria-hidden="true" />正在加载</div>}
       </div>
       {playerId && <div className="siteVideoToolbar">
         <div className="siteVideoTimeline"><span>{formatDuration(Math.floor(playerTime.current)) || '0:00'}</span><input aria-label="播放进度" type="range" min="0" max={playerTime.duration || 1} step="0.1" value={Math.min(playerTime.current, playerTime.duration || 0)} disabled={!playerTime.duration} onChange={(event) => { if (mediaRef.current) mediaRef.current.currentTime = Number(event.target.value); }} /><span>{formatDuration(Math.floor(playerTime.duration)) || '0:00'}</span></div>
@@ -3173,7 +3419,7 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
           <button className="siteVideoFullscreen" type="button" onClick={enterFullscreen} aria-label="全屏" title="全屏"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="M9 4H4v5m11-5h5v5M4 15v5h5m11-5v5h-5" /></svg><span>全屏</span></button>
         </div>
       </div>}
-      {playError && <p role="status">{playError}</p>}
+      {playerError && <p role="status">{playerError}</p>}
       </div>
       {playerId && !inlineVideo && activeVideo && <VideoPlaybackDetails video={activeVideo} />}
       </div>
@@ -3183,40 +3429,17 @@ function VideoBrowser({ videos, feedTitle, feedNote, discoveryMode = false, csrf
   </div>;
 }
 
+function VideoInteractionMetrics({ video, className }: { video: Video; className?: string }) {
+  const metrics = [['点赞', video.likeCount], ['评论', video.commentCount], ['收藏', video.favoriteCount], ['分享', video.shareCount]] as const;
+  return <dl className={className} aria-label="视频互动数据">{metrics.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{formatMetric(value)}</dd></div>)}</dl>;
+}
+
 function VideoPlaybackDetails({ video }: { video: Video }) {
-  const author = video.authorName || '作者未记录';
-  const description = video.description.trim();
-  const duration = formatDuration(video.durationSeconds);
-  const metrics = [
-    ['点赞', video.likeCount, 'M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8L12 21l8.8-8.6a5.5 5.5 0 0 0 0-7.8Z'],
-    ['评论', video.commentCount, 'M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5Z'],
-    ['收藏', video.favoriteCount, 'm12 3 2.8 5.7 6.3.9-4.5 4.4 1 6.2-5.6-2.9-5.6 2.9 1-6.2L3 9.6l6.2-.9L12 3Z'],
-    ['分享', video.shareCount, 'M14 4 22 11l-8 7v-4C7 14 4 17 2 20c0-9 4-13 12-13V4Z'],
-  ] as const;
   return <aside className="siteVideoDetails" aria-label="当前播放视频详情">
-    <div className="siteVideoAuthor">
-      <span className="siteVideoAvatar" aria-hidden="true">{video.authorAvatarUrl
-        ? <img src={video.authorAvatarUrl} alt="" referrerPolicy="no-referrer" />
-        : author.slice(0, 1)}</span>
-      <div>{video.authorProfileUrl
-        ? <a className="siteVideoAuthorName" href={video.authorProfileUrl} target="_blank" rel="noreferrer">{author}</a>
-        : <strong className="siteVideoAuthorName">{author}</strong>}
-        <span className="siteVideoPublished">{video.publishedAt ? `发布于 ${formatPublishedTime(video.publishedAt)}` : '发布时间未知'}{duration && ` · ${duration}`}</span>
-      </div>
-    </div>
-    <div className="siteVideoCopy" tabIndex={0} aria-label="视频文案">
-      <h2>{video.title || description || '未命名视频'}</h2>
-      {description && video.title.trim() !== description && <p>{description}</p>}
-    </div>
     <section className="siteVideoStats" aria-label="当前播放视频互动数据">
-      <h3>互动数据</h3>
-      <dl>{metrics.map(([label, value, path]) => <div key={label}>
-        <dt><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={path} /></svg>{label}</dt>
-        <dd>{formatMetric(value)}</dd>
-      </div>)}</dl>
-      {video.lastSeenAt && <p className="siteVideoDataTime">最近采集：{formatPublishedTime(video.lastSeenAt)}</p>}
+      <VideoInteractionMetrics video={video} />
     </section>
-    <div className="siteVideoSource"><a href={video.url} target="_blank" rel="noreferrer">打开原视频 <span aria-hidden="true">↗</span></a></div>
+    <a className="siteVideoSourceLink" href={video.url} target="_blank" rel="noreferrer" aria-label="打开原视频">原视频 ↗</a>
   </aside>;
 }
 
@@ -3228,9 +3451,6 @@ function VideoPreview({ video, scope, jobs, onOpen, onAnalysis, onCancel, connec
   const busy = analysisStatus === 'queued' || analysisStatus === 'processing';
   const complete = savedSections(video);
   const reading = videoContentReading(video.analysis);
-  const latestRun = video.analysisRuns[0] || null;
-  const latestUsage = video.analysisUsage || latestRun?.usage || null;
-  const previousRuns = video.analysisRuns.slice(1);
   const metrics = [['点赞', video.likeCount], ['评论', video.commentCount], ['收藏', video.favoriteCount], ['分享', video.shareCount]] as const;
   const hasPreviewContent = reading.available || Boolean(video.transcript);
   const previewStatus = busy ? analysisProgress(video, latestJob)
@@ -3251,7 +3471,7 @@ function VideoPreview({ video, scope, jobs, onOpen, onAnalysis, onCancel, connec
         setLinkSection(next); document.getElementById(`link-tab-${next}`)?.focus();
       }}>{label}</button>)}</div>
       <div className="linkResultBody" id="link-result-panel" role="tabpanel" aria-labelledby={`link-tab-${linkSection}`}>
-        {linkSection === 'transcript' ? video.transcript ? <ReadingText>{video.transcript}</ReadingText> : <p className="readingEmpty">{video.transcriptStatus === 'ready' ? '未识别到清晰口播' : video.transcriptStatus === 'error' ? '口播识别未完成' : busy ? '等待口播结果' : '暂无口播稿'}</p>
+        {linkSection === 'transcript' ? video.transcript ? <ReadingText>{video.transcript}</ReadingText> : <p className="readingEmpty">{transcriptPendingText(video)}</p>
           : linkSection === 'content' ? reading.available ? <>
             {reading.overview && <section className="readingSummary"><h3>{reading.legacy ? '历史分析摘要' : '主要内容'}</h3><ReadingText>{reading.overview}</ReadingText></section>}
             {reading.sections.map((item) => <section className="readingSection" key={item.key}><h3>{item.label}</h3><ReadingText>{item.text}</ReadingText></section>)}
@@ -3276,6 +3496,15 @@ function VideoPreview({ video, scope, jobs, onOpen, onAnalysis, onCancel, connec
     {busy && !connectorConnected && <p className="rowTaskMessage">采集服务未连接</p>}
     {busy && connectorConnected && connectorBusy && analysisStatus === 'queued' && <p className="rowTaskMessage">等待主机空闲</p>}
     {analysisStatus === 'error' && latestJob?.status !== 'cancelled' && <p className="rowTaskMessage analysisError">{redactDiagnosticText(video.analysisDiagnostics?.lastError || latestJob?.error || video.analysisError || '任务未完成，详细原因尚未记录')}<button type="button" onClick={() => onOpen(video, 'content', scope)}>查看诊断</button></p>}
+    <VideoRecordDetails video={video} analysisStatus={analysisStatus} />
+  </article>;
+}
+
+function VideoRecordDetails({ video, analysisStatus }: { video: Video; analysisStatus: AnalysisStatus }) {
+  const latestRun = video.analysisRuns[0] || null;
+  const latestUsage = video.analysisUsage || latestRun?.usage || null;
+  const previousRuns = video.analysisRuns.slice(1);
+  return <>
     <details className="previewMetadata"><summary>采集信息</summary><p>首次采集：{formatTime(video.firstSeenAt)}<br />最近采集：{formatTime(video.lastSeenAt)}</p></details>
         {(video.analysis || latestRun || latestUsage) && <details className="analysisCosts">
           <summary><span>用量与费用</span><strong>{analysisUsageSummary(latestUsage, analysisStatus)}</strong></summary>
@@ -3284,15 +3513,15 @@ function VideoPreview({ video, scope, jobs, onOpen, onAnalysis, onCancel, connec
               <div className="analysisUsageHeader"><b>本次消耗</b>{latestRun?.updatedAt && <small>{formatTime(latestRun.updatedAt)}</small>}</div>
               <div className="analysisUsageGrid">
                 <span><small>视频模型请求</small><b>{analysisRequestCountLabel(latestUsage)}</b></span>
-                <span><small>模型</small><b>{latestUsage.requestedModel}</b></span>
+                <span><small>模型</small><b>{latestUsage.model}</b></span>
                 <span><small>输入 Token</small><b>{formatTokenCount(latestUsage.promptTokens)}</b></span>
                 <span><small>输出 Token</small><b>{formatTokenCount(latestUsage.completionTokens)}</b></span>
                 <span><small>视频模型总 Token</small><b>{formatTokenCount(latestUsage.totalTokens)}</b></span>
-                <span><small>{latestUsage.cloudAsr ? '视频分析估算' : '官方原价估算'}</small><b>{formatEstimatedCost(latestUsage.estimatedCostCny)}</b></span>
+                <span><small>{latestUsage.provider === 'CodeBuddy' ? '视频分析积分' : latestUsage.cloudAsr ? '视频分析估算' : '官方原价估算'}</small><b>{latestUsage.provider === 'CodeBuddy' ? formatAnalysisCost({ ...latestUsage, cloudAsr: null }) : formatEstimatedCost(latestUsage.estimatedCostCny)}</b></span>
                 {latestUsage.cloudAsr && <>
                   <span><small>云端口播时长</small><b>{formatCloudAudioSeconds(latestUsage.cloudAsr.audioSeconds)}</b></span>
                   <span><small>云端口播估算</small><b>{formatEstimatedCost(latestUsage.cloudAsr.estimatedCostCny)}</b></span>
-                  <span><small>含口播合计估算</small><b>{formatEstimatedCost(latestUsage.totalEstimatedCostCny)}</b></span>
+                  {latestUsage.provider !== 'CodeBuddy' && <span><small>含口播合计估算</small><b>{formatEstimatedCost(latestUsage.totalEstimatedCostCny)}</b></span>}
                 </>}
               </div>
               {latestUsage.requestIds.length > 0 && <p className="analysisRequestIds" title={latestUsage.requestIds.join('\n')}>请求 ID：{latestUsage.requestIds.join('、')}</p>}
@@ -3303,20 +3532,20 @@ function VideoPreview({ video, scope, jobs, onOpen, onAnalysis, onCancel, connec
                 ? '历史用量未记录。'
                 : '本次用量未记录。'}</p>}
             {!latestRun && video.analysis && !latestUsage && <p className="analysisUsageUnavailable">历史用量未记录。</p>}
-            {(video.analysis || latestRun || latestUsage) && <a className="analysisBillingLink" href="https://bailian.console.aliyun.com/?tab=costing-balance" target="_blank" rel="noreferrer">打开百炼模型用量核对实际账单 ↗</a>}
+            {(video.analysis || latestRun || latestUsage) && <a className="analysisBillingLink" href={latestUsage?.provider === 'CodeBuddy' ? 'https://www.codebuddy.cn/profile/plans-usage' : 'https://bailian.console.aliyun.com/?tab=costing-balance'} target="_blank" rel="noreferrer">查看{latestUsage?.provider === 'CodeBuddy' ? 'CodeBuddy' : '百炼'}用量 ↗</a>}
             {previousRuns.length > 0 && <section className="analysisRunHistory" aria-label="历史 AI 分析费用记录">
               <div className="analysisUsageHeader"><b>历次分析记录</b></div>
               <div className="analysisRunList">{previousRuns.map((run) => <div className="analysisRunItem" key={run.id}>
                 <span><b>{formatTime(run.createdAt || run.updatedAt)}</b><small>{analysisRunStatusLabel(run.status)}</small></span>
                 {run.usage
-                  ? <span><b>{formatEstimatedCost(run.usage.totalEstimatedCostCny)} · {formatTokenCount(run.usage.totalTokens)} Token{run.usage.cloudAsr ? '（含云端口播）' : ''}</b><small>输入 {formatTokenCount(run.usage.promptTokens)} / 输出 {formatTokenCount(run.usage.completionTokens)} Token{run.usage.cloudAsr ? ` · 云端口播 ${formatCloudAudioSeconds(run.usage.cloudAsr.audioSeconds)} / ${formatEstimatedCost(run.usage.cloudAsr.estimatedCostCny)}` : ''}</small></span>
+                  ? <span><b>{formatAnalysisCost(run.usage)} · {formatTokenCount(run.usage.totalTokens)} Token{run.usage.cloudAsr && run.usage.provider !== 'CodeBuddy' ? '（含云端口播）' : ''}</b><small>输入 {formatTokenCount(run.usage.promptTokens)} / 输出 {formatTokenCount(run.usage.completionTokens)} Token{run.usage.cloudAsr ? ` · 云端口播 ${formatCloudAudioSeconds(run.usage.cloudAsr.audioSeconds)} / ${formatEstimatedCost(run.usage.cloudAsr.estimatedCostCny)}` : ''}</small></span>
                   : <span><b>无用量记录</b></span>}
               </div>)}</div>
             </section>}
-            <p className="analysisUsageNote">费用为估算，以实际账单为准。</p>
+            <p className="analysisUsageNote">{latestUsage?.billingNote || '费用为估算，以实际账单为准。'}</p>
           </div>
         </details>}
-  </article>;
+  </>;
 }
 
 function closeOverlay(close: () => void) {
@@ -3386,21 +3615,20 @@ function downloadReading(text: string, filename: string) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-function VideoReader({ video, jobs, initialSection, index, total, onClose, onNavigate, onAnalysis, onCancel }: {
-  video: Video; jobs: HostJob[]; initialSection: ReadingSection; index: number; total: number;
+function VideoReader({ active, video, jobs, initialSection, index, total, onClose, onNavigate, onAnalysis, onTranscribe, onCancel }: {
+  active: boolean; video: Video; jobs: HostJob[]; initialSection: ReadingSection; index: number; total: number;
   onClose: () => void; onNavigate: (offset: number) => void;
   onAnalysis: (video: Video, regenerate?: boolean, forceRegenerate?: boolean) => void; onCancel: (job: HostJob) => void;
+  onTranscribe: (video: Video) => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const scroller = useRef<HTMLDivElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
   const timers = useRef<ReturnType<typeof setTimeout>[]>([]);
-  const contentTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const previousContent = useRef('');
   const [section, setSection] = useState<ReadingSection>(initialSection);
   const [fontSize, setFontSize] = useState<18 | 20 | 22>(20);
   const [closing, setClosing] = useState(false);
-  const [changing, setChanging] = useState(false);
-  const [direction, setDirection] = useState(1);
   const [copyMessage, setCopyMessage] = useState('');
   const latestJob = analysisJob(video, jobs);
   const analysisStatus = displayedAnalysisStatus(video, latestJob);
@@ -3415,12 +3643,13 @@ function VideoReader({ video, jobs, initialSection, index, total, onClose, onNav
   const tabLabels: Record<ReadingSection, string> = { transcript: '口播稿', content: '内容分析', production: '制作规范' };
   useEffect(() => {
     const element = dialog.current;
+    if (!active) { element?.close(); return; }
     const scheduledTimers = timers.current;
     const origin = document.activeElement as HTMLElement | null;
     const scrollY = window.scrollY;
     const overflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
-    element?.showModal(); closeButton.current?.focus({ preventScroll: true });
+    element?.show(); closeButton.current?.focus({ preventScroll: true });
     const keepFocus = (event: KeyboardEvent) => {
       if (event.key !== 'Tab' || !element) return;
       const controls = Array.from(element.querySelectorAll<HTMLElement>('button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'))
@@ -3438,32 +3667,40 @@ function VideoReader({ video, jobs, initialSection, index, total, onClose, onNav
       element?.close(); document.body.style.overflow = overflow;
       origin?.focus({ preventScroll: true }); window.scrollTo({ top: scrollY, behavior: 'instant' });
     };
-  }, []);
+  }, [active]);
+  useEffect(() => {
+    const key = `${video.id}:${section}`;
+    const changed = previousContent.current && previousContent.current !== key;
+    previousContent.current = key;
+    if (!changed || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    const animation = dialog.current?.querySelector('#reader-panel')?.animate([
+      { transform: 'translateY(4px)' },
+      { transform: 'none' },
+    ], { duration: 120, easing: 'cubic-bezier(.2,.8,.2,1)' });
+    return () => animation?.cancel();
+  }, [video.id, section]);
   const requestClose = () => {
     if (closing) return;
     setClosing(true);
-    timers.current.push(setTimeout(onClose, window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 230));
+    timers.current.push(setTimeout(onClose, window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 120));
   };
-  const changeContent = (update: () => void, nextDirection = 1) => {
-    if (contentTimer.current) clearTimeout(contentTimer.current);
-    setDirection(nextDirection); setChanging(true); setCopyMessage('');
-    contentTimer.current = setTimeout(() => {
-      update(); scroller.current?.scrollTo({ top: 0, behavior: 'instant' }); setChanging(false);
-      contentTimer.current = null;
-    }, window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 130);
-    timers.current.push(contentTimer.current);
+  const changeContent = (update: () => void) => {
+    setCopyMessage('');
+    update();
+    scroller.current?.scrollTo({ top: 0, behavior: 'instant' });
   };
   const copy = (text: string) => { void copyReadingText(text).then(() => setCopyMessage('已复制')).catch((error: Error) => setCopyMessage(error.message)); };
   const changeTab = (next: ReadingSection) => {
-    const ordered: ReadingSection[] = ['transcript', 'content', 'production'];
-    changeContent(() => setSection(next), ordered.indexOf(next) > ordered.indexOf(section) ? 1 : -1);
+    changeContent(() => setSection(next));
   };
-  return <dialog ref={dialog} className={`readingDialog ${closing ? 'isClosing' : ''}`} aria-labelledby="reader-title" onCancel={(event) => { event.preventDefault(); requestClose(); }} onClick={(event) => { if (event.target === event.currentTarget) requestClose(); }}>
-    <div className="readerCloseBar"><div className="readerNavigation"><button className="secondaryButton" type="button" aria-label="上一条" disabled={index <= 0} onClick={() => changeContent(() => onNavigate(-1), -1)}>←</button><span className="readerPosition">{index + 1} / {total}</span><button className="secondaryButton" type="button" aria-label="下一条" disabled={index >= total - 1} onClick={() => changeContent(() => onNavigate(1), 1)}>→</button></div><button ref={closeButton} type="button" className="readerClose" onClick={requestClose} aria-label="关闭阅读，返回列表">关闭 <span aria-hidden="true">×</span></button></div>
-    <div ref={scroller} className="readerScroll" style={{ '--reading-size': `${fontSize}px`, '--reading-direction': direction } as CSSProperties}>
-      <header className="readerHeader"><h2 id="reader-title">{video.title}</h2><div className="readerMetadata"><span>{formatPublishedTime(video.publishedAt)}</span><a href={video.url} target="_blank" rel="noreferrer">打开原视频 ↗</a>{complete.length > 0 && complete.length < 3 && <span>{complete.length}/3 个分区已生成</span>}</div>
+  return <dialog ref={dialog} className={`readingDialog ${closing ? 'isClosing' : ''}`} aria-labelledby="reader-title" onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); requestClose(); } }} onCancel={(event) => { event.preventDefault(); requestClose(); }} onClick={(event) => { if (event.target === event.currentTarget) requestClose(); }}>
+    <div className="readerCloseBar">
+      <header className="readerHeader"><h2 id="reader-title" title={video.title}>{video.title}</h2><div className="readerMetadata"><span>{formatPublishedTime(video.publishedAt)}</span><a href={video.url} target="_blank" rel="noreferrer">打开原视频 ↗</a></div>
       </header>
-      <div className="readerTabs" role="tablist" aria-label="分析结果分区">{(['transcript', 'content', 'production'] as const).map((key) => <button key={key} id={`reader-tab-${key}`} type="button" role="tab" aria-selected={section === key} aria-controls="reader-panel" tabIndex={section === key ? 0 : -1} onClick={() => { if (section !== key) changeTab(key); }} onKeyDown={(event) => {
+      <div className="readerNavigation"><button className="secondaryButton" type="button" aria-label="上一条" disabled={index <= 0} onClick={() => changeContent(() => onNavigate(-1))}>←</button><span className="readerPosition">{index + 1} / {total}</span><button className="secondaryButton" type="button" aria-label="下一条" disabled={index >= total - 1} onClick={() => changeContent(() => onNavigate(1))}>→</button></div><button ref={closeButton} type="button" className="readerClose" onClick={requestClose} aria-label="关闭阅读，返回列表">关闭 <span aria-hidden="true">×</span></button>
+    </div>
+    <div className="readerControls">
+      <div className="readerTabs" role="tablist" aria-label="分析结果分区">{(['transcript', 'content', 'production'] as const).map((key) => <button key={key} id={`reader-tab-${key}`} type="button" role="tab" aria-selected={section === key} aria-controls="reader-panel" tabIndex={section === key ? 0 : -1} onClick={() => changeTab(key)} onKeyDown={(event) => {
         const keys: ReadingSection[] = ['transcript', 'content', 'production'];
         const offset = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0;
         if (!offset && event.key !== 'Home' && event.key !== 'End') return;
@@ -3471,17 +3708,20 @@ function VideoReader({ video, jobs, initialSection, index, total, onClose, onNav
         changeTab(next); document.getElementById(`reader-tab-${next}`)?.focus();
       }}>{tabLabels[key]}</button>)}</div>
       <div className="readerToolbar"><label className="readingFontControl">字号<select value={fontSize} onChange={(event) => setFontSize(Number(event.target.value) as 18 | 20 | 22)}>{([18, 20, 22] as const).map((size) => <option key={size} value={size}>{size}</option>)}</select></label><div className="readerExport"><button className="secondaryButton" type="button" title={`复制${labels[section]}`} disabled={!sectionText} onClick={() => copy(sectionText)}>复制</button><button className="secondaryButton" type="button" title="下载 Markdown 文件" disabled={!sectionText} onClick={() => downloadReading(sectionText, `${section}-${video.id}.md`)}>下载</button></div>{copyMessage && <span role="status" className="readerCopyStatus">{copyMessage}</span>}</div>
+    </div>
+    <div ref={scroller} className="readerScroll" style={{ '--reading-size': `${fontSize}px` } as CSSProperties}>
       {busy && <div className="readerTask" role="status"><p>{analysisProgress(video, latestJob)}</p>{latestJob && <button type="button" className="secondaryButton" onClick={() => onCancel(latestJob)}>取消任务</button>}</div>}
       {latestJob?.status === 'cancelled' && <p className="readerTask">任务已取消</p>}
       {failed && <section className="readerFailure" aria-label="任务诊断"><h3>本次分析未完成</h3><p>失败阶段：{ANALYSIS_STAGE_LABELS[diagnostics.failedStage || ''] || diagnostics.failedStage || '尚未记录'}{Number.isFinite(diagnostics.attemptCount) ? ` · 实际尝试 ${diagnostics.attemptCount} 次` : ' · 尝试次数未记录'}</p><p>最后错误：{redactDiagnosticText(diagnostics.lastError || latestJob?.error || video.analysisError || '没有详细记录，根因尚未确定')}</p><p>已保存并保留：{complete.join('、') || '暂无已生成结果'}</p>{diagnostics.userAction && <p>{redactDiagnosticText(diagnostics.userAction)}</p>}<button type="button" className="secondaryButton" onClick={() => copy(formatAnalysisDiagnostics({ ...diagnostics, jobId: diagnostics.jobId || latestJob?.id, videoId: video.id, lastError: diagnostics.lastError || latestJob?.error || video.analysisError || '' }))}>复制诊断信息</button></section>}
-      <div id="reader-panel" key={`${video.id}:${section}`} role="tabpanel" aria-labelledby={`reader-tab-${section}`} className={`readerBody ${changing ? 'isChanging' : ''}`}>
-        {section === 'transcript' ? video.transcript ? <ReadingText>{video.transcript}</ReadingText> : <p className="readingEmpty">{video.transcriptStatus === 'ready' ? '未识别到清晰口播' : video.transcriptStatus === 'error' ? `口播识别未完成：${redactDiagnosticText(video.transcriptError || '具体原因未记录')}` : busy ? '等待口播结果' : '暂无口播稿'}</p> : section === 'content' ? reading.available ? <>
+      <div id="reader-panel" key={`${video.id}:${section}`} role="tabpanel" tabIndex={0} aria-labelledby={`reader-tab-${section}`} className="readerBody">
+        {section === 'transcript' ? video.transcript ? <ReadingText>{video.transcript}</ReadingText> : <><p className="readingEmpty">{transcriptPendingText(video)}</p>{['idle', 'error', 'paused'].includes(video.transcriptStatus) && <button type="button" className="secondaryButton" onClick={() => onTranscribe(video)}>{video.transcriptStatus === 'paused' ? '继续这条口播识别' : video.transcriptStatus === 'error' ? '重试口播识别' : '提取口播稿'}</button>}</> : section === 'content' ? reading.available ? <>
           {reading.overview && <section className="readingSummary"><h3>{reading.legacy ? '历史分析摘要' : '主要内容'}</h3><ReadingText>{reading.overview}</ReadingText></section>}
           {reading.sections.map((item) => <section className="readingSection" key={item.key}><h3>{item.label}</h3><ReadingText>{item.text}</ReadingText></section>)}
         </> : <><p className="readingEmpty">尚未分析</p>{video.description && video.description.trim() !== video.title.trim() && <section className="readingSection"><h3>原视频文案</h3><ReadingText>{video.description}</ReadingText></section>}</> : isRemotionPlan(video.analysis) ? <>{REMOTION_PLAN_SECTIONS.map(([key, label]) => <section className="readingSection" key={key}><h3>{label}</h3><ReadingText>{video.analysis?.[key] || ''}</ReadingText></section>)}</> : <p className="readingEmpty">暂无制作规范</p>}
         {!busy && complete.length < 3 && <div className="readerGenerate"><button className="primaryButton" type="button" onClick={() => onAnalysis({ ...video, analysisStatus }, Boolean(video.analysis) || analysisStatus === 'error')}>{complete.length ? '补全缺失分析' : '分析'}</button><span>可能产生云端费用</span></div>}
         {!busy && complete.length === 3 && <details className="readerMore"><summary>重新分析</summary><button type="button" className="secondaryButton" onClick={() => { if (window.confirm('重新分析会再次调用付费视频模型，已有口播稿直接复用。确定继续吗？')) onAnalysis({ ...video, analysisStatus }, true, true); }}>重新分析内容与制作规范（会产生费用）</button></details>}
       </div>
+      <div className="readerRecordDetails"><VideoRecordDetails video={video} analysisStatus={analysisStatus} /></div>
     </div>
   </dialog>;
 }

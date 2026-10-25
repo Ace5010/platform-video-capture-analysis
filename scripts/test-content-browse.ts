@@ -1,6 +1,17 @@
 import assert from 'node:assert/strict';
 
-import { browseContentVideos, collectionAccountScope } from '../lib/content-browse.ts';
+import { browseContentVideos, collectionAccountScope, contentSourceDescription } from '../lib/content-browse.ts';
+
+// The list description is source material, never a transcript or generated summary.
+const completed = { title: 'AI 视频教程', description: '', transcript: '已保存的口播正文', analysis: { summary: '模型分析摘要' } };
+assert.equal(contentSourceDescription(completed), '');
+assert.equal(contentSourceDescription({ title: 'AI 视频教程', description: ' 介绍环境安装与使用步骤。 ' }), '介绍环境安装与使用步骤。');
+for (const description of ['AI 视频教程', 'ＡＩ视频教程！ #AI #教程', 'AI 视频教程 #AI', '#AI #教程', '   ']) {
+  assert.equal(contentSourceDescription({ title: 'AI 视频教程', description }), '', description);
+}
+assert.equal(contentSourceDescription({ title: 'AI 视频教程', description: 'AI 视频教程。\n这里是额外的原视频说明。' }), '这里是额外的原视频说明。');
+assert.equal(contentSourceDescription({ title: 'AI 视频教程 #AI', description: 'AI视频教程：介绍环境安装，不修改软件设置。' }), '介绍环境安装，不修改软件设置。');
+assert.equal(contentSourceDescription({ title: 'AI 视频教程：完整标题 #AI', description: 'AI 视频教程' }), '');
 
 type FixtureVideo = {
   id: string;
@@ -103,6 +114,18 @@ assert.notEqual(all, videos, 'the displayed order is a separate array');
 assert.equal(all.find((item) => item.id === 'a4'), videos.find((item) => item.id === 'a4'));
 assert.deepEqual(browseContentVideos([], accounts, { accountId: '', scope: 'latest', result: 'all' }), []);
 assert.deepEqual(browseContentVideos(videos, [], { accountId: '', scope: 'all', result: 'all' }), []);
+
+// Compare instants rather than date strings; missing/invalid dates stay last.
+const mixedDates = Object.freeze([
+  video('unknown', 'account-a', null),
+  video('invalid', 'account-a', null, { publishedAt: 'unknown' }),
+  video('older-offset', 'account-a', null, { publishedAt: '2026-10-21T09:00:00+08:00' }),
+  video('newer-utc', 'account-b', null, { publishedAt: '2026-10-21T02:00:00Z' }),
+  video('same-instant', 'account-b', null, { publishedAt: '2026-10-21T10:00:00+08:00' }),
+]);
+assert.deepEqual(ids(browseContentVideos(mixedDates, accounts, {
+  accountId: '', scope: 'all', result: 'all',
+})), ['newer-utc', 'same-instant', 'older-offset', 'invalid', 'unknown']);
 
 assert.equal(collectionAccountScope('内容浏览', 'account-a', 'account-b'), 'account-a');
 assert.equal(collectionAccountScope('内容浏览', '', 'account-b'), '');

@@ -1,0 +1,179 @@
+.observeShell { --observe-header: 56px; }
+.observeShell [hidden] { display: none !important; }
+.observeGlobalBar { position: sticky; top: 0; z-index: 100; height: var(--observe-header); display: flex; align-items: center; gap: 30px; padding: 0 24px; background: var(--paper, #fff); border-bottom: 1px solid var(--line); }
+.observeBrand { font-size: 20px; letter-spacing: -.6px; }
+.observeGlobalBar nav { display: flex; height: 100%; gap: 12px; }
+.observeGlobalBar nav button { display: flex; align-items: center; gap: 8px; padding: 0 14px; border: 0; border-bottom: 3px solid transparent; border-radius: 0; background: transparent; color: var(--muted); font-size: 15px; }
+.observeGlobalBar nav button[aria-current] { color: var(--ink); border-bottom-color: var(--green); font-weight: 700; }
+.observeGlobalBar nav small { font-size: 12px; font-weight: 400; }
+.observeTaskDot { width: 7px; height: 7px; background: var(--green); border-radius: 50%; }
+.observeSettings { margin-left: auto; position: relative; font-size: 14px; }
+.observeSettings summary { cursor: pointer; padding: 10px 0; }
+.observeSettings > div { position: absolute; right: 0; top: 40px; width: 290px; padding: 16px; background: var(--paper,#fff); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 8px 24px #0002; }
+.observeContent .appShell { min-height: calc(100dvh - var(--observe-header)); grid-template-rows: 60px minmax(0,1fr); }
+.observeContent .sidebar { top: var(--observe-header); height: 60px; padding-block: 6px; }
+.observeContent .accountRail { top: 116px; height: calc(100dvh - 116px); }
+.observeContent .topbar { top: 116px; }
+.observeContent .readingDialog { z-index: 80; top: 56px; max-height: calc(100dvh - 88px); box-shadow: 0 20px 70px #0004, 0 0 0 100vmax #18292266; animation: none; }
+.observeContent .readingDialog.isClosing { animation: none; }
+.observeContent .modalBackdrop { top: 56px; }
+.moduleFunctionBar { display: flex; align-items: center; flex-shrink: 0; gap: 8px; height: 60px; padding: 8px 24px; border-bottom: 1px solid var(--line); background: var(--paper,#fff); }
+.moduleFunctionBar > button { border: 0; background: transparent; padding: 10px 16px; color: var(--muted); }
+.moduleFunctionBar > button[aria-current] { background: var(--selected-gradient); color: var(--ink); font-weight: 700; }
+.moduleFunctionBar > .wxRefresh { margin-left: auto; font-size: 14px; }
+.wxModule { height: calc(100dvh - var(--observe-header)); display: flex; flex-direction: column; min-height: 0; color: var(--ink); background: var(--paper,#fff); }
+.wxModule button { cursor: pointer; font: inherit; border: 1px solid var(--line); border-radius: 7px; padding: 7px 12px; background: var(--paper,#fff); color: inherit; transition: background-color 100ms; }
+.wxModule button:hover:not(:disabled) { background: var(--selected-gradient); }
+.wxModule button:active { transform: none; }
+.wxModule button:disabled { cursor: default; opacity: .5; }
+.wxModule select,.wxModule input { min-width: 0; border: 1px solid var(--line); border-radius: 6px; background: var(--paper,#fff); color: var(--ink); padding: 7px 9px; font: inherit; }
+.wxModule label { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.wxWorkspace { display: grid; grid-template-columns: 220px minmax(0,1fr); flex: 1; min-height: 0; }
+.wxGroups { border-right: 1px solid var(--line); background: var(--selected-gradient); padding: 22px 12px; overflow: auto; }
+.wxGroupOptions h2 { font-size: 15px; margin: 0 10px 16px; }
+.wxGroupOptions button { width: 100%; text-align: left; padding: 12px; background: transparent; }
+.wxGroupOptions button[aria-current] { background: var(--paper,#fff); }
+.wxGroupOptions strong { display: block; font-size: 15px; line-height: 1.6; overflow-wrap: anywhere; }
+.wxGroupOptions small { display: block; color: var(--muted); margin-top: 9px; line-height: 1.6; font-size: 13px; }
+.wxGroupToggle,.wxTopicToggle { display: none; }
+.wxMain { position: relative; display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden; }
+.wxMainContent { display: contents; }
+.wxHeading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px 18px; padding: 20px 28px 13px; }
+.wxHeading h1 { font-size: 22px; margin: 0; line-height: 1.4; }
+.wxHeading > span { color: var(--muted); font-size: 14px; }
+.wxReadingControls { display: flex; align-items: center; gap: 12px; padding: 0 28px 13px; flex-wrap: wrap; border-bottom: 1px solid var(--line); }
+.wxDateRange { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 14px; }
+.wxViewTabs { display: flex; gap: 4px; margin-right: auto; }
+.wxViewTabs button { border: 0; }
+.wxViewTabs [aria-pressed=true] { background: var(--selected-gradient); font-weight: 700; }
+.wxGenerate { font-size: 14px !important; }
+.wxJobStatus,.wxNotice { margin: 0; padding: 8px 28px; color: var(--muted); font-size: 13px; line-height: 1.5; background: color-mix(in srgb,var(--line) 20%,transparent); }
+.wxJobStatus button { margin-left: 16px; }
+.wxSummaryGrid { display: grid; grid-template-columns: 232px minmax(0,1fr); flex: 1; min-height: 0; }
+.wxTopics { min-height: 0; border-right: 1px solid var(--line); }
+.wxTopicOptions { height: 100%; overflow-y: auto; padding: 12px; overscroll-behavior: contain; scrollbar-width: thin; }
+.wxTopicOptions button { display: block; text-align: left; width: 100%; padding: 11px 12px; margin-bottom: 3px; border-color: transparent; line-height: 1.5; font-size: 14px; background: transparent; }
+.wxTopicOptions button[aria-current] { background: var(--selected-gradient); font-weight: 700; border-color: var(--line); }
+.wxTopicReading { overflow-y: auto; min-height: 0; padding: 26px 32px 40px; overscroll-behavior: contain; overflow-anchor: none; scrollbar-width: thin; }
+.wxTopicReading article { max-width: 880px; margin: auto; font-size: 16px; line-height: 1.9; overflow-wrap: anywhere; }
+.wxTopicReading h2 { margin: 0 0 14px; font-size: 25px; line-height: 1.5; }
+.wxTopicLead { margin: 0 0 24px; color: var(--muted); }
+.wxDiscussion { margin: 24px 0; }
+.wxDiscussion h3 { margin: 0 0 8px; font-size: 18px; }
+.wxDiscussion p { margin: 7px 0; }
+.wxPerson { display: inline; color: var(--green); font-size: .94em; font-weight: 600; white-space: normal; }
+.wxModule button.wxPerson { padding: 0; background: transparent; border: 0; text-align: left; color: var(--green); font-weight: 600; }
+.wxComparisons { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 18px; margin: 18px 0; padding: 16px 18px; background: var(--selected-gradient); border-radius: 8px; }
+.wxComparisons h4 { margin: 0; font-size: 15px; }
+.wxComparisons p { font-size: 15px; }
+.wxQuote { margin: 18px 0; padding: 12px 18px; border-left: 3px solid var(--line); background: color-mix(in srgb,var(--line) 13%,transparent); }
+.wxQuote figcaption { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; font-size: 13px; color: var(--muted); }
+.wxQuote blockquote { margin: 6px 0 0; font-size: 15px; }
+.wxProgress { border-top: 1px solid var(--line); padding-top: 18px; }
+.wxModule .wxTextButton { border: 0; color: var(--green); padding: 5px 0; background: transparent; font-size: 14px; }
+.wxTopicPaging { display: flex; justify-content: space-between; border-top: 1px solid var(--line); margin-top: 28px; padding-top: 16px; }
+.wxFilters { padding: 12px 28px; display: flex; flex-wrap: wrap; gap: 12px; border-bottom: 1px solid var(--line); }
+.wxFilters label { flex-direction: column; align-items: stretch; gap: 5px; }
+.wxFilters label:nth-last-child(2) { flex: 1; }
+.wxFilters select { max-width: 180px; }
+.wxFilters button { align-self: end; }
+.wxMessages,.wxSourcePane { overflow: auto; padding: 20px 32px 32px; min-height: 0; flex: 1; overscroll-behavior: contain; overflow-anchor: none; }
+.wxResultCount { color: var(--muted); font-size: 14px; margin: 0 0 20px; }
+.wxMessage { max-width: 900px; margin: 0 auto 22px; padding: 0 0 18px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.wxMessage header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.wxMessage time { color: var(--muted); font-size: 13px; }
+.wxMessage p { margin: 7px 0; white-space: pre-wrap; line-height: 1.8; font-size: 15px; }
+.wxMessageTarget { background: var(--selected-gradient); outline: 8px solid color-mix(in srgb,var(--green) 10%,transparent); border-radius: 4px; }
+.wxOverlay { position: absolute; inset: 0; z-index: 30; background: var(--paper,#fff); display: flex; flex-direction: column; }
+.wxOverlay > header { display: flex; gap: 20px; justify-content: space-between; align-items: center; padding: 16px 28px; border-bottom: 1px solid var(--line); }
+.wxOverlay h2 { font-size: 18px; margin: 0; }
+.wxOverlay > header button { flex-shrink: 0; }
+.wxConfirmBackdrop { position: absolute; inset: 0; z-index: 40; background: #17252666; display: grid; place-items: center; padding: 20px; }
+.wxConfirm { width: min(520px,100%); max-height: 100%; overflow: auto; padding: 26px; border-radius: 12px; background: var(--paper,#fff); box-shadow: 0 20px 60px #0003; line-height: 1.8; }
+.wxConfirm h2 { margin-top: 0; font-size: 21px; }
+.wxActions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 18px; }
+.wxManagement { overflow: auto; padding: 24px 32px; }
+.wxManagement h1 { margin: 0 0 22px; font-size: 24px; }
+.wxManagement h2 { font-size: 18px; }
+.wxManagement { width: 100%; }
+.wxReadAction { max-width: 720px; }
+.wxReadAction > p { color: var(--muted); line-height: 1.7; }
+.wxReadAction .wxReadStatus { color: var(--ink); }
+.wxReadAction .wxActions > button:first-child { background: var(--selected-gradient); font-weight: 700; }
+.wxReadOptions { margin-top: 22px; }
+.wxReadOptions summary,.wxHistory > summary { cursor: pointer; font-size: 15px; }
+.wxReadOptions label { margin-top: 12px; }
+.wxHistory { max-width: 900px; }
+.wxHistory > section:first-of-type { padding-top: 10px; }
+.wxManagement section { border-bottom: 1px solid var(--line); padding-bottom: 24px; margin-bottom: 24px; }
+.wxTask { display: flex; align-items: baseline; flex-wrap: wrap; gap: 12px 24px; padding: 12px 0; font-size: 14px; border-bottom: 1px solid var(--line); }
+.wxTask time { color: var(--muted); }
+.wxTask p { flex-basis: 100%; margin: 0; }
+.wxRecord { margin-top: 18px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 8px; font-size: 15px; }
+.wxRecord header { display: flex; flex-wrap: wrap; gap: 8px 20px; justify-content: space-between; }
+.wxRecord header span { color: var(--green); }
+.wxRecord dl { display: grid; grid-template-columns: 80px minmax(0,1fr); gap: 10px 18px; margin-bottom: 0; line-height: 1.6; }
+.wxRecord dt { color: var(--muted); }
+.wxRecord dd { margin: 0; overflow-wrap: anywhere; }
+.wxRecord p { margin: 14px 0 0; line-height: 1.7; }
+.wxEmpty,.wxLocalOnly { padding: 36px; line-height: 1.8; }
+.wxError { margin: 10px 20px; padding: 12px; color: #a33c35; background: #fff2ee; border-radius: 6px; }
+.wxError button { margin-left: 12px; }
+@media(max-width:1100px) {
+  .wxWorkspace { grid-template-columns: minmax(0,1fr); }
+  .wxGroups { position: relative; overflow: visible; padding: 8px 20px; border-right: 0; border-bottom: 1px solid var(--line); z-index: 35; }
+  .wxModule .wxGroupToggle { display: block; width: 100%; text-align: left; background: transparent; border: 0; }
+  .wxGroupOptions { display: none; position: absolute; top: 100%; left: 12px; width: min(360px,calc(100vw - 24px)); background: var(--paper,#fff); border: 1px solid var(--line); padding: 16px; box-shadow: 0 8px 24px #0002; border-radius: 8px; }
+  .wxGroups.isExpanded .wxGroupOptions { display: block; }
+  .wxHeading { display: none; }
+  .wxReadAction h1 { display: none; }
+  .wxReadingControls { padding-top: 12px; }
+  .wxWorkspace { grid-template-rows: auto minmax(0,1fr); }
+}
+@media(max-width:700px) {
+  .observeGlobalBar { padding: 0 12px; gap: 12px; }
+  .observeBrand { font-size: 17px; }
+  .observeGlobalBar nav { gap: 0; }
+  .observeGlobalBar nav button { padding: 0 9px; font-size: 14px; }
+  .observeGlobalBar nav small { display: none; }
+  .observeSettings { font-size: 12px; }
+  .observeSettings summary { list-style: none; }
+  .observeContent .sidebar { height: auto; min-height: 60px; }
+  .observeContent .appShell { display: block; }
+  .observeContent .accountRail { height: auto; top: auto; }
+  .observeContent .topbar { top: auto; }
+  .observeContent .readingDialog { top: 56px; width: calc(100% - 16px); max-height: calc(100dvh - 72px); }
+  .moduleFunctionBar { height: 52px; padding: 6px 12px; gap: 6px; }
+  .wxModule .moduleFunctionBar button { padding: 7px 8px; font-size: 13px; }
+  .wxModule .moduleFunctionBar .wxRefresh { font-size: 12px; }
+  .wxGroups { padding: 6px 10px; }
+  .wxReadingControls { padding: 10px 14px; gap: 8px; }
+  .wxViewTabs { flex-basis: 100%; }
+  .wxReadingControls button,.wxReadingControls label { font-size: 13px; }
+  .wxReadingControls select { padding: 5px; }
+  .wxJobStatus,.wxNotice { padding: 7px 16px; }
+  .wxSummaryGrid { grid-template-columns: minmax(0,1fr); grid-template-rows: 43px minmax(0,1fr); position: relative; }
+  .wxTopics { border: 0; border-bottom: 1px solid var(--line); }
+  .wxModule .wxTopicToggle { display: block; border: 0; border-radius: 0; width: 100%; text-align: left; padding: 10px 18px; }
+  .wxTopicOptions { display: none; position: absolute; top: 43px; left: 8px; right: 8px; height: auto; max-height: 70%; z-index: 20; background: var(--paper,#fff); border: 1px solid var(--line); box-shadow: 0 12px 30px #0002; border-radius: 8px; }
+  .wxTopicOptions.isOpen { display: block; }
+  .wxTopicReading { padding: 20px 18px 30px; }
+  .wxTopicReading h2 { font-size: 22px; }
+  .wxComparisons { grid-template-columns: 1fr; }
+  .wxFilters { padding: 10px 14px; max-height: 220px; overflow: auto; }
+  .wxFilters label { flex: 1; max-width: 100%; }
+  .wxFilters select { max-width: 150px; }
+  .wxMessages,.wxSourcePane { padding: 18px; }
+  .wxOverlay > header { padding: 14px 18px; gap: 10px; }
+  .wxOverlay h2 { font-size: 16px; }
+  .wxOverlay > header button { font-size: 13px; }
+  .wxManagement { padding: 20px; }
+}
+
+.observeContent .siteVideoPlayer.isOpen { max-height: calc(100dvh - 80px); }
+@media (min-width:1181px) and (min-height:521px) {
+  .observeContent .linkPlaybackWorkspace .siteVideoPlayer.isInline { top: 224px; }
+  .observeContent .siteVideoPlayer.isInline .siteVideoStage { max-height: min(60dvh, calc(100dvh - 330px), 580px); min-height: 180px; }
+}
+.wxGroups { background: color-mix(in srgb, var(--line) 22%, var(--paper,#fff)); }
+.wxComparisons { background: color-mix(in srgb, var(--line) 25%, var(--paper,#fff)); }

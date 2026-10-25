@@ -1,6 +1,28 @@
 export type ContentBrowseScope = 'all' | 'latest';
 export type ContentResultFilter = 'all' | 'available' | 'missing';
 
+/** The feed shows only the source description, with a repeated title omitted. */
+export function contentSourceDescription(video: { title: string; description: string }): string {
+  const description = video.description.trim();
+  const key = (text: string) => text.normalize('NFKC').toLowerCase()
+    .replace(/#[^\s#]+/gu, '')
+    .replace(/[\s\p{P}\p{S}]/gu, '');
+  const titleKey = key(video.title);
+  const descriptionKey = key(description);
+  if (!descriptionKey || (titleKey && titleKey.includes(descriptionKey))) return '';
+  if (!titleKey || !descriptionKey.startsWith(titleKey)) return description;
+
+  // Keep additional source text after its repeated opening title. Match using
+  // normalized text, but return the original wording without rewriting it.
+  let prefix = '';
+  for (const character of description) {
+    prefix += character;
+    if (key(prefix).length >= titleKey.length) break;
+  }
+  const remainder = description.slice(prefix.length).replace(/^[\s:：,，;；.!！?？、。—–\-|｜·]+/u, '').trim();
+  return key(remainder) ? remainder : '';
+}
+
 type BrowseVideo = {
   id: string;
   accountId: string;
@@ -11,6 +33,18 @@ type BrowseVideo = {
 };
 type BrowseAccount = { id: string; latestVideoIds?: string[] };
 
+/** Newest publications first; unknown dates never borrow a collection timestamp. */
+export function orderContentVideosNewestFirst<T extends { id: string; publishedAt: string | null }>(videos: readonly T[]): T[] {
+  const publishedTime = (video: T) => {
+    const time = Date.parse(video.publishedAt || '');
+    return Number.isFinite(time) ? time : -Infinity;
+  };
+  return [...videos].sort((left, right) => {
+    const leftTime = publishedTime(left), rightTime = publishedTime(right);
+    return leftTime === rightTime ? left.id.localeCompare(right.id) : leftTime > rightTime ? -1 : 1;
+  });
+}
+
 /** Content browsing only reads saved results; it never creates collection or analysis tasks. */
 export function browseContentVideos<T extends BrowseVideo>(
   videos: readonly T[],
@@ -20,7 +54,7 @@ export function browseContentVideos<T extends BrowseVideo>(
   // A monitored video may also have a link-analysis entry. Its real account
   // ownership keeps it in this feed; standalone link records have a hidden account.
   const saved = videos.filter((video) => accounts.some((account) => account.id === video.accountId));
-  const ordered = [...saved].sort((a, b) => (b.publishedAt || '').localeCompare(a.publishedAt || '') || a.id.localeCompare(b.id));
+  const ordered = orderContentVideosNewestFirst(saved);
   const latestIds = new Map(accounts.map((account) => [account.id, new Set(
     account.latestVideoIds?.length ? account.latestVideoIds.slice(0, 5)
       : ordered.filter((video) => video.accountId === account.id).slice(0, 5).map((video) => video.id),

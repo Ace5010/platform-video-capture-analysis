@@ -53,6 +53,18 @@ assert.equal(requests.at(-1)?.headers.get('Content-Length'), '2');
 assert.equal(await requests.at(-1)?.text(), '{}');
 assert.equal(requests.at(-1)?.headers.get('X-CSRF-Token'), 'c'.repeat(64));
 
+const clearBody = JSON.stringify({ videoIds: ['7530000000000000001', '7530000000000000002'] });
+assert.equal((await proxyHostRequest(request('/api/discoveries/clear', {
+  ...post({ 'X-CSRF-Token': 'c'.repeat(64) }), body: clearBody,
+}), env)).status, 200);
+assert.equal(requests.at(-1)?.url, 'http://127.0.0.1:43130/api/discoveries/clear');
+assert.equal(requests.at(-1)?.headers.get('X-CSRF-Token'), 'c'.repeat(64));
+assert.equal(await requests.at(-1)?.text(), clearBody);
+const clearRequestCount = requests.length;
+assert.equal((await proxyHostRequest(request('/api/discoveries/clear'), env)).status, 403);
+assert.equal((await proxyHostRequest(request('/api/discoveries/clear', post({ Origin: 'https://evil.example' })), env)).status, 403);
+assert.equal(requests.length, clearRequestCount, 'invalid clear requests must not reach the host');
+
 const count = requests.length;
 respond = async () => { throw new Error(`transport error with secret ${token}`); };
 const failed = await proxyHostRequest(request('/api/jobs', post()), env);
@@ -69,4 +81,38 @@ respond = async () => new Response('tunnel error', { status: 502 });
 const offline = await proxyHostRequest(request('/api/state'), env);
 assert.equal(offline.status, 503);
 assert.equal((await offline.json() as { upstreamStatus: number }).upstreamStatus, 502);
-console.log('HTTPS 主机网关检查通过：来源、白名单、Cookie、凭据隔离、请求限制与失败不重发。');
+respond = async () => new Response(new Uint8Array([1, 2, 3, 4]), { status: 206, headers: {
+  'Content-Type': 'video/mp4', 'Content-Length': '4', 'Content-Range': 'bytes 4-7/100',
+  'Accept-Ranges': 'bytes', 'X-Secret': token,
+} });
+const previewMediaPath = '/api/previews/1234567890123456789/0123456789abcdef0123456789abcdef/media';
+const media = await proxyHostRequest(request(previewMediaPath, { headers: {
+  Range: 'bytes=4-7', Cookie: `douyin_monitor_session=${'s'.repeat(43)}`,
+} }), env);
+assert.equal(media.status, 206);
+assert.equal(media.headers.get('Content-Range'), 'bytes 4-7/100');
+assert.equal(media.headers.get('X-Secret'), null);
+assert.equal(requests.at(-1)?.headers.get('Range'), 'bytes=4-7');
+assert.deepEqual([...new Uint8Array(await media.arrayBuffer())], [1, 2, 3, 4]);
+assert.equal((await proxyHostRequest(request(previewMediaPath, { headers: { Range: 'bytes=1-2,4-5' } }), env)).status, 416);
+assert.equal((await proxyHostRequest(request('/api/previews/invalid/0123456789abcdef0123456789abcdef/media'), env)).status, 403);
+assert.equal((await proxyHostRequest(request('/api/previews/1234567890123456789/ZZZZ/media'), env)).status, 403);
+assert.equal((await proxyHostRequest(request('/api/media/1234567890123456789', { headers: { Range: 'bytes=4-7' } }), env)).status, 403,
+  'the retired local-file media route must no longer be reachable');
+// A status read must never forward the Range header, while a prepare POST is a
+// normal bounded JSON request.
+respond = async () => Response.json({ ok: true, sources: [] });
+const prepared = await proxyHostRequest(request('/api/previews/prepare', post({ 'X-CSRF-Token': 'c'.repeat(64) })), env);
+assert.equal(prepared.status, 200);
+assert.equal(requests.at(-1)?.url, 'http://127.0.0.1:43130/api/previews/prepare');
+respond = async () => Response.json({ ok: true, status: 'ready', generation: '0123456789abcdef0123456789abcdef' });
+const previewStatus = await proxyHostRequest(request('/api/previews/1234567890123456789/status'), env);
+assert.equal(previewStatus.status, 200);
+assert.equal(requests.at(-1)?.url, 'http://127.0.0.1:43130/api/previews/1234567890123456789/status');
+assert.equal(requests.at(-1)?.headers.get('Range'), null, 'a status read must not carry a media range');
+respond = async () => new Response(null, { status: 200, headers: {
+  'Content-Type': 'video/mp4', 'Content-Length': '100', 'Accept-Ranges': 'bytes',
+} });
+assert.equal((await proxyHostRequest(request(previewMediaPath, { method: 'HEAD' }), env)).status, 200);
+assert.equal((await proxyHostRequest(request('/api/previews/1234567890123456789/status', { method: 'HEAD' }), env)).status, 403);
+console.log('HTTPS 主机网关检查通过：来源、白名单、Cookie、凭据隔离、请求限制、按需播放路由与失败不重发。');

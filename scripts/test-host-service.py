@@ -635,6 +635,18 @@ def run() -> None:
             require(status == 200 and payload.get("setupRequired") is True, "first-run status is wrong")
             require(payload.get("setupAllowed") is True, "localhost must be allowed to set the first password")
 
+            # A stopped VPN can leave DNS unavailable. Both origin validation
+            # and CORS must work without resolving localhost or numeric IPs.
+            with patch("host_service.server.socket.getfqdn", side_effect=AssertionError("unexpected DNS lookup")):
+                for origin in (LOCAL_ORIGIN, "http://127.0.0.1:3000", "http://[::1]:3000", REMOTE_ORIGIN):
+                    status, payload, headers = client.request("GET", "/api/auth/status", origin=origin, use_cookie=False)
+                    require(status == 200 and payload.get("setupRequired") is True, f"DNS-free auth failed: {origin}")
+                    require(("Access-Control-Allow-Origin", origin) in headers, f"DNS-free CORS failed: {origin}")
+                for origin in ("http://8.8.8.8:3000", "http://localhost:3001", "http://localhost:3000@8.8.8.8:3000"):
+                    status, _, headers = client.request("GET", "/api/auth/status", origin=origin, use_cookie=False)
+                    require(status == 403, f"untrusted origin accepted: {origin}")
+                    require(not any(name.lower() == "access-control-allow-origin" for name, _ in headers), "rejected origin received CORS access")
+
             status, payload, _ = client.request(
                 "POST",
                 "/api/auth/setup",
@@ -667,6 +679,13 @@ def run() -> None:
             }
             status, _, _ = client.request("POST", "/api/accounts/upsert", {"account": account})
             require(status == 200, "account upsert failed")
+            status, repeated, _ = client.request("POST", "/api/accounts/upsert", {"account": {
+                **account, "id": "duplicate-account-a", "name": "待识别账号", "url": account["url"] + "?nt=2#works",
+            }})
+            require(status == 200 and repeated.get("reused") is True, "duplicate profile add must be reported as reused")
+            require(repeated["account"]["id"] == "account-a" and repeated["account"]["name"] == account["name"],
+                    "duplicate add must return the saved identity and preserve the established name")
+            require(len(server.database.state()["accounts"]) == 1, "query variants must not create another account")
 
             status, pair, _ = client.request(
                 "POST",
@@ -973,6 +992,25 @@ def run() -> None:
             )
             require(status == 428, "analysis must be rejected before Qwen configuration")
 
+            status, before_clear, _ = client.request("GET", "/api/state")
+            clear_ids = [item["videoId"] for item in before_clear["discoveries"]]
+            require(bool(clear_ids), "clear API fixture must contain discoveries")
+            status, _, _ = client.request("POST", "/api/discoveries/clear", {"videoIds": clear_ids}, use_cookie=False)
+            require(status == 401, "clearing discoveries must require a password session")
+            status, _, _ = client.request("POST", "/api/discoveries/clear", {"videoIds": clear_ids}, csrf="invalid")
+            require(status == 403, "clearing discoveries must require valid CSRF")
+            status, _, _ = client.request("POST", "/api/discoveries/clear", {"videoIds": "all"})
+            require(status == 400, "clear API must validate the requested video list")
+            status, cleared, _ = client.request("POST", "/api/discoveries/clear", {"videoIds": clear_ids}, origin=REMOTE_ORIGIN)
+            require(status == 200 and cleared.get("clearedCount") == len(clear_ids),
+                    "authenticated LAN clear must dismiss every displayed notification")
+            status, after_clear, _ = client.request("GET", "/api/state")
+            require(after_clear["discoveries"] == [], "cleared discoveries must leave /api/state")
+            require(after_clear["videos"] == before_clear["videos"] and after_clear["snapshots"] == before_clear["snapshots"],
+                    "clear API must preserve saved works, transcripts, analysis and snapshots")
+            status, repeated, _ = client.request("POST", "/api/discoveries/clear", {"videoIds": clear_ids})
+            require(status == 200 and repeated.get("clearedCount") == 0, "repeated clear API must be harmless")
+
             status, _, _ = client.request(
                 "POST",
                 "/api/qwen/config",
@@ -1274,7 +1312,7 @@ def run() -> None:
 
             status, final_state, _ = client.request("GET", "/api/state", origin=REMOTE_ORIGIN)
             require(status == 200, "LAN state read failed")
-            final_video = final_state["videos"][0]
+            final_video = next(item for item in final_state["videos"] if item["id"] == video["id"])
             require(final_video.get("transcriptStatus") == "ready", "transcript was not persisted")
             require(final_video.get("transcript", "").endswith("。"), "transcript punctuation was not persisted")
             require(final_video.get("analysisStatus") == "ready", "analysis was not permanently persisted")
@@ -1365,7 +1403,7 @@ def run() -> None:
             server.database.save_analysis_failure(retry_job_id, "模拟第二次请求超时", usage=retry_usage)
             status, retry_state, _ = client.request("GET", "/api/state", origin=REMOTE_ORIGIN)
             require(status == 200, "retry state read failed")
-            retry_video = retry_state["videos"][0]
+            retry_video = next(item for item in retry_state["videos"] if item["id"] == video["id"])
             retry_runs = retry_video.get("analysisRuns", [])
             require(len(retry_runs) == 2, "analysis attempts were not retained independently")
             require(retry_runs[0].get("jobId") == retry_job_id and retry_runs[0].get("status") == "failed", "latest failed receipt is wrong")
@@ -1387,6 +1425,19 @@ def run() -> None:
             preserved_link_video = reopened_database.get_video(video["id"])
             require(preserved_link_video is not None and len(preserved_link_video.get("analysisRuns", [])) == 2, "link analysis receipts were deleted with monitored account")
             require(not any(config.temp_dir.iterdir()), "analysis temporary media was not deleted")
+
+            # More than 600 works must remain reachable through the normal read.
+            history = [{**video, "id": f"754000000000000{index:04d}",
+                        "url": f"https://www.douyin.com/video/754000000000000{index:04d}",
+                        "accountId": "history-account"} for index in range(605)]
+            server.database.migrate({"accounts": [{**account, "id": "history-account"}], "videos": history})
+            status, complete_state, _ = client.request("GET", "/api/state", origin=REMOTE_ORIGIN)
+            require(status == 200 and len(complete_state["videos"]) == 605,
+                    "normal workspace read silently truncated account history")
+            require(len(complete_state["linkVideos"]) == 1, "history window hid the link analysis")
+            status, limited_state, _ = client.request("GET", "/api/state?videos=10", origin=REMOTE_ORIGIN)
+            require(status == 200 and len(limited_state["videos"]) + len(limited_state["linkVideos"]) == 10,
+                    "explicit limited workspace read was not bounded")
 
             print(
                 "Host validation passed: localhost-only setup/key entry, password session and CSRF, "

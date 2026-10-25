@@ -20,6 +20,12 @@ const SCRIPT_EXECUTION_TIMEOUT_MS = 60_000;
 const ACCOUNT_DOM_WAIT_MS = 25_000;
 const DETAIL_DOM_WAIT_MS = 15_000;
 const MEDIA_CAPTURE_WAIT_MS = 22_000;
+// The detail player only attaches its media element after its own hydration
+// delay, which is observed to take several seconds; preview address resolution
+// waits for real playback within this bound and reports failure honestly.
+const PREVIEW_PLAYBACK_WAIT_MS = 18_000;
+// How many ranked candidates one preview may verify before giving up.
+const PREVIEW_CANDIDATE_LIMIT = 8;
 const TRANSCRIBE_TIMEOUT_MS = 180_000;
 const INITIAL_HISTORY_VIDEOS = 30;
 const LATEST_CHECK_VIDEOS = 5;
@@ -1037,6 +1043,7 @@ async function collectAccount(account, mode, onProgress) {
   try {
     await waitForTab(tab.id);
     const readiness = await executeInTab(tab.id, waitForAccountVideoDom, [ACCOUNT_DOM_WAIT_MS, targetCount]);
+    if (readiness?.blockingReason) throw new Error(readiness.blockingReason);
     if (!readiness?.ready) {
       const pageLabel = readiness?.title ? `（${readiness.title}）` : '';
       throw new Error(`等待约 25 秒后仍未发现真实 /video/ 作品节点${pageLabel}，可能遇到登录、验证码、风控或页面结构变化`);
@@ -1105,11 +1112,19 @@ async function collectAccount(account, mode, onProgress) {
       await onProgress({ stage: 'video-detail', completed: index + 1, total });
     }
 
+    const transcriptionMedia = {};
+    for (const video of enrichedVideos) {
+      const media = video._transcriptionMedia
+        || await collectTranscriptionSource(tab.id, video.id, account.id);
+      delete video._transcriptionMedia;
+      if (media) transcriptionMedia[video.id] = media;
+    }
     return {
       accountName: accountPage.accountName || account.name || '抖音账号',
       accountAvatarUrl: accountPage.accountAvatarUrl || account.avatarUrl || null,
       ...(accountPage.accountFollowers ? { accountFollowers: accountPage.accountFollowers } : {}),
       videos: enrichedVideos,
+      transcriptionMedia,
       discoveredVideoIds: accountPage.videos.map((video) => String(video.id)),
     };
   } finally {
@@ -1117,11 +1132,24 @@ async function collectAccount(account, mode, onProgress) {
   }
 }
 
+async function collectTranscriptionSource(tabId, videoId, accountId) {
+  try {
+    const sources = await executeInTab(tabId, extractVerifiedVideoMediaSources, [videoId, [], true], 'MAIN');
+    const audio = sources?.audioCandidates?.[0];
+    const video = audio ? null : selectPreviewVideoCandidate(new Map((sources?.videoCandidates || [])
+      .map(candidate => [candidate.url, { url: candidate.url, metadata: { ...candidate, targetBound: true } }])));
+    if (!audio && !video) return null;
+    return { videoId, accountId, origin: 'collection',
+      audio: audio ? { url: audio.url, metadata: { ...audio, targetBound: true } } : null,
+      video, page: { observedVideoId: videoId } };
+  } catch { return null; } // Missing source data must not fail public metadata collection.
+}
+
 async function collectVideoWithRetries(video, accountId) {
   let result = { ...video, accountId };
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      const details = await collectVideoDetails(video.url, attempt > 0);
+      const details = await collectVideoDetails(video.url, attempt > 0, accountId);
       result = mergeVideoDetails(result, details, accountId);
       if (hasCompletePublicData(result)) return result;
     } catch (error) {
@@ -1140,7 +1168,7 @@ function missingPublicFields(video) {
     .map(([, label]) => label);
 }
 
-async function collectVideoDetails(videoUrl, active = false) {
+async function collectVideoDetails(videoUrl, active = false, accountId = null) {
   const tab = await chrome.tabs.create({ url: videoUrl, active });
   if (!tab.id) throw new Error('无法创建视频详情标签页');
 
@@ -1174,7 +1202,7 @@ async function collectVideoDetails(videoUrl, active = false) {
         'ISOLATED', 30_000, (value) => hasCompletePublicData({ ...value, title: value?.description }));
       if (!details) throw new Error('目标视频校验失败，已停止写入');
     }
-    return details;
+    return { ...details, _transcriptionMedia: await collectTranscriptionSource(tab.id, expectedVideoId, accountId) };
   } finally {
     await chrome.tabs.remove(tab.id).catch(() => {});
   }
@@ -1184,6 +1212,7 @@ function mergeVideoDetails(video, details, accountId) {
   const description = details.description || video.description || '';
   return {
     ...video,
+    _transcriptionMedia: details._transcriptionMedia || video._transcriptionMedia,
     accountId,
     title: video.title || description,
     description,
@@ -1383,7 +1412,7 @@ function scoreMediaCandidate(urlValue, requestType, contentTypeValue) {
   return 0;
 }
 
-function extractVerifiedVideoMediaSources(expectedVideoId, receivedMediaRoots = []) {
+function extractVerifiedVideoMediaSources(expectedVideoId, receivedMediaRoots = [], fullAudioOnly = false) {
   const targetId = String(expectedVideoId || '');
   const videoCandidates = new Map();
   const audioCandidates = new Map();
@@ -1444,6 +1473,7 @@ function extractVerifiedVideoMediaSources(expectedVideoId, receivedMediaRoots = 
       contentLength: numberOrNull(value.data_size, value.dataSize, value.file_size, value.fileSize, inherited.contentLength),
       quality: scalarText(value.gear_name, value.gearName, value.quality_type, value.qualityType, value.quality, inherited.quality),
       codec: scalarText(value.codec_type, value.codecType, value.codec, inherited.codec) || null,
+      containerFormat: scalarText(value.format, value.containerFormat, inherited.containerFormat) || null,
     };
   };
   const addCandidate = (kind, rawUrl, metadata) => {
@@ -1504,13 +1534,16 @@ function extractVerifiedVideoMediaSources(expectedVideoId, receivedMediaRoots = 
       if (belongsToOtherVideo(value)) continue;
       const metadata = metadataFrom(value, current.metadata);
       const path = current.path.toLowerCase();
+      // A work's music resource can be background music without its voiceover.
+      // The automatic transcript accepts only a video audio track, or muxed video.
+      if (fullAudioOnly && /(?:^|\.)(?:music|sound)(?:\.|$)/.test(path)) continue;
       const mime = scalarText(value.mime_type, value.mimeType, value.format).toLowerCase();
       const imagePath = /(?:cover|avatar|poster|thumb|image|logo|sticker)/.test(path);
       const audioPath = /(?:^|\.)(?:audio|music|sound)(?:\.|$)/.test(path) || mime.startsWith('audio/');
       const videoPath = /(?:^|\.)(?:video|bit_rate|bitrate)(?:\.|$)/.test(path) || mime.startsWith('video/');
       const addressPath = /(?:play_addr|playaddr|play_url|playurl|download_addr|downloadaddr|url_list|urllist|\.urls?$|\.src$)/.test(path);
       if (!imagePath && (addressPath || mime.startsWith('video/') || mime.startsWith('audio/'))) {
-        const kind = audioPath && !videoPath ? 'audio' : 'video';
+        const kind = audioPath && (!videoPath || fullAudioOnly) ? 'audio' : 'video';
         for (const url of urlsFrom(value)) addCandidate(kind, url, metadata);
       }
       for (const [key, child] of Object.entries(value)) {
@@ -1519,8 +1552,9 @@ function extractVerifiedVideoMediaSources(expectedVideoId, receivedMediaRoots = 
           const lowered = childPath.toLowerCase();
           if (!/(?:cover|avatar|poster|thumb|image|logo|sticker)/.test(lowered)
             && /(?:play_addr|playaddr|play_url|playurl|download_addr|downloadaddr|url_list|urllist|\.url$|\.src$)/.test(lowered)) {
+            if (fullAudioOnly && /(?:^|\.)(?:music|sound)(?:\.|$)/.test(lowered)) continue;
             const kind = /(?:^|\.)(?:audio|music|sound)(?:\.|$)/.test(lowered)
-              && !/(?:^|\.)(?:video|bit_rate|bitrate)(?:\.|$)/.test(lowered)
+              && (fullAudioOnly || !/(?:^|\.)(?:video|bit_rate|bitrate)(?:\.|$)/.test(lowered))
               ? 'audio'
               : 'video';
             addCandidate(kind, child, metadata);
@@ -1574,7 +1608,7 @@ function extractVerifiedVideoMediaSources(expectedVideoId, receivedMediaRoots = 
   };
 
   const roots = Array.isArray(receivedMediaRoots) ? receivedMediaRoots.slice(0, 4) : [];
-  for (const key of ['_ROUTER_DATA', '__INITIAL_STATE__', '__SSR_DATA__', '__NEXT_DATA__', '__NUXT__', 'RENDER_DATA']) {
+  for (const key of ['_ROUTER_DATA', '__INITIAL_STATE__', '__SSR_DATA__', '__NEXT_DATA__', '__NUXT__', 'RENDER_DATA', '__DOUYIN_MONITOR_PUBLIC_POSTS_V3__']) {
     try {
       const value = window[key];
       if (value && typeof value === 'object') roots.push(value);
@@ -1750,34 +1784,64 @@ function fullMediaCandidate(
 // Preview playback wants the smallest usable encoding the platform already
 // publishes, not a locally re-compressed copy. Short edge is used as the
 // resolution measure so vertical works are not judged by pixel height alone.
-const PREVIEW_TARGET_SHORT_EDGE = 480;
 const PREVIEW_SHORT_EDGE_RANGE = [360, 540];
 const PREVIEW_FALLBACK_SHORT_EDGE = 720;
 
+function previewCandidateMetadata(candidate) {
+  // A candidate from a media capture carries its measurements under
+  // ``metadata``; the structured extractor returns them flat on the object.
+  // Both shapes are accepted so the chooser never depends on the caller.
+  const metadata = candidate?.metadata;
+  if (metadata && typeof metadata === 'object') return metadata;
+  return {
+    width: candidate?.width, height: candidate?.height, bitrate: candidate?.bitrate,
+    contentLength: candidate?.contentLength, codec: candidate?.codec,
+    contentType: candidate?.contentType, targetBound: candidate?.targetBound,
+    containerFormat: candidate?.containerFormat,
+  };
+}
+
 function previewPlaybackCodecScore(candidate) {
-  const value = String(candidate.metadata?.codec || candidate.metadata?.contentType || '').toLowerCase();
-  return /h264|avc/.test(value) ? 3 : /av1|vp9/.test(value) ? 2 : /hevc|h265/.test(value) ? 0 : 1;
+  const metadata = previewCandidateMetadata(candidate);
+  const value = String(metadata.codec || metadata.contentType || '').toLowerCase();
+  return /h264|avc/.test(value) ? 3 : /av1|vp9|hevc|h265/.test(value) ? 2 : 1;
 }
 
 function previewByteSize(candidate) {
-  const metadata = candidate.metadata || {};
+  const metadata = previewCandidateMetadata(candidate);
   const pixels = metadata.width > 0 && metadata.height > 0 ? metadata.width * metadata.height : 0;
-  const seconds = metadata.contentLength && metadata.bitrate ? metadata.contentLength / (metadata.bitrate / 8) : 0;
   // Prefer a smaller measured payload, then a lower bitrate. Resolution labels
   // alone never prove a smaller transfer.
   return metadata.contentLength || metadata.bitrate || pixels || 0;
 }
 
 function selectPreviewVideoCandidate(videoCandidates) {
-  const values = [...videoCandidates.values()].filter((candidate) => candidate.metadata.targetBound === true);
+  const values = [...videoCandidates.values()]
+    .filter((candidate) => previewCandidateMetadata(candidate).targetBound === true);
   if (!values.length) return null;
-  const measured = values.filter(({ metadata }) => metadata.width > 0 && metadata.height > 0);
+  // Codec names alone do not establish browser support; real track decoding
+  // happens in the viewer. Keep platform HEVC variants in the low-size pool.
+  const playable = values.filter((candidate) => previewPlaybackCodecScore(candidate) > 0);
+  const available = playable.length ? playable : values;
+  // The platform's DASH video renditions have a separate audio stream. Prefer
+  // its existing combined addresses before spending startup time rejecting
+  // several silent variants. Unknown labels still undergo real track checks;
+  // keep DASH candidates available if no combined address succeeds.
+  const combined = available.filter(candidate => String(previewCandidateMetadata(candidate).containerFormat || '').toLowerCase() !== 'dash');
+  const pool = combined.length ? combined : available;
+  const measured = pool.filter((candidate) => {
+    const metadata = previewCandidateMetadata(candidate);
+    return metadata.width > 0 && metadata.height > 0;
+  });
   const select = (candidates) => [...candidates].sort((left, right) => {
     const size = previewByteSize(left) - previewByteSize(right);
     const codec = previewPlaybackCodecScore(right) - previewPlaybackCodecScore(left);
-    return size || codec || left.url.length - right.url.length;
+    return size || codec || String(left.url).length - String(right.url).length;
   })[0];
-  const shortEdge = ({ metadata }) => Math.min(metadata.width, metadata.height);
+  const shortEdge = (candidate) => {
+    const metadata = previewCandidateMetadata(candidate);
+    return Math.min(metadata.width, metadata.height);
+  };
   if (measured.length) {
     const preferred = measured.filter((candidate) => {
       const edge = shortEdge(candidate);
@@ -1800,7 +1864,38 @@ function selectPreviewVideoCandidate(videoCandidates) {
   // Without measurements the platform only publishes one candidate, or the
   // detail response omitted sizes. Report that limit instead of pretending a
   // specific resolution was obtained.
-  return select(values);
+  return select(pool);
+}
+
+function rankPreviewVideoCandidates(candidates) {
+  const remaining = new Map(candidates.map(candidate => [candidate.url, candidate]));
+  const ordered = [];
+  // A failed low-size source must advance to the next low-size source, rather
+  // than the original high-resolution address at the head of the API response.
+  while (remaining.size) {
+    const selected = selectPreviewVideoCandidate(remaining);
+    if (!selected) break;
+    ordered.push(selected);
+    remaining.delete(selected.url);
+  }
+  // CDNs often repeat the same published encoding at several addresses. Try
+  // distinct measured encodings before their mirror addresses, while keeping
+  // mirrors available if the first address fails. Tracks are still verified
+  // from each chosen address; identical labels alone never establish audio.
+  const seen = new Set();
+  const distinct = [];
+  const mirrors = [];
+  for (const candidate of ordered) {
+    const metadata = previewCandidateMetadata(candidate);
+    const measuredEncoding = metadata.contentLength > 0
+      || (metadata.width > 0 && metadata.height > 0 && metadata.bitrate > 0 && metadata.quality);
+    const key = measuredEncoding
+      ? JSON.stringify([metadata.width, metadata.height, metadata.contentLength,
+        metadata.bitrate, metadata.codec, metadata.quality, metadata.containerFormat]) : candidate.url;
+    (seen.has(key) ? mirrors : distinct).push(candidate);
+    seen.add(key);
+  }
+  return [...distinct, ...mirrors];
 }
 
 function createFullVideoCapture(tabId, timeoutMs, expectedVideoId = null) {
@@ -1978,7 +2073,8 @@ async function captureFullVideoForAnalysis({
   requireCompleteMetadata = false,
   savedVideoMetadata = null,
 }) {
-  const previewPurpose = purpose === 'preview';
+  const transcriptionPurpose = purpose === 'transcription';
+  const previewPurpose = purpose === 'preview' || transcriptionPurpose;
   let tab;
   let capture;
   try {
@@ -1987,49 +2083,143 @@ async function captureFullVideoForAnalysis({
     capture = createFullVideoCapture(tab.id, MEDIA_CAPTURE_WAIT_MS, videoId);
     await chrome.tabs.update(tab.id, { url: videoUrl });
     await waitForTab(tab.id);
-    const readiness = await waitForAnalysisVideoReady(tab.id, videoId);
+    // Preview needs the target's verified source data, which may arrive before
+    // the site mounts a video element. Do not wait/activate the analysis UI.
+    const readiness = previewPurpose
+      ? await executeInTab(tab.id, inspectAnalysisVideoReady, [videoId])
+      : await waitForAnalysisVideoReady(tab.id, videoId);
     if (readiness?.blockingReason) throw new Error(readiness.blockingReason);
     const observedFromReady = videoIdFromUrl(readiness?.url);
     if (observedFromReady !== videoId) {
       throw new Error(`目标视频校验失败，页面实际打开的是 ${observedFromReady || '未知视频'}`);
     }
-    if (!readiness?.ready) throw new Error('目标视频播放器未加载，请在 Chrome 打开原视频确认可播放，并检查是否需要登录或验证');
+    if (!previewPurpose && !readiness?.ready) throw new Error('目标视频播放器未加载，请在 Chrome 打开原视频确认可播放，并检查是否需要登录或验证');
     const structuredSources = await executeInTab(
       tab.id,
       extractVerifiedVideoMediaSources,
-      [videoId],
+      [videoId, [], transcriptionPurpose],
       'MAIN',
     );
+    if (transcriptionPurpose && structuredSources?.audioCandidates?.length) {
+      const source = [...structuredSources.audioCandidates].sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+      const target = await executeInTab(tab.id, inspectVerifiedVideoTarget, [videoId]);
+      if (!target?.targetMatches) throw new Error('口播音轨目标视频校验失败');
+      await executeInTab(tab.id, pauseVerifiedVideoPlayback, [videoId]).catch(() => {});
+      return { accountId, videoId, sourceVideoUrl: videoUrl, purpose: 'transcription', video: null,
+        audio: { url: source.url, metadata: { ...source, targetBound: true } },
+        page: { observedVideoId: observedFromReady, durationSeconds: null } };
+    }
     if (previewPurpose) {
-      // Preview address resolution ends as soon as one valid target-bound
-      // low-resolution source exists. Refresh only when the first pass found
-      // nothing, and never wait for the highest available quality.
-      let sources = structuredSources;
-      if (!sources?.videoCandidates?.length) {
-        sources = await executeUntilPageCondition(
-          tab.id,
-          extractVerifiedVideoMediaSources,
-          [videoId],
-          'MAIN',
-          DETAIL_DOM_WAIT_MS,
-          (result) => Boolean(result?.videoCandidates?.length),
-        );
+      const publishedResult = (sources) => {
+        const published = (sources?.videoCandidates || []).map((candidate) => ({
+          url: candidate.url, metadata: { ...candidate, targetBound: true, sourceKind: 'structured' },
+        }));
+        const measuredPublished = published.filter(({ metadata }) => metadata.width > 0 && metadata.height > 0);
+        const publishedPreview = selectPreviewVideoCandidate(new Map(measuredPublished.map(candidate => [candidate.url, candidate])));
+        if (!publishedPreview) return null;
+        // These URLs are already bound to the exact target record. The host
+        // checks their actual tracks and Range support, so waiting for the
+        // original site's player to decode the same work only adds latency.
+        return {
+          accountId, videoId, sourceVideoUrl: videoUrl, purpose: 'preview',
+          video: { url: publishedPreview.url, metadata: publishedPreview.metadata },
+          previewCandidates: rankPreviewVideoCandidates(published)
+            .slice(0, PREVIEW_CANDIDATE_LIMIT),
+          playedSources: [],
+          page: { observedVideoId: observedFromReady, durationSeconds: null },
+        };
+      };
+      const publish = async (result) => {
+        const target = await executeInTab(tab.id, inspectVerifiedVideoTarget, [videoId]);
+        if (!target?.targetMatches) throw new Error(`目标视频校验失败，播放页实际是 ${target?.observedVideoId || '未知视频'}`);
+        await executeInTab(tab.id, pauseVerifiedVideoPlayback, [videoId]).catch(() => {});
+        return result;
+      };
+      const initialPublished = publishedResult(structuredSources);
+      if (initialPublished) return await publish(initialPublished);
+      // Source metadata can arrive shortly after the first inspection. Check
+      // it throughout activation instead of waiting for the site's own decoder
+      // to finish before looking again.
+      const activationDeadline = Date.now() + PREVIEW_PLAYBACK_WAIT_MS;
+      let page;
+      do {
+        const remainingTimeout = () => Math.min(SCRIPT_EXECUTION_TIMEOUT_MS, Math.max(1000, activationDeadline - Date.now()));
+        page = await executeInTab(tab.id, activateVerifiedVideoPlayback, [videoId], 'ISOLATED', remainingTimeout());
+        if (page?.targetMatches === false) break;
+        const newlyPublished = publishedResult(await executeInTab(tab.id, extractVerifiedVideoMediaSources, [videoId], 'MAIN', remainingTimeout()));
+        if (newlyPublished) return await publish(newlyPublished);
+        if (page?.found === true && page.playbackStarted === true) break;
+        if (Date.now() < activationDeadline) await new Promise(resolve => setTimeout(resolve, Math.min(350, activationDeadline - Date.now())));
+      } while (Date.now() < activationDeadline);
+      // The player only hydrates its media element once it actually starts, so
+      // the preview waits for real playback and identifies the source by the
+      // element's own decoded size. It reports the real available resolutions
+      // instead of failing when no reduced variant is published.
+      if (!page?.targetMatches) {
+        throw new Error(`目标视频校验失败，播放页实际是 ${page?.observedVideoId || '未知视频'}`);
       }
-      const selectedPreview = selectPreviewVideoCandidate(
-        new Map((sources?.videoCandidates || []).map((candidate) => [candidate.url, candidate])),
+      if (!page.found || page.playbackStarted !== true) {
+        throw new Error('目标视频播放器没有开始加载媒体，暂时无法准备在线播放');
+      }
+      const sources = await executeUntilPageCondition(
+        tab.id,
+        extractVerifiedVideoMediaSources,
+        [videoId],
+        'MAIN',
+        DETAIL_DOM_WAIT_MS,
+        (result) => Boolean(result?.videoCandidates?.length),
       );
-      if (!selectedPreview) {
-        throw new Error('没有取得经过目标视频校验的可用低清播放源');
+      const structured = (sources?.videoCandidates || []).map((candidate) => ({
+        url: candidate.url, metadata: { ...candidate, targetBound: true, sourceKind: 'structured' },
+      }));
+      const measured = structured.filter((candidate) => candidate.metadata.width > 0 && candidate.metadata.height > 0);
+      const pageMediaUrls = [...new Set([page.currentSrc, ...(page.sourceUrls || [])]
+        .filter((value) => typeof value === 'string' && value))].slice(0, 16);
+      const played = pageMediaUrls.map((url) => ({
+        url,
+        metadata: {
+          targetBound: true, sourceKind: 'current-source',
+          contentType: 'video/mp4',
+          width: positiveNumber(page.videoWidth) || null,
+          height: positiveNumber(page.videoHeight) || null,
+        },
+      }));
+      // Stop the page from streaming the rest of the work once the address is
+      // known; the bytes for playback come from the host relay instead.
+      await executeInTab(tab.id, pauseVerifiedVideoPlayback, [videoId]).catch(() => {});
+      let selectedPreview = null;
+      if (measured.length) {
+        // The page may have selected a high-resolution source. Preview still
+        // prefers the smallest suitable published variant for this target.
+        selectedPreview = selectPreviewVideoCandidate(
+          new Map(measured.map((candidate) => [candidate.url, candidate])));
       }
+      if (!selectedPreview) {
+        selectedPreview = selectPreviewVideoCandidate(new Map(played.map((candidate) => [candidate.url, candidate])));
+      }
+      if (!selectedPreview) {
+        throw new Error(`没有取得经过目标视频校验的可用播放源（已检查 ${pageMediaUrls.length} 个页面地址、`
+          + `${structured.length} 个媒体候选）`);
+      }
+      // The platform does not always publish a codec label, so the host verifies
+      // the leading bytes of the leading candidates and falls back until one is
+      // actually decodable. The order here is the preference order.
+      const ranked = [...structured, ...played.filter((candidate) =>
+        !structured.some((item) => item.url === candidate.url))];
+      const ordered = rankPreviewVideoCandidates(ranked)
+        .slice(0, PREVIEW_CANDIDATE_LIMIT)
+        .map((candidate) => ({ url: candidate.url, metadata: candidate.metadata }));
       return {
         accountId,
         videoId,
         sourceVideoUrl: videoUrl,
         purpose: 'preview',
         video: { url: selectedPreview.url, metadata: selectedPreview.metadata },
+        previewCandidates: ordered,
+        playedSources: played.slice(0, PREVIEW_CANDIDATE_LIMIT),
         page: {
           observedVideoId: videoIdFromUrl(readiness?.url) || videoId,
-          durationSeconds: null,
+          durationSeconds: Number(page.durationSeconds) > 0 ? Number(page.durationSeconds) : null,
         },
       };
     }
@@ -2595,7 +2785,14 @@ function waitForAccountVideoDom(timeoutMs, minimumVideos = 1) {
       return !card?.querySelector('[aria-label*="置顶"]')
         && !/(^|\n)\s*置顶\s*(\n|$)/.test(card?.innerText || card?.textContent || '');
     });
+    const pageText = document.body?.innerText?.trim() || '';
+    let blockingReason = null;
+    if (!unique.length && pageText.length < 1500) {
+      if (/登录已失效|请先登录后查看|必须重新登录/.test(pageText)) blockingReason = '必须重新登录，请在电脑抖音登录窗口完成登录';
+      else if (/请完成安全验证|请进行安全验证|完成验证后继续|滑块验证|拖动滑块/.test(pageText)) blockingReason = '需要完成验证码，请在电脑抖音登录窗口处理';
+    }
     return {
+      blockingReason,
       ready: nonPinned.length > 0,
       enough: nonPinned.length >= minimumVideos,
       count: unique.length,
@@ -2614,7 +2811,7 @@ function waitForAccountVideoDom(timeoutMs, minimumVideos = 1) {
     try { window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)); } catch { /* keep polling */ }
   };
   const immediate = inspect();
-  if (immediate.enough) return Promise.resolve(immediate);
+  if (immediate.enough || immediate.blockingReason) return Promise.resolve(immediate);
   requestMore();
   return new Promise((resolve) => {
     let settled = false;
@@ -2628,7 +2825,7 @@ function waitForAccountVideoDom(timeoutMs, minimumVideos = 1) {
     };
     const check = () => {
       const result = inspect();
-      if (result.enough) finish(result);
+      if (result.enough || result.blockingReason) finish(result);
       else requestMore();
     };
     const observer = new MutationObserver(check);
@@ -2638,7 +2835,7 @@ function waitForAccountVideoDom(timeoutMs, minimumVideos = 1) {
   });
 }
 
-async function extractAccountPageV3(maxVideos) {
+async function extractAccountPageV3(maxVideos, receivedAccountProfile = null) {
   const numberOrNull = (value) => {
     if (value === null || value === undefined || value === '') return null;
     if (typeof value === 'number') return Number.isFinite(value) ? value : null;
@@ -2714,44 +2911,57 @@ async function extractAccountPageV3(maxVideos) {
     const number = Number(value);
     return Number.isSafeInteger(number) && number >= 0 ? number : null;
   };
-  // Followers are auxiliary profile data. They are read from the account's own
-  // public profile data or profile header, and only after the captured
-  // responses are available, so a zero-new-works check still refreshes them.
+  // Followers are auxiliary profile data. The exact count comes from the
+  // account's own profile response when the page has already loaded it; the
+  // profile header is only used as a fallback and is usually abbreviated.
+  const followerStatsFromHeader = () => {
+    const scopes = [
+      document.querySelector('[data-e2e="user-info"]'),
+      document.querySelector('[data-e2e="user-detail"]'),
+      document.querySelector('#user_detail_element'),
+    ].filter(Boolean);
+    for (const scope of scopes) {
+      const label = [...scope.querySelectorAll('*')]
+        .filter((node) => node.children.length === 0 && (node.textContent || '').trim() === '粉丝')
+        .find((node) => {
+          // The number sits next to the label; the label alone is not a value.
+          const parent = node.parentElement;
+          if (!parent) return false;
+          return [...parent.children].some((sibling) => sibling !== node && /\d/.test(sibling.textContent || ''));
+        });
+      if (!label) continue;
+      const parent = label.parentElement;
+      const numberText = [...parent.children]
+        .filter((sibling) => sibling !== label)
+        .map((sibling) => (sibling.textContent || '').trim())
+        .find((value) => /^\d[\d.,]*\s*(?:亿|万|w|k)?$/i.test(value));
+      if (!numberText) continue;
+      const parsed = followerReading(numberText.replace(/,/g, ''));
+      if (parsed) return parsed;
+    }
+    return null;
+  };
   const readFollowers = () => {
     const observedAt = new Date().toISOString();
     let exact = null;
     let text = null;
-    for (const entry of capturedEntries) {
-      const page = entry?.page || entry;
-      const candidates = [page?.user, page?.user_info, page?.userInfo, page?.author]
-        .filter((value) => value && typeof value === 'object');
-      for (const value of candidates) {
-        const key = value.sec_uid || value.secUid || null;
-        if (pageAccountKey && key && key !== pageAccountKey) continue;
-        const reading = exactFollowerCount(value.follower_count ?? value.followerCount);
-        if (reading !== null) { exact = reading; text = String(reading); break; }
+    // The official profile response for this account, already received by this
+    // page, is the only source allowed to claim an exact integer.
+    const profile = receivedAccountProfile && typeof receivedAccountProfile === 'object'
+      ? receivedAccountProfile : null;
+    const profileKey = profile ? (profile.sec_uid || profile.secUid || null) : null;
+    if (profile && (!pageAccountKey || !profileKey || profileKey === pageAccountKey)) {
+      const reading = exactFollowerCount(profile.follower_count ?? profile.followerCount);
+      if (reading !== null) {
+        exact = reading;
+        text = String(reading);
       }
-      if (exact !== null) break;
     }
-    if (exact === null) {
-      const scopes = [
-        document.querySelector('[data-e2e="user-info"]'),
-        document.querySelector('[data-e2e="user-detail"]'),
-        document.querySelector('#user_detail_element'),
-      ].filter(Boolean);
-      for (const scope of scopes) {
-        const found = [...scope.querySelectorAll('*')]
-          .filter((node) => node.children.length === 0)
-          .map((node) => node.textContent || '')
-          .find((value) => /粉丝/.test(value) && /\d/.test(value));
-        if (!found) continue;
-        const label = found.match(/(?:粉丝|Fans)\s*[:：]?\s*([0-9][0-9.,]*\s*(?:亿|万|w|k)?)/i);
-        const parsed = followerReading(label?.[1]?.replace(/,/g, ''));
-        if (parsed) {
-          text = parsed.followerDisplayText;
-          exact = parsed.followerCount;
-          break;
-        }
+    if (text === null) {
+      const parsed = followerStatsFromHeader();
+      if (parsed) {
+        exact = parsed.followerCount;
+        text = parsed.followerDisplayText;
       }
     }
     if (text === null) return null;
@@ -3545,12 +3755,18 @@ function activateVerifiedVideoPlayback(expectedVideoId) {
       .flatMap((source) => [source.src, source.getAttribute?.('src') || ''])
       .filter(Boolean)
     : [];
+  // A blob URL or an empty src means the player has not attached its media
+  // pipeline yet; readyState proves real media has been loaded and decoded.
+  const currentSrc = typeof video.currentSrc === 'string' ? video.currentSrc : '';
+  const playbackStarted = Number(video.readyState) >= 1 && Boolean(currentSrc)
+    && !currentSrc.startsWith('blob:');
   return {
     targetMatches: true,
     found: true,
+    playbackStarted,
     observedVideoId: finalObservedId,
     pageUrl: location.href,
-    currentSrc: video.currentSrc || video.src || null,
+    currentSrc: currentSrc || video.src || null,
     sourceUrls,
     videoWidth: Number(video.videoWidth) || null,
     videoHeight: Number(video.videoHeight) || null,

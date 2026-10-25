@@ -31,17 +31,50 @@ export class BrowserWorker {
   async ensureBrowser() {
     if (this.context) return this.context;
     this.context = await chromium.launchPersistentContext(this.profile, {
-      channel: 'chrome', headless: false, viewport: { width: 1440, height: 1000 },
+      channel: 'chrome', headless: false,
+      // Setting a headed viewport makes Playwright restore minimized windows
+      // as each page is attached. Preserve the background window's own bounds.
+      viewport: this.options.headless ? { width: 1440, height: 1000 } : null,
       locale: 'zh-CN', timeout: 30_000, ...this.options,
     });
     this.context.on('close', () => { this.context = null; this.tabs.clear(); });
+    if (!this.options.headless) {
+      const page = this.context.pages()[0];
+      if (page) await this.setWindowState(page, 'minimized');
+    }
     return this.context;
+  }
+
+  async setWindowState(page, windowState) {
+    const session = await this.context.newCDPSession(page);
+    try {
+      const { windowId } = await session.send('Browser.getWindowForTarget');
+      await session.send('Browser.setWindowBounds', { windowId, bounds: { windowState } });
+    } finally { await session.detach(); }
+  }
+
+  async createPage(active) {
+    const context = await this.ensureBrowser();
+    if (active || this.options.headless) return context.newPage();
+    // Playwright newPage activates/restores a headed window. A background CDP
+    // target preserves the workbench's focus while using the same login profile.
+    const session = await context.newCDPSession(context.pages()[0]);
+    try {
+      const [page] = await Promise.all([
+        context.waitForEvent('page'),
+        session.send('Target.createTarget', { url: 'about:blank', background: true,
+          focus: false }),
+      ]);
+      await session.detach();
+      return page;
+    } catch (error) { await session.detach(); throw error; }
   }
 
   async open() {
     const context = await this.ensureBrowser();
     const page = context.pages().find((item) => ![...this.tabs.values()].some((tab) => tab.page === item))
       || await context.newPage();
+    if (!this.options.headless) await this.setWindowState(page, 'normal');
     if (!page.url().startsWith('https://www.douyin.com/')) {
       await page.goto('https://www.douyin.com/', { waitUntil: 'domcontentloaded', timeout: 45_000 });
     }
@@ -58,6 +91,7 @@ export class BrowserWorker {
   navigate(id, url) {
     const tab = this.tabs.get(id);
     tab.verifiedMediaRoots = [];
+    tab.verifiedProfile = null;
     tab.status = 'loading';
     tab.error = null;
     // Match chrome.tabs: navigation returns before the page finishes loading.
@@ -69,6 +103,44 @@ export class BrowserWorker {
       tab.status = 'complete';
       this.updated.emit(id, { status: 'complete' });
     });
+  }
+
+  // The account's own public profile response carries the exact follower count.
+  // Only the fields that identify the account and its follower total are kept.
+  async rememberPublicAccountProfile(id, response) {
+    const tab = this.tabs.get(id);
+    if (!tab) return;
+    try {
+      const responseUrl = new URL(response.url());
+      if (responseUrl.protocol !== 'https:' || responseUrl.hostname !== 'www.douyin.com'
+        || (responseUrl.port && responseUrl.port !== '443')
+        || responseUrl.pathname !== '/aweme/v1/web/user/profile/other/'
+        || response.status() !== 200) return;
+      const headers = response.headers();
+      if (!headers['content-type']?.toLowerCase().includes('json')
+        || Number(headers['content-length']) > 512 * 1024) return;
+      const observedKey = () => {
+        try {
+          return new URL(tab.page.url()).pathname.match(/^\/user\/([^/]+)/)?.[1] || null;
+        } catch { return null; }
+      };
+      const expectedKey = observedKey();
+      if (!expectedKey) return;
+      const body = await response.body();
+      if (body.length > 512 * 1024 || this.tabs.get(id) !== tab || observedKey() !== expectedKey) return;
+      const payload = JSON.parse(body.toString('utf8'));
+      const user = payload?.user;
+      if (!user || typeof user !== 'object') return;
+      const secUid = typeof user.sec_uid === 'string' ? user.sec_uid : null;
+      if (secUid && secUid !== expectedKey) return;
+      if (!secUid && responseUrl.searchParams.get('sec_user_id') !== expectedKey) return;
+      if (observedKey() !== expectedKey) return;
+      tab.verifiedProfile = {
+        sec_uid: secUid || expectedKey,
+        follower_count: Number.isSafeInteger(user.follower_count) && user.follower_count >= 0
+          ? user.follower_count : null,
+      };
+    } catch { /* failed or non-JSON public responses supply no follower evidence */ }
   }
 
   async rememberPublicVideoMedia(id, response) {
@@ -136,9 +208,9 @@ export class BrowserWorker {
       tabs: {
         onUpdated: this.updated,
         create: async ({ url, active }) => {
-          const page = await (await this.ensureBrowser()).newPage();
+          const page = await this.createPage(active);
           const id = this.nextId++;
-          this.tabs.set(id, { page, status: 'complete', error: null, verifiedMediaRoots: [] });
+          this.tabs.set(id, { page, status: 'complete', error: null, verifiedMediaRoots: [], verifiedProfile: null });
           const details = (request) => ({ tabId: id, url: request.url(), type: request.resourceType(), timeStamp: Date.now() });
           page.on('request', (request) => this.beforeRequest.emit(details(request)));
           page.on('response', (response) => {
@@ -146,6 +218,7 @@ export class BrowserWorker {
               statusCode: response.status(), responseHeaders: Object.entries(response.headers()).map(([name, value]) => ({ name, value })),
             });
             void this.rememberPublicVideoMedia(id, response);
+            void this.rememberPublicAccountProfile(id, response);
           });
           if (active || this.activeId === null) this.activeId = id;
           if (active) await page.bringToFront();
@@ -173,8 +246,10 @@ export class BrowserWorker {
         if (tab.error) throw new Error(tab.error);
         // Only functions from the local audited collector are evaluated.
         const invocationArgs = ['extractVerifiedVideoMediaSources', 'extractVideoDetailPage'].includes(func.name)
-          ? [args[0], tab.verifiedMediaRoots.filter((record) => record.aweme_id === args[0])]
-          : args;
+          ? [args[0], tab.verifiedMediaRoots.filter((record) => record.aweme_id === args[0]), ...args.slice(2)]
+          : func.name === 'extractAccountPageV3'
+            ? [args[0], tab.verifiedProfile]
+            : args;
         const result = await tab.page.evaluate(`(${func.toString()})(...${JSON.stringify(invocationArgs)})`);
         return [{ result }];
       } },

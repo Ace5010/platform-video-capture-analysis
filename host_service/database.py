@@ -9,7 +9,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -18,6 +18,7 @@ from local_asr.punctuation import restore_transcript_text
 
 from .compatibility import CONNECTOR_FRESHNESS_SECONDS, semver_at_least
 from .config import HostConfig
+from .account_identity import canonical_douyin_account_url
 from .recovery import safe_error
 
 
@@ -46,6 +47,8 @@ DISCOVERY_ORDER_STEP = 0.000001
 # New records are stamped this far behind the observed server time, which keeps
 # them strictly after older records without ever claiming a future time.
 DISCOVERY_CLOCK_BACKOFF = 0.5
+# Upper bound for an explicitly limited read; normal workspace reads stay complete.
+STATE_VIDEO_LIMIT_MAXIMUM = 2000
 DISCOVERY_ORIGIN_MANUAL_LATEST = "manual_latest"
 # Account keys replaced together whenever a real follower observation arrives,
 # so an approximate reading can never keep an older exact integer alive.
@@ -271,12 +274,22 @@ class Database:
                     origin_job_id TEXT,
                     origin_event_id TEXT,
                     origin TEXT NOT NULL DEFAULT 'manual_latest',
+                    cleared_at TEXT,
                     PRIMARY KEY(account_id, video_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_collection_discoveries_time
                     ON collection_discoveries(discovered_at DESC);
                 """
             )
+            connection.execute("""CREATE TABLE IF NOT EXISTS transcription_jobs (
+                video_id TEXT PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
+                status TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0,
+                claim_token TEXT, claim_until REAL, attempt_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT, result_json TEXT
+            )""")
+            discovery_columns = {row["name"] for row in connection.execute("PRAGMA table_info(collection_discoveries)")}
+            if "cleared_at" not in discovery_columns:
+                connection.execute("ALTER TABLE collection_discoveries ADD COLUMN cleared_at TEXT")
             connector_columns = {row["name"] for row in connection.execute("PRAGMA table_info(connectors)")}
             for column, definition in {
                 "extension_version": "TEXT",
@@ -610,10 +623,35 @@ class Database:
         })
 
     @staticmethod
+    def _canonical_account_id(connection: sqlite3.Connection, account_id: str) -> str:
+        if connection.execute("SELECT 1 FROM accounts WHERE id=?", (account_id,)).fetchone():
+            return account_id
+        for row in connection.execute("SELECT id,data_json FROM accounts"):
+            if account_id in json.loads(row["data_json"]).get("mergedAccountIds", []):
+                return row["id"]
+        return account_id
+
+    @staticmethod
     def _upsert_account(connection: sqlite3.Connection, raw: dict[str, Any]) -> dict[str, Any]:
         incoming = dict(_object(raw, "account"))
-        account_id = _identifier(incoming.get("id"), "account.id")
+        supplied_id = _identifier(incoming.get("id"), "account.id")
+        account_id = Database._canonical_account_id(connection, supplied_id)
         current = connection.execute("SELECT data_json FROM accounts WHERE id=?", (account_id,)).fetchone()
+        platform = str(incoming.get("platform") or (json.loads(current["data_json"]).get("platform") if current else None) or "douyin")
+        identity = canonical_douyin_account_url(str(incoming.get("url") or "")) if platform == "douyin" else None
+        if not current and identity:
+            for existing in connection.execute("SELECT id,url,data_json FROM accounts WHERE platform='douyin' ORDER BY created_at,id"):
+                if canonical_douyin_account_url(existing["url"]) != identity:
+                    continue
+                # A repeated add must not replace an established name/avatar or
+                # restart collection. Remember the supplied ID for stale clients
+                # and legacy imports that still reference it.
+                account = json.loads(existing["data_json"])
+                account["mergedAccountIds"] = list(dict.fromkeys([*account.get("mergedAccountIds", []), supplied_id]))
+                Database._merge_follower_observation(account, incoming)
+                connection.execute("UPDATE accounts SET data_json=?,updated_at=? WHERE id=?",
+                                   (_compact_json(account), utc_now(), existing["id"]))
+                return account
         account = json.loads(current["data_json"]) if current else {}
         account.update({key: value for key, value in incoming.items()
                         if (value is not None or key in ("currentSyncMode", "collectionError"))
@@ -621,6 +659,8 @@ class Database:
         Database._merge_follower_observation(account, incoming)
         platform = str(account.get("platform") or "douyin")[:64]
         url = str(account.get("url") or "")[:4096]
+        if platform == "douyin":
+            url = canonical_douyin_account_url(url) or url
         name = str(account.get("name") or "待识别账号")[:512]
         account.update({"id": account_id, "platform": platform, "url": url, "name": name})
         now = utc_now()
@@ -636,10 +676,108 @@ class Database:
         with self.transaction() as connection:
             return self._upsert_account(connection, account)
 
+    def add_account_with_initial_job(self, raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
+        """Save an add request and its initial job in one transaction.
+
+        An identical request after a lost response must not overwrite a running
+        or completed account with the client's original pending snapshot.
+        """
+        with self.transaction() as connection:
+            account_id = self._canonical_account_id(connection, _identifier(raw.get("id"), "account.id"))
+            current = connection.execute("SELECT data_json FROM accounts WHERE id=?", (account_id,)).fetchone()
+            saved = json.loads(current["data_json"]) if current else self._upsert_account(connection, raw)
+            if saved.get("platform") != "douyin" or saved.get("initialSyncStatus") == "complete":
+                return saved, None, False
+            job, created = self.create_job("archive_account", {"accountId": saved["id"], "retry": True}, _connection=connection)
+            saved = json.loads(connection.execute("SELECT data_json FROM accounts WHERE id=?", (saved["id"],)).fetchone()["data_json"])
+            return saved, job, created
+
+    def update_account_if_present(self, account: dict[str, Any]) -> dict[str, Any] | None:
+        """Background status updates cannot recreate an account the user removed."""
+        account_id = _identifier(account.get("id"), "account.id")
+        with self.transaction() as connection:
+            account_id = self._canonical_account_id(connection, account_id)
+            if not connection.execute("SELECT 1 FROM accounts WHERE id=?", (account_id,)).fetchone():
+                return None
+            return self._upsert_account(connection, account)
+
+    def merge_accounts(self, keep_id: str, duplicate_ids: list[str]) -> dict[str, Any]:
+        """Merge verified identical profiles without cascading their saved work.
+
+        Run only while collection is idle, after a SQLite backup. Finished job
+        and analysis history stays byte-for-byte unchanged; old IDs remain
+        resolvable from the retained account for stale clients and imports.
+        """
+        keep_id = _identifier(keep_id, "keepId")
+        duplicates = list(dict.fromkeys(_identifier(value, "duplicateId") for value in duplicate_ids if value != keep_id))
+        with self.transaction() as connection:
+            if connection.execute("SELECT 1 FROM jobs WHERE status IN ('queued','claimed','running') LIMIT 1").fetchone():
+                raise ValueError("仍有活动任务，不能合并账号")
+            rows = []
+            for account_id in [keep_id, *duplicates]:
+                row = connection.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+                if row is None:
+                    raise ValueError("待合并账号不存在")
+                rows.append(row)
+            identity = canonical_douyin_account_url(rows[0]["url"])
+            if not identity or any(row["platform"] != "douyin" or canonical_douyin_account_url(row["url"]) != identity for row in rows):
+                raise ValueError("仅能合并主页账号 ID 相同的抖音账号")
+            merged: dict[str, Any] = {}
+            aliases: list[str] = []
+            history: list[str] = []
+            followers: dict[str, Any] = {}
+            for row in sorted(rows, key=lambda item: (item["updated_at"], item["id"])):
+                account = json.loads(row["data_json"])
+                merged.update({key: value for key, value in account.items()
+                               if (value is not None or key in ("currentSyncMode", "collectionError"))
+                               and key not in FOLLOWER_FIELD_GROUP})
+                self._merge_follower_observation(followers, account)
+                aliases.extend(account.get("mergedAccountIds", []))
+                history.extend(account.get("collectedHistoryIds", []))
+            merged.update(followers)
+            merged.update({"id": keep_id, "platform": "douyin", "url": identity,
+                           "mergedAccountIds": list(dict.fromkeys([*aliases, *duplicates])),
+                           "collectedHistoryIds": list(dict.fromkeys(history))})
+            added = [json.loads(row["data_json"]).get("addedAt") for row in rows]
+            if any(added):
+                merged["addedAt"] = min(value for value in added if value)
+            completed = [json.loads(row["data_json"]).get("initialSyncCompletedAt") for row in rows]
+            if any(completed):
+                merged["initialSyncStatus"] = "complete"
+                merged["initialSyncCompletedAt"] = min(value for value in completed if value)
+            for duplicate_id in duplicates:
+                for table, payload_key in (("videos", "accountId"), ("snapshots", "accountId")):
+                    for row in connection.execute(f"SELECT id,data_json FROM {table} WHERE account_id=?", (duplicate_id,)).fetchall():
+                        saved = json.loads(row["data_json"])
+                        saved[payload_key] = keep_id
+                        connection.execute(f"UPDATE {table} SET account_id=?,data_json=? WHERE id=?",
+                                           (keep_id, _compact_json(saved), row["id"]))
+                for discovery in connection.execute("SELECT * FROM collection_discoveries WHERE account_id=?", (duplicate_id,)).fetchall():
+                    previous = connection.execute("SELECT discovered_at,cleared_at FROM collection_discoveries WHERE account_id=? AND video_id=?",
+                                                  (keep_id, discovery["video_id"])).fetchone()
+                    if previous and discovery["cleared_at"]:
+                        connection.execute("UPDATE collection_discoveries SET cleared_at=COALESCE(cleared_at,?) WHERE account_id=? AND video_id=?",
+                                           (discovery["cleared_at"], keep_id, discovery["video_id"]))
+                    if previous and previous["discovered_at"] <= discovery["discovered_at"]:
+                        continue
+                    connection.execute("INSERT INTO collection_discoveries(account_id,video_id,discovered_at,origin_job_id,origin_event_id,origin,cleared_at) "
+                        "VALUES(?,?,?,?,?,?,?) ON CONFLICT(account_id,video_id) DO UPDATE SET discovered_at=excluded.discovered_at,"
+                        "origin_job_id=excluded.origin_job_id,origin_event_id=excluded.origin_event_id,origin=excluded.origin,"
+                        "cleared_at=COALESCE(collection_discoveries.cleared_at,excluded.cleared_at)",
+                        (keep_id, discovery["video_id"], discovery["discovered_at"], discovery["origin_job_id"],
+                         discovery["origin_event_id"], discovery["origin"], discovery["cleared_at"]))
+                # All saved children now belong to the retained account.
+                connection.execute("DELETE FROM accounts WHERE id=?", (duplicate_id,))
+            connection.execute("UPDATE accounts SET url=?,name=?,data_json=?,updated_at=? WHERE id=?",
+                               (identity, merged["name"], _compact_json(merged), utc_now(), keep_id))
+            if connection.execute("PRAGMA foreign_key_check").fetchone():
+                raise ValueError("账号合并后的关联校验失败")
+        return merged
+
     def acknowledge_account_updates(self, accounts: list[dict[str, Any]]) -> None:
         with self.transaction() as connection:
             for item in accounts:
-                account_id = _identifier(_object(item, "account").get("id"), "account.id")
+                account_id = self._canonical_account_id(connection, _identifier(_object(item, "account").get("id"), "account.id"))
                 row = connection.execute("SELECT data_json FROM accounts WHERE id=?", (account_id,)).fetchone()
                 if not row:
                     continue
@@ -766,7 +904,7 @@ class Database:
         for removed_metric in ("playCount", "play_count", "viewCount", "view_count"):
             video.pop(removed_metric, None)
         video_id = _identifier(video.get("id"), "video.id")
-        account_id = _identifier(video.get("accountId"), "video.accountId")
+        account_id = Database._canonical_account_id(connection, _identifier(video.get("accountId"), "video.accountId"))
         exists = connection.execute("SELECT id FROM accounts WHERE id=?", (account_id,)).fetchone()
         if not exists:
             raise ValueError(f"视频 {video_id} 对应的监控账号不存在")
@@ -777,6 +915,11 @@ class Database:
             for removed_metric in ("playCount", "play_count", "viewCount", "view_count"):
                 merged.pop(removed_metric, None)
             merged.update(video)
+            if not video.get("transcript"):
+                previous = json.loads(current["data_json"])
+                for key in previous:
+                    if key.startswith("transcript"):
+                        merged[key] = previous[key]
             # A collection result must never erase a saved transcript/analysis.
             for key in ("transcript", "analysis", "analysisUsage", "analysisStatus", "analysisUpdatedAt", "analysisError"):
                 if key not in video or video.get(key) is None:
@@ -806,7 +949,8 @@ class Database:
                 raise ValueError("snapshot 对应视频不存在")
             account_id = video["account_id"]
             snapshot["accountId"] = account_id
-        account_id = _identifier(account_id, "snapshot.accountId")
+        account_id = Database._canonical_account_id(connection, _identifier(account_id, "snapshot.accountId"))
+        snapshot["accountId"] = account_id
         captured_at = str(snapshot.get("capturedAt") or utc_now())[:64]
         snapshot["capturedAt"] = captured_at
         connection.execute(
@@ -830,15 +974,30 @@ class Database:
                 self._upsert_snapshot(connection, _object(snapshot, "snapshot"))
         return {"accounts": len(accounts), "videos": len(videos), "snapshots": len(snapshots)}
 
-    def state(self) -> dict[str, Any]:
+    def state(self, video_limit: int | None = None) -> dict[str, Any]:
+        """Current workspace snapshot.
+
+        ``video_limit`` bounds how many works are returned, newest first, so the
+        frequently polled read does not grow without limit as an account
+        accumulates history. Discoveries outside the returned window are dropped
+        so the two lists always agree.
+        """
         self.reconcile_collection_statuses()
+        limit = 0 if video_limit is None else max(0, min(STATE_VIDEO_LIMIT_MAXIMUM, int(video_limit)))
         with closing(self.connect()) as connection:
             accounts = [
                 account
                 for row in connection.execute("SELECT data_json FROM accounts ORDER BY created_at")
                 if not (account := json.loads(row["data_json"])).get("hidden")
             ]
-            video_rows = connection.execute("SELECT account_id,data_json,created_at FROM videos ORDER BY created_at").fetchall()
+            video_sql = ("SELECT account_id,data_json,created_at FROM videos "
+                         "ORDER BY COALESCE(json_extract(data_json,'$.publishedAt'), created_at) DESC, "
+                         "created_at DESC, id DESC")
+            if limit:
+                video_sql += " LIMIT ?"
+                video_rows = connection.execute(video_sql, (limit,)).fetchall()
+            else:
+                video_rows = connection.execute(video_sql).fetchall()
             all_videos = [
                 (str(row["account_id"]), _normalize_video_transcript({**json.loads(row["data_json"]),
                     "firstSeenAt": json.loads(row["data_json"]).get("firstSeenAt") or row["created_at"]}))
@@ -867,6 +1026,15 @@ class Database:
                 )
             ]
         discoveries, discovery_counts = self.recent_discoveries()
+        if limit:
+            # A discovery whose work is outside the returned window would be an
+            # entry the page can neither count nor open, so it is dropped here
+            # and stays available through the complete workspace read.
+            returned = {str(video.get("id")) for _, video in all_videos}
+            discoveries = [item for item in discoveries if item["videoId"] in returned]
+            discovery_counts = {}
+            for item in discoveries:
+                discovery_counts[item["accountId"]] = discovery_counts.get(item["accountId"], 0) + 1
         return {
             "accounts": accounts,
             "videos": videos,
@@ -875,6 +1043,7 @@ class Database:
             "discoveries": discoveries,
             "discoveryAccountCounts": discovery_counts,
             "discoveryWindowSeconds": DISCOVERY_TTL_SECONDS,
+            "videoLimit": limit,
             "connector": self.connector_status(),
         }
 
@@ -918,6 +1087,99 @@ class Database:
             ).fetchall()
             video["analysisRuns"] = [_analysis_run_dict(run) for run in run_rows]
         return video
+
+    def queue_transcription(self, video_id: str, *, retry: bool = False,
+                            connection: sqlite3.Connection | None = None) -> dict[str, Any] | None:
+        """Persist local work atomically with collection; never touch analysis."""
+        with (nullcontext(connection) if connection is not None else self.transaction()) as active:
+            row = active.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
+            if not row:
+                raise ValueError("视频不存在")
+            video = json.loads(row["data_json"])
+            if video.get("transcriptStatus") == "ready" or video.get("transcript"):
+                return None
+            previous = active.execute("SELECT * FROM transcription_jobs WHERE video_id=?", (video_id,)).fetchone()
+            if previous and (previous["status"] in ("queued", "processing") or not retry):
+                return dict(previous)
+            now = utc_now()
+            active.execute(
+                "INSERT INTO transcription_jobs(video_id,status,created_at,updated_at) VALUES(?,'queued',?,?) "
+                "ON CONFLICT(video_id) DO UPDATE SET status='queued',claim_token=NULL,claim_until=NULL,error=NULL,updated_at=excluded.updated_at",
+                (video_id, now, now),
+            )
+            video.update(transcriptStatus="queued", transcriptError=None)
+            active.execute("UPDATE videos SET data_json=?,updated_at=? WHERE id=?", (_compact_json(video), now, video_id))
+            return dict(active.execute("SELECT * FROM transcription_jobs WHERE video_id=?", (video_id,)).fetchone())
+
+    def transcription_state(self, video_id: str) -> dict[str, Any] | None:
+        with closing(self.connect()) as connection:
+            row = connection.execute("SELECT * FROM transcription_jobs WHERE video_id=?", (video_id,)).fetchone()
+            return dict(row) if row else None
+
+    def prioritize_transcription(self, video_id: str) -> None:
+        with self.transaction() as connection:
+            connection.execute("UPDATE transcription_jobs SET priority=1 WHERE video_id=? AND status='queued'", (video_id,))
+
+    def claim_transcription(self) -> dict[str, Any] | None:
+        with self.transaction() as connection:
+            connection.execute("UPDATE transcription_jobs SET status='queued',claim_token=NULL,claim_until=NULL "
+                               "WHERE status='processing' AND claim_until<=?", (time.time(),))
+            rows = connection.execute("SELECT q.*,v.data_json FROM transcription_jobs q JOIN videos v ON v.id=q.video_id "
+                                      "WHERE q.status='queued' ORDER BY q.priority DESC,q.created_at,q.rowid").fetchall()
+            for row in rows:
+                video = json.loads(row["data_json"])
+                if video.get("transcriptStatus") == "ready" or video.get("transcript"):
+                    connection.execute("UPDATE transcription_jobs SET status='ready',updated_at=? WHERE video_id=?", (utc_now(), row["video_id"]))
+                    continue
+                token = uuid.uuid4().hex
+                connection.execute("UPDATE transcription_jobs SET status='processing',claim_token=?,claim_until=?,"
+                                   "attempt_count=attempt_count+1,updated_at=?,error=NULL WHERE video_id=?",
+                                   (token, time.time()+120, utc_now(), row["video_id"]))
+                video.update(transcriptStatus="processing", transcriptError=None)
+                connection.execute("UPDATE videos SET data_json=?,updated_at=? WHERE id=?", (_compact_json(video), utc_now(), row["video_id"]))
+                return {"videoId": row["video_id"], "claimToken": token, "video": video}
+            return None
+
+    def renew_transcription(self, video_id: str, token: str) -> bool:
+        with self.transaction() as connection:
+            return bool(connection.execute("UPDATE transcription_jobs SET claim_until=? WHERE video_id=? "
+                                           "AND claim_token=? AND status='processing'", (time.time()+120, video_id, token)).rowcount)
+
+    def release_transcription(self, video_id: str, token: str) -> None:
+        with self.transaction() as connection:
+            changed = connection.execute("UPDATE transcription_jobs SET status='queued',claim_token=NULL,claim_until=NULL "
+                                         "WHERE video_id=? AND claim_token=? AND status='processing'", (video_id, token)).rowcount
+            if changed:
+                row = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
+                if row:
+                    video = json.loads(row["data_json"])
+                    if video.get("transcriptStatus") != "ready":
+                        video.update(transcriptStatus="queued", transcriptError=None)
+                        connection.execute("UPDATE videos SET data_json=?,updated_at=? WHERE id=?", (_compact_json(video), utc_now(), video_id))
+
+    def finish_transcription(self, video_id: str, token: str, text: str = "", *,
+                             error: str | None = None, metadata: dict[str, Any] | None = None) -> bool:
+        with self.transaction() as connection:
+            owned = connection.execute("SELECT 1 FROM transcription_jobs WHERE video_id=? AND claim_token=? "
+                                       "AND status='processing'", (video_id, token)).fetchone()
+            row = connection.execute("SELECT data_json FROM videos WHERE id=?", (video_id,)).fetchone()
+            if not owned or not row:
+                return False
+            video = json.loads(row["data_json"])
+            ready = video.get("transcriptStatus") == "ready" or bool(video.get("transcript"))
+            now = utc_now()
+            if not ready:
+                if error:
+                    video.update(transcriptStatus="error", transcriptError=safe_error(RuntimeError(error))[:500])
+                else:
+                    video.update(transcript=restore_transcript_text(text), transcriptRaw=text, transcriptStatus="ready",
+                                 transcriptError=None, transcriptUpdatedAt=now, transcriptSource="local_qwen3_asr",
+                                 transcriptModel="Qwen3-ASR-1.7B-Q8_0", transcriptMetadata=metadata or {})
+                connection.execute("UPDATE videos SET data_json=?,updated_at=? WHERE id=?", (_compact_json(video), now, video_id))
+            connection.execute("UPDATE transcription_jobs SET status=?,claim_token=NULL,claim_until=NULL,error=?,result_json=?,updated_at=? WHERE video_id=?",
+                               ("ready" if ready or not error else "error", None if ready else video.get("transcriptError"),
+                                _compact_json(metadata or {}), now, video_id))
+            return True
 
     def _remove_account_discoveries(self, connection: sqlite3.Connection, account_id: str) -> None:
         connection.execute("DELETE FROM collection_discoveries WHERE account_id=?", (account_id,))
@@ -973,7 +1235,7 @@ class Database:
                 "SELECT d.account_id,d.video_id,d.discovered_at "
                 "FROM collection_discoveries d JOIN videos v ON v.id=d.video_id "
                 "JOIN accounts a ON a.id=d.account_id AND a.id!=? "
-                "WHERE d.discovered_at<=? AND d.discovered_at>? "
+                "WHERE d.cleared_at IS NULL AND d.discovered_at<=? AND d.discovered_at>? "
                 "ORDER BY d.discovered_at DESC, d.video_id DESC",
                 (LINK_VIDEO_ACCOUNT_ID, now_epoch, now_epoch - window_seconds),
             ).fetchall()
@@ -987,6 +1249,27 @@ class Database:
         for item in items:
             counts[item["accountId"]] = counts.get(item["accountId"], 0) + 1
         return items, counts
+
+    def clear_discoveries(self, video_ids: list[str]) -> int:
+        """Dismiss displayed notifications without deleting saved works/history.
+
+        Keep the original discovery rows so replay or re-check cannot restore
+        them. Only the supplied works are cleared; unseen concurrent finds stay.
+        """
+        if not isinstance(video_ids, list) or len(video_ids) > 500:
+            raise ValueError("videoIds 必须是最多 500 项的数组")
+        video_ids = list(dict.fromkeys(_identifier(value, "videoId") for value in video_ids))
+        if any(not value.isdigit() or len(value) > 32 for value in video_ids):
+            raise ValueError("videoId 无效")
+        if not video_ids:
+            return 0
+        cleared_at = utc_now()
+        with self.transaction() as connection:
+            cursor = connection.executemany(
+                "UPDATE collection_discoveries SET cleared_at=? WHERE video_id=? AND cleared_at IS NULL",
+                [(cleared_at, video_id) for video_id in video_ids],
+            )
+            return cursor.rowcount
 
     def purge_expired_discoveries(self, window_seconds: int = DISCOVERY_TTL_SECONDS) -> int:
         """Lazy cleanup of expired links only; works and analyses are untouched."""
@@ -1154,11 +1437,23 @@ class Database:
                 candidate_payload = json.loads(row["payload_json"])
             except (TypeError, json.JSONDecodeError):
                 continue
-            if isinstance(candidate_payload, dict) and self._idempotency_key("analyze_video", candidate_payload) == base_key:
+            if isinstance(candidate_payload, dict) and self._idempotency_key("analyze_video", self._canonical_job_payload(connection, candidate_payload)) == base_key:
                 return row
         return None
 
-    def create_job(self, requested_type: str, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    @staticmethod
+    def _canonical_job_payload(connection: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
+        saved = dict(payload)
+        if saved.get("accountId"):
+            saved["accountId"] = Database._canonical_account_id(connection, str(saved["accountId"]))
+        if isinstance(saved.get("accountIds"), list):
+            saved["accountIds"] = list(dict.fromkeys(Database._canonical_account_id(connection, str(value)) for value in saved["accountIds"]))
+        if isinstance(saved.get("account"), dict):
+            saved["account"] = {**saved["account"], "id": Database._canonical_account_id(connection, str(saved["account"].get("id") or ""))}
+        return saved
+
+    def create_job(self, requested_type: str, payload: dict[str, Any], *,
+                   _connection: sqlite3.Connection | None = None) -> tuple[dict[str, Any], bool]:
         job_type = CANONICAL_JOB_TYPES.get(requested_type)
         if not job_type:
             raise ValueError("不支持的任务类型")
@@ -1172,12 +1467,17 @@ class Database:
             _identifier(payload.get("accountId"), "accountId")
             _identifier(payload.get("videoId"), "videoId")
             payload["analysisVersion"] = str(payload.get("analysisVersion") or "v1")[:64]
-        key = self._idempotency_key(job_type, payload)
         now_epoch = int(time.time())
         now = utc_now()
         job_ttl = self.config.analysis_job_expiry_seconds if job_type == "analyze_video" else self.config.job_expiry_seconds
-        with self.transaction() as connection:
+        with (nullcontext(_connection) if _connection is not None else self.transaction()) as connection:
             self.expire_and_requeue(connection)
+            if job_type == "archive_account" and isinstance(payload.get("account"), dict):
+                saved_account = self._upsert_account(connection, payload["account"])
+                payload["account"] = saved_account
+                payload["accountId"] = saved_account["id"]
+            payload = self._canonical_job_payload(connection, payload)
+            key = self._idempotency_key(job_type, payload)
 
             def upgrade_active_link_analysis(row: sqlite3.Row) -> sqlite3.Row:
                 if (
@@ -1196,9 +1496,12 @@ class Database:
                 )
                 return connection.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
 
-            if job_type == "archive_account" and isinstance(payload.get("account"), dict):
-                self._upsert_account(connection, payload["account"])
             existing = connection.execute("SELECT * FROM jobs WHERE idempotency_key=?", (key,)).fetchone()
+            if not existing and job_type == "analyze_video":
+                existing = self._latest_analysis_job(connection, key)
+            if not existing and job_type == "archive_account":
+                existing = next((row for row in connection.execute("SELECT * FROM jobs WHERE type='archive_account' ORDER BY created_epoch DESC,created_at DESC,id DESC")
+                                 if self._idempotency_key(job_type, self._canonical_job_payload(connection, json.loads(row["payload_json"]))) == key), None)
             if job_type == "analyze_video" and bool(payload.get("retry")):
                 latest = self._latest_analysis_job(connection, key)
                 if latest and latest["status"] in ACTIVE_JOB_STATUSES:
@@ -1211,7 +1514,7 @@ class Database:
             elif job_type == "archive_account" and payload.get("retry") and existing:
                 latest = next((row for row in connection.execute(
                     "SELECT * FROM jobs WHERE type='archive_account' ORDER BY created_epoch DESC,created_at DESC,id DESC"
-                ).fetchall() if self._idempotency_key("archive_account", json.loads(row["payload_json"])) == key), existing)
+                ).fetchall() if self._idempotency_key("archive_account", self._canonical_job_payload(connection, json.loads(row["payload_json"]))) == key), existing)
                 if latest["status"] in ACTIVE_JOB_STATUSES:
                     return _job_dict(latest), False
                 result = json.loads(latest["result_json"] or "{}")
@@ -1255,7 +1558,7 @@ class Database:
         )
         connection.execute(
             "UPDATE jobs SET status='expired',error='任务等待主机 Chrome 超时',updated_at=? "
-            "WHERE status='queued' AND type!='analyze_video' AND expires_at<=?",
+            "WHERE status='queued' AND type NOT IN ('analyze_video','archive_account','collect_latest') AND expires_at<=?",
             (now, now_epoch),
         )
         connection.execute(
@@ -1287,7 +1590,13 @@ class Database:
         limit = max(1, min(500, int(limit)))
         with self.transaction() as connection:
             self.expire_and_requeue(connection)
-            rows = connection.execute("SELECT * FROM jobs ORDER BY created_epoch DESC,rowid DESC LIMIT ?", (limit,)).fetchall()
+            # Keep every active task visible even when many newer additions push
+            # the running/oldest job beyond the bounded history window.
+            rows = connection.execute(
+                "SELECT * FROM jobs WHERE status IN ('queued','claimed','running') OR id IN "
+                "(SELECT id FROM jobs ORDER BY created_epoch DESC,rowid DESC LIMIT ?) "
+                "ORDER BY created_epoch DESC,rowid DESC", (limit,),
+            ).fetchall()
         return [_job_dict(row) for row in rows]
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
@@ -1311,7 +1620,7 @@ class Database:
             where += f" AND type IN ({placeholders})"
             parameters.extend(sorted(allowed))
             row = connection.execute(
-                f"SELECT * FROM jobs WHERE {where} ORDER BY created_epoch LIMIT 1", parameters
+                f"SELECT * FROM jobs WHERE {where} ORDER BY created_epoch,rowid LIMIT 1", parameters
             ).fetchone()
             if not row:
                 connection.execute("UPDATE connectors SET last_seen_at=? WHERE id=?", (utc_now(), connector_id))
@@ -1358,6 +1667,18 @@ class Database:
             )
             current = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return _job_dict(current)
+
+    def defer_collection_job(self, connector_id: str, job: dict[str, Any], message: str) -> None:
+        """Keep the blocked collection queued, isolating its old claim token."""
+        with self.transaction() as connection:
+            changed = connection.execute(
+                "UPDATE jobs SET status='queued',claimed_by=NULL,claim_until=NULL,claim_token=NULL,"
+                "progress_json=NULL,error=?,updated_at=? WHERE id=? AND claimed_by=? AND claim_token=? "
+                "AND status IN ('claimed','running') AND type IN ('archive_account','collect_latest')",
+                (message, utc_now(), job["id"], connector_id, job["claimToken"]),
+            ).rowcount
+            if changed:
+                self.set_setting("collection_pause", message, connection)
 
     def process_connector_event(
         self,
@@ -1420,9 +1741,16 @@ class Database:
                 account_values = payload.get("accounts") or ([payload["account"]] if isinstance(payload.get("account"), dict) else [])
                 pending_discoveries: list[tuple[str, list[str]]] = []
                 discovered_at_epoch = int(time.time())
+                # Removal can happen while the browser still holds this job's
+                # old account list. Check under the same write transaction as
+                # the result; neither metadata nor works may re-add a subject.
+                present_account_ids = {row["id"] for row in connection.execute("SELECT id FROM accounts")}
+                discarded_video_ids: set[str] = set()
                 for account in account_values:
                     normalized = dict(_object(account, "account"))
                     account_id = _identifier(normalized.get("id"), "account.id")
+                    if self._canonical_account_id(connection, account_id) not in present_account_ids:
+                        continue
                     completed_at = str(payload.get("completedAt") or utc_now())
                     normalized["lastCheckedAt"] = completed_at
                     normalized["lastSuccessAt"] = completed_at
@@ -1462,7 +1790,14 @@ class Database:
                         pending_discoveries.append((account_id, new_video_ids))
                     self._upsert_account(connection, normalized)
                 for video in payload.get("videos") or []:
+                    account_id = _identifier(_object(video, "video").get("accountId"), "video.accountId")
+                    if self._canonical_account_id(connection, account_id) not in present_account_ids:
+                        discarded_video_ids.add(_identifier(video.get("id"), "video.id"))
+                        continue
+                    video_id = _identifier(video.get("id"), "video.id")
                     self._upsert_video(connection, _object(video, "video"))
+                    if self.config.auto_transcribe:
+                        self.queue_transcription(video_id, connection=connection)
                 # Discovery rows reference the work row, so they are inserted
                 # only after every work of this event is saved.
                 for discovery_account_id, discovery_video_ids in pending_discoveries:
@@ -1487,7 +1822,13 @@ class Database:
                             }
                         )
                 for snapshot in snapshots:
-                    self._upsert_snapshot(connection, _object(snapshot, "snapshot"))
+                    snapshot = _object(snapshot, "snapshot")
+                    if str(snapshot.get("videoId") or "") in discarded_video_ids:
+                        continue
+                    if snapshot.get("accountId") and self._canonical_account_id(
+                            connection, _identifier(snapshot["accountId"], "snapshot.accountId")) not in present_account_ids:
+                        continue
+                    self._upsert_snapshot(connection, snapshot)
                 if job_id:
                     connection.execute(
                         "UPDATE jobs SET status='running',result_json=?,progress_json=?,error=NULL,updated_at=? WHERE id=?",

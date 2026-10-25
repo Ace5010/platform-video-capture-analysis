@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from http import HTTPStatus
 from pathlib import Path
@@ -148,6 +149,39 @@ def probe_media(path: Path, *, timeout: float = 60) -> dict[str, Any]:
 
 def has_audio_stream(probe: dict[str, Any]) -> bool:
     return any(stream.get("codec_type") == "audio" for stream in probe.get("streams") or [])
+
+
+def probe_media_bytes(payload: bytes, *, suffix: str = ".mp4", timeout: float = 20) -> dict[str, Any]:
+    """Identify codecs and size from a bounded byte slice of a media object.
+
+    Only the leading part of a container is needed to read its track headers, so
+    this never fetches a whole work. A slice that cannot be parsed is reported as
+    unusable instead of being treated as playable.
+    """
+    if not payload:
+        raise RuntimeError("媒体切片为空")
+    with tempfile.TemporaryDirectory(prefix="douyin-media-probe-") as directory:
+        path = Path(directory) / f"slice{suffix}"
+        path.write_bytes(payload)
+        result = subprocess.run(
+            [
+                _tool_path("ffprobe"), "-v", "error",
+                "-show_entries",
+                "stream=index,codec_type,codec_name,width,height:format=duration,format_name",
+                "-of", "json", str(path),
+            ],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=max(0.1, min(60, timeout)), check=False,
+        )
+    if result.returncode != 0:
+        raise RuntimeError("该媒体切片无法解析")
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("ffprobe 返回无效结果") from error
+    if not any(stream.get("codec_type") == "video" for stream in data.get("streams") or []):
+        raise RuntimeError("该媒体切片不含视频流")
+    return data
 
 
 def prepare_cloud_audio(path: Path, probe: dict[str, Any], destination: Path) -> Path | None:

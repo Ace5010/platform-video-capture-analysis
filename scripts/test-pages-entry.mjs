@@ -83,6 +83,47 @@ for (const location of ['https://other.test/login', upstreamOrigin + '/login']) 
 }
 console.log('Pages entry passed: fixed upstream, login/session/CSRF, real gateway restrictions, streamed media, preview/cross-origin rejection, no write retry. Isolated interfaces only.');
 
+// An icon-only release must preserve the live application's scripts and APIs.
+const brand = JSON.parse(await readFile(new URL('../public/app-icons/brand.json', import.meta.url), 'utf8'));
+let brandedUpstreamCalls = 0;
+let brandedAssetCalls = 0;
+const brandedEntry = createWebsiteEntry({ websiteOrigin, upstreamOrigin, brand }, async incoming => {
+  brandedUpstreamCalls++;
+  if (new URL(incoming.url).pathname.startsWith('/host/')) return Response.json({ existingData: true });
+  return new Response('<html><head><link rel="icon" href="/old.svg"><script src="/assets/keep-this.js"></script></head><body>existing application</body></html>', {
+    headers: { 'Content-Type': 'text/html', ETag: 'old-page', 'Content-Length': '999' },
+  });
+});
+const brandingEnv = { ASSETS: { fetch: async incoming => {
+  brandedAssetCalls++;
+  const file = new URL(incoming.url).pathname;
+  assert.ok(brand.files[file], 'only approved icon resources may bypass the upstream');
+  const bytes = await readFile(new URL('../public' + file, import.meta.url));
+  return new Response(incoming.method === 'HEAD' ? null : bytes);
+} } };
+const brandedHome = await brandedEntry.fetch(request('/'), brandingEnv);
+const brandedHtml = await brandedHome.text();
+assert.match(brandedHtml, /observe-coral\.ico\?v=f1e88b21cf5f/);
+assert.match(brandedHtml, /rel="apple-touch-icon"/);
+assert.match(brandedHtml, /observe-coral-brand\.css/);
+assert.match(brandedHtml, /assets\/keep-this\.js/);
+assert.match(brandedHtml, /existing application/);
+assert.doesNotMatch(brandedHtml, /old\.svg/);
+assert.equal(brandedHome.headers.get('ETag'), null);
+assert.equal(brandedHome.headers.get('Content-Length'), null);
+for (const method of ['GET', 'HEAD']) {
+  const icon = await brandedEntry.fetch(request('/app-icons/observe-coral-192.png', { method }), brandingEnv);
+  assert.equal(icon.status, 200);
+  assert.equal(icon.headers.get('Cache-Control'), 'public, max-age=0, must-revalidate');
+  assert.equal((await icon.arrayBuffer()).byteLength, method === 'HEAD' ? 0 : brand.files['/app-icons/observe-coral-192.png'].bytes);
+}
+assert.equal(brandedUpstreamCalls, 1, 'icon requests must not touch the business upstream');
+assert.deepEqual(await (await brandedEntry.fetch(request('/host/api/state'), brandingEnv)).json(), { existingData: true });
+assert.equal(brandedAssetCalls, 2, 'API data must not be routed into branding assets');
+assert.equal((await brandedEntry.fetch(new Request('https://preview.test/favicon.ico'), brandingEnv)).status, 403);
+assert.equal((await brandedEntry.fetch(request('/favicon.ico', { method: 'POST', headers, body: '{}' }), brandingEnv)).status, 405);
+console.log('Icon-only entry checks passed: approved static icons, source/cross-origin guards, HEAD, cache metadata, preserved scripts and API routing.');
+
 const builtConfig = JSON.parse(await readFile(new URL('../cloudflare-pages.json', import.meta.url), 'utf8'));
 const originalConfig = JSON.parse(await readFile(new URL('../cloudflare-host.json', import.meta.url), 'utf8'));
 const runtime = new Miniflare({

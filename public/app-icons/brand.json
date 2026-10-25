@@ -1,0 +1,54 @@
+{
+  "design": "coral-amber-no-ring",
+  "sourceSha256": "f1e88b21cf5f9463e9275e18d66f84678ce0e6c699544ca512d165912372c979",
+  "files": {
+    "/app-icons/observe-coral-32.png": {
+      "bytes": 1565,
+      "sha256": "3cfa1c08e6a2c597a7402c6202882d63a6ef176bd194feb040fae70acac0a19d"
+    },
+    "/app-icons/observe-coral-96.png": {
+      "bytes": 11407,
+      "sha256": "26432f0f7fca68f890f34ddb0535882f4a427b140d3b04cef4e9770af745778c"
+    },
+    "/app-icons/observe-coral-180.png": {
+      "bytes": 32599,
+      "sha256": "407b46568ce8794dad2640ddb68df742676cbae32dce0acfad1e6e2d39715605"
+    },
+    "/app-icons/observe-coral-192.png": {
+      "bytes": 36374,
+      "sha256": "2e86eba7fb25e7812bba602029ff771d52bcba91b2e5c8379cc9c49680dd6ca0"
+    },
+    "/app-icons/observe-coral-512.png": {
+      "bytes": 216073,
+      "sha256": "4233a7ba2fa9412b3f3717b62c020ecb0c2abd7db8ff68165e44a83eefae8ad6"
+    },
+    "/app-icons/observe-coral-maskable-512.png": {
+      "bytes": 106143,
+      "sha256": "a20102fec66554b9b73a8728c925b130968cc8d807bdce625008394113de6aa4"
+    },
+    "/app-icons/observe-coral.ico": {
+      "bytes": 87023,
+      "sha256": "c09aa95228ebc7d9b76ce6d1e04a9d433bb9e7d19cde157820262faa795e8687"
+    },
+    "/favicon.ico": {
+      "bytes": 87023,
+      "sha256": "c09aa95228ebc7d9b76ce6d1e04a9d433bb9e7d19cde157820262faa795e8687"
+    },
+    "/apple-touch-icon.png": {
+      "bytes": 32599,
+      "sha256": "407b46568ce8794dad2640ddb68df742676cbae32dce0acfad1e6e2d39715605"
+    },
+    "/favicon.svg": {
+      "bytes": 15339,
+      "sha256": "4b4df925347889a3fb6c8df975fb16bb6ce0a98345889882f101f2757706aa25"
+    },
+    "/manifest.webmanifest": {
+      "bytes": 604,
+      "sha256": "5a22acdf0fedfc67f7ab13d6bfa055bd4cedd471d42a912bc51ba90e92fee1a6"
+    },
+    "/app-icons/observe-coral-brand.css": {
+      "bytes": 491,
+      "sha256": "10332e169a742be292cefebc3df4dace96271057cbed1dfdfed04741a504d1fe"
+    }
+  }
+}

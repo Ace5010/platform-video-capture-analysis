@@ -8,10 +8,12 @@ the same player can be answered without asking the CDN twice.
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import queue
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -20,6 +22,7 @@ from typing import Any, Callable, Iterator
 
 from .browser import PreviewCandidate
 from .config import HostConfig
+from .media import probe_media_bytes
 from .recovery import safe_error
 
 # Only these public media hosts may be relayed. Every redirect hop is rechecked.
@@ -30,6 +33,9 @@ MEDIA_HOST_SUFFIXES = (
 MAX_REDIRECTS = 3
 CHUNK_BYTES = 64 * 1024
 UPSTREAM_TIMEOUT_SECONDS = 20
+# Startup reads are tiny. A stalled CDN candidate must not hold the whole
+# preview behind the longer timeout used for continuous playback.
+PROBE_TIMEOUT_SECONDS = 5
 # A resolved resource is re-resolved after this long even without an error, so a
 # long-open page cannot keep using an expired signed address.
 STALE_GENERATION_SECONDS = 6 * 60 * 60
@@ -93,7 +99,7 @@ def allowed_media_url(url: str, *, testing: bool = False) -> bool:
     return _host_allowed(url, testing=testing)
 
 
-def _open_url(url: str, byte_range: str | None = None):
+def _open_url(url: str, byte_range: str | None = None, *, timeout: float = UPSTREAM_TIMEOUT_SECONDS):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -104,7 +110,15 @@ def _open_url(url: str, byte_range: str | None = None):
     if byte_range:
         headers["Range"] = byte_range
     request = urllib.request.Request(url, headers=headers, method="GET")
-    return urllib.request.build_opener(_ValidatedRedirects).open(request, timeout=UPSTREAM_TIMEOUT_SECONDS)
+    try:
+        return urllib.request.build_opener(_ValidatedRedirects).open(request, timeout=timeout)
+    except urllib.error.HTTPError as error:
+        status = error.code
+        error.close()
+        raise PreviewError(f"媒体源返回了 {status}", 502) from None
+    except (urllib.error.URLError, OSError):
+        # Never include the signed request address or exception text.
+        raise PreviewError("媒体源连接失败", 502) from None
 
 
 def _total_from_content_range(value: str) -> int | None:
@@ -119,6 +133,34 @@ def _start_from_content_range(value: str) -> int | None:
         return None
 
 
+def _track_probe_limit(header: bytes, budget: int) -> int:
+    """Size the prefix around a front-loaded MP4 track table when present.
+
+    A fixed large prefix spends bandwidth identifying tracks whose moov box is
+    already near the front. Retain a small amount of following media for probe
+    compatibility, and always stay below the existing per-source ceiling.
+    """
+    cursor = 0
+    while cursor + 8 <= len(header):
+        size = int.from_bytes(header[cursor:cursor + 4], "big")
+        box_type = header[cursor + 4:cursor + 8]
+        header_size = 8
+        if size == 1:
+            if cursor + 16 > len(header):
+                break
+            size = int.from_bytes(header[cursor + 8:cursor + 16], "big")
+            header_size = 16
+        if size < header_size:
+            break
+        if box_type == b"moov":
+            desired = cursor + size + 32 * 1024
+            return min(budget, max(len(header), ((desired + CHUNK_BYTES - 1) // CHUNK_BYTES) * CHUNK_BYTES))
+        cursor += size
+    # Only a measured track table needs the larger ceiling. Unknown headers
+    # keep the previous small fallback rather than growing all startup reads.
+    return min(budget, 512 * 1024)
+
+
 def _header(response: Any, name: str) -> str:
     try:
         return str(response.headers.get(name) or "")
@@ -126,7 +168,8 @@ def _header(response: Any, name: str) -> str:
         return ""
 
 
-def read_upstream_range(url: str, start: int, length: int, *, testing: bool = False
+def read_upstream_range(url: str, start: int, length: int, *, testing: bool = False,
+                        timeout: float = UPSTREAM_TIMEOUT_SECONDS
                         ) -> tuple[Iterator[bytes], dict[str, Any]]:
     """Open one bounded upstream range and return positioned bytes plus facts.
 
@@ -139,13 +182,14 @@ def read_upstream_range(url: str, start: int, length: int, *, testing: bool = Fa
     if length <= 0:
         raise PreviewError("请求范围无效", 416)
     wanted_end = start + length - 1
-    response = _open_url(url, f"bytes={start}-{wanted_end}")
+    response = _open_url(url, f"bytes={start}-{wanted_end}", timeout=timeout)
     status = int(getattr(response, "status", 200))
     info: dict[str, Any] = {
         "status": status,
         "totalBytes": None,
         "acceptRanges": _header(response, "Accept-Ranges").lower(),
         "etag": _header(response, "ETag") or None,
+        "close": response.close,
     }
     skip = start
     if status == 206:
@@ -184,6 +228,8 @@ def read_upstream_range(url: str, start: int, length: int, *, testing: bool = Fa
                         continue
                 remaining -= len(chunk)
                 yield chunk
+        except (OSError, http.client.HTTPException):
+            raise PreviewError("媒体源传输中断", 502) from None
         finally:
             response.close()
 
@@ -195,8 +241,9 @@ class _CacheEntry:
     """One encoded resource version, with the bytes already relayed for it.
 
     ``buffer`` is the contiguous prefix from byte 0 (the startup prewarm and
-    ordinary sequential playback). ``tail`` holds one later contiguous block,
-    which is what a seek or a suffix range produces. Bytes are never merged
+    ordinary sequential playback), capped at 2 MiB. ``tail`` keeps the most
+    recent 2 MiB of playback; ``suffix`` preserves up to 64 KiB of already-read
+    end metadata. Bytes are never merged
     across the gap, so a byte-range answer can never splice two parts of the
     resource that were not verified to be adjacent.
     """
@@ -206,6 +253,9 @@ class _CacheEntry:
     buffer: bytearray = field(default_factory=bytearray)
     tail: bytearray = field(default_factory=bytearray)
     tail_start: int = 0
+    suffix: bytearray = field(default_factory=bytearray)
+    prefix_limit: int = 2 * 1024 * 1024
+    tail_limit: int = 2 * 1024 * 1024
     total_bytes: int | None = None
     last_used: float = field(default_factory=time.monotonic)
     upstream_supports_range: bool | None = None
@@ -215,43 +265,55 @@ class _CacheEntry:
         if not data or start < 0:
             return
         end = start + len(data)
-        if start < len(self.buffer):
-            overlap = min(len(data), len(self.buffer) - start)
-            if data[:overlap] != bytes(self.buffer[start:start + overlap]):
-                # The bytes at this offset changed, so this is not the resource
-                # version the player already received. Refuse to splice them.
+        # Verify every overlap before changing any retained window.
+        for begin, existing in ((0, self.buffer), (self.tail_start, self.tail),
+                                ((self.total_bytes or 0) - len(self.suffix), self.suffix)):
+            overlap_start = max(begin, start)
+            overlap_end = min(begin + len(existing), end)
+            if overlap_end > overlap_start and data[overlap_start - start:overlap_end - start] \
+                    != existing[overlap_start - begin:overlap_end - begin]:
                 raise GenerationChanged()
-        if start == len(self.buffer):
-            self.buffer.extend(data)
+        # Chrome sometimes asks for a small end range during startup. Preserve
+        # that already-read metadata separately so seeking does not evict it.
+        if self.total_bytes and end == self.total_bytes:
+            ending = data[-CHUNK_BYTES:]
+            if len(ending) > len(self.suffix):
+                self.suffix = bytearray(ending)
+        if start <= len(self.buffer) and start < self.prefix_limit:
+            amount = min(len(data), self.prefix_limit - start)
+            overlap = min(amount, len(self.buffer) - start)
+            self.buffer.extend(data[overlap:amount])
+            start += amount
+            data = data[amount:]
             self._absorb_tail()
-            return
-        if start < len(self.buffer):
-            return
+            if not data:
+                return
         if not self.tail:
             self.tail, self.tail_start = bytearray(data), start
-            return
-        if start < self.tail_start:
+        elif start < self.tail_start:
             self.tail, self.tail_start = bytearray(data), start
-            return
-        if start > self.tail_start + len(self.tail):
+        elif start > self.tail_start + len(self.tail):
             # A second gap: replace the previous one instead of pretending the
             # two belong to the same continuous region.
             self.tail, self.tail_start = bytearray(data), start
-            return
-        offset = start - self.tail_start
-        if offset < len(self.tail):
-            overlap = min(len(data), len(self.tail) - offset)
-            if data[:overlap] != bytes(self.tail[offset:offset + overlap]):
-                raise GenerationChanged()
-        self.tail.extend(data[overlap:])
+        else:
+            offset = start - self.tail_start
+            overlap = min(len(data), max(0, len(self.tail) - offset))
+            self.tail.extend(data[overlap:])
         self._absorb_tail()
+        excess = len(self.tail) - self.tail_limit
+        if excess > 0:
+            del self.tail[:excess]
+            self.tail_start += excess
 
     def _absorb_tail(self) -> None:
         """Fold a tail that has become adjacent to the prefix back into it."""
-        if self.tail and self.tail_start == len(self.buffer):
-            self.buffer.extend(self.tail)
-            self.tail = bytearray()
-            self.tail_start = 0
+        if self.tail and self.tail_start <= len(self.buffer) < self.tail_start + len(self.tail):
+            offset = len(self.buffer) - self.tail_start
+            amount = min(len(self.tail) - offset, max(0, self.prefix_limit - len(self.buffer)))
+            self.buffer.extend(self.tail[offset:offset + amount])
+            del self.tail[:offset + amount]
+            self.tail_start += offset + amount
 
     def slice(self, start: int, stop: int) -> bytes | None:
         if start < 0 or stop < start:
@@ -260,6 +322,9 @@ class _CacheEntry:
             return bytes(self.buffer[start:stop])
         if self.tail and start >= self.tail_start and stop <= self.tail_start + len(self.tail):
             return bytes(self.tail[start - self.tail_start:stop - self.tail_start])
+        suffix_start = (self.total_bytes or 0) - len(self.suffix)
+        if self.suffix and start >= suffix_start and stop <= self.total_bytes:
+            return bytes(self.suffix[start - suffix_start:stop - suffix_start])
         return None
 
     def covers(self, start: int, end: int) -> bool:
@@ -267,10 +332,11 @@ class _CacheEntry:
             return False
         if end < len(self.buffer):
             return True
-        return bool(self.tail) and start >= self.tail_start and end < self.tail_start + len(self.tail)
+        return (bool(self.tail) and start >= self.tail_start and end < self.tail_start + len(self.tail)) \
+            or (bool(self.suffix) and start >= (self.total_bytes or 0) - len(self.suffix) and end < self.total_bytes)
 
     def stored_bytes(self) -> int:
-        return len(self.buffer) + len(self.tail)
+        return len(self.buffer) + len(self.tail) + len(self.suffix)
 
     def known_ranges(self) -> list[tuple[int, int]]:
         ranges = []
@@ -278,7 +344,9 @@ class _CacheEntry:
             ranges.append((0, len(self.buffer)))
         if self.tail:
             ranges.append((self.tail_start, self.tail_start + len(self.tail)))
-        return ranges
+        if self.suffix:
+            ranges.append((self.total_bytes - len(self.suffix), self.total_bytes))
+        return sorted(ranges)
 
 
 class PreviewCache:
@@ -300,6 +368,7 @@ class PreviewCache:
 
     def entry(self, key: str) -> _CacheEntry | None:
         with self._lock:
+            self._evict_locked()
             entry = self._entries.get(key)
             if entry is not None:
                 entry.last_used = time.monotonic()
@@ -335,6 +404,7 @@ class PreviewCache:
 
     def used_bytes(self) -> int:
         with self._lock:
+            self._evict_locked()
             return sum(entry.stored_bytes() for entry in self._entries.values())
 
     def entry_count(self) -> int:
@@ -352,7 +422,17 @@ class PreviewCache:
             candidates = [(entry.last_used, key) for key, entry in self._entries.items()
                           if not self._pinned.get(key) and entry.stored_bytes()]
             if not candidates:
-                return
+                # Active streams already hold their outgoing byte chunks. Drop
+                # cached copies rather than exempting all pinned entries from
+                # the shared memory cap indefinitely.
+                active = [entry for entry in self._entries.values() if entry.stored_bytes()]
+                if not active:
+                    return
+                oldest = min(active, key=lambda entry: entry.last_used)
+                oldest.buffer.clear()
+                oldest.tail.clear()
+                oldest.suffix.clear()
+                continue
             _, oldest = min(candidates)
             self._entries.pop(oldest, None)
 
@@ -368,6 +448,14 @@ class PreviewSource:
     bitrate: int | None = None
     content_length: int | None = None
     codec: str | None = None
+    page_duration: float | None = None
+    # True when the host could not confirm local decodability and the viewer's
+    # own browser has to decide; the page must not promise playback then.
+    codec_unverified: bool = False
+    audio_codec: str | None = None
+    resolve_duration_ms: int = 0
+    probe_duration_ms: int = 0
+    probe_attempts: list[dict[str, Any]] = field(default_factory=list)
     resolved_at: float = field(default_factory=time.monotonic)
 
     def public(self) -> dict[str, Any]:
@@ -377,6 +465,12 @@ class PreviewSource:
             "height": self.height,
             "bitrate": self.bitrate,
             "codec": self.codec,
+            "codecUnverified": self.codec_unverified,
+            "audioCodec": self.audio_codec,
+            "durationSeconds": self.page_duration,
+            "resolveDurationMs": self.resolve_duration_ms,
+            "probeDurationMs": self.probe_duration_ms,
+            "probeAttempts": self.probe_attempts,
         }
 
 
@@ -406,25 +500,163 @@ class PreviewManager:
 
     def _resolve(self, video: dict[str, Any], *, check_cancelled: Callable[[], None] | None = None) -> PreviewSource:
         video_id = str(video["id"])
-        candidate: PreviewCandidate = self.browser.resolve_preview(
+        started = time.monotonic()
+        resolution = self.browser.resolve_preview(
             video_id, str(video.get("url") or f"https://www.douyin.com/video/{video_id}"),
             timeout=self.config.preview_resolve_timeout_seconds, check_cancelled=check_cancelled,
         )
-        metadata = candidate.metadata or {}
-        fingerprint = candidate.fingerprint
+        # The platform does not publish a codec label and lists one entry per
+        # variant, so several leading candidates are identified from their real
+        # bytes before the best playable one is chosen. Keep the collector's
+        # low-resolution preference ahead of the page's potentially larger source.
+        ordered: list[Any] = []
+        for candidate in [resolution.candidate, *resolution.alternatives, *resolution.played]:
+            if candidate.url not in {item.url for item in ordered}:
+                ordered.append(candidate)
+        probe_started = time.monotonic()
+        chosen, prefix, attempts = self._first_playable(ordered)
+        metadata = chosen.metadata or {}
+        fingerprint = chosen.fingerprint
         with self._lock:
             previous = self._sources.get(video_id)
             generation = previous.generation if previous and previous.fingerprint == fingerprint else uuid.uuid4().hex
             source = PreviewSource(
-                video_id=video_id, generation=generation, url=candidate.url, fingerprint=fingerprint,
+                video_id=video_id, generation=generation, url=chosen.url, fingerprint=fingerprint,
                 width=metadata.get("width"), height=metadata.get("height"), bitrate=metadata.get("bitrate"),
                 content_length=metadata.get("contentLength"), codec=metadata.get("codec"),
+                page_duration=resolution.page.get("durationSeconds"),
+                codec_unverified=metadata.get("codecUnverified") is True,
+                audio_codec=metadata.get("audioCodec"),
+                resolve_duration_ms=int((probe_started - started) * 1000),
+                probe_duration_ms=int((time.monotonic() - probe_started) * 1000),
+                probe_attempts=attempts,
             )
             self._sources[video_id] = source
             self._errors.pop(video_id, None)
         if not previous or previous.generation != generation:
             self.cache.drop(self._cache_key(video_id, generation))
+        # The verified prefix already fetched for track identification is also
+        # the beginning the browser needs. Keep only the chosen source's bytes
+        # in the existing capped memory cache; do not fetch them a second time.
+        entry = self._entry(source)
+        entry.total_bytes = source.content_length
+        entry.upstream_supports_range = True
+        self.cache.store(self._cache_key(video_id, generation), entry, 0, prefix)
         return source
+
+    def _first_playable(self, candidates: list[Any]) -> tuple[Any, bytes, list[dict[str, Any]]]:
+        """Return the first readable preferred codec and its verified prefix.
+
+        When the platform publishes nothing the preferred decoder set covers,
+        the best-ranked candidate is used anyway: the viewer's own browser may
+        support that codec even though it is outside the host preference set.
+        The browser attempts the actual media track rather than a codec label.
+        """
+        if not candidates:
+            raise PreviewError("没有取得经过目标校验的可用播放源", 404)
+        errors: list[str] = []
+        attempts: list[dict[str, Any]] = []
+        identified: tuple[Any, bytes] | None = None
+        for index, candidate in enumerate(candidates):
+            if index >= self.config.preview_candidate_probe_limit:
+                break
+            attempt_started = time.monotonic()
+            try:
+                probe = self._identify_candidate(candidate)
+                prefix = probe.pop("_previewPrefix")
+                attempts.append({"index": index, "elapsedMs": int((time.monotonic() - attempt_started) * 1000),
+                                 "rangeMs": probe.pop("_previewRangeMs"), "trackMs": probe.pop("_previewTrackMs"),
+                                 "outcome": "verified"})
+                if candidate.metadata.get("codec") in self.config.preview_playable_codecs:
+                    return candidate, prefix, attempts
+                if identified is None:
+                    identified = candidate, prefix
+                errors.append("候选编码不在默认支持范围内")
+            except Exception as error:
+                attempts.append({"index": index, "elapsedMs": int((time.monotonic() - attempt_started) * 1000),
+                                 "stage": candidate.metadata.get("probeStage"), "outcome": type(error).__name__,
+                                 "reason": safe_error(str(error))[:160],
+                                 "containerFormat": safe_error(str(candidate.metadata.get("containerFormat") or ""))[:40]})
+                errors.append(f"{type(error).__name__}: {error}"[:160])
+        if identified:
+            # Nothing passed the local decoder check; keep the first candidate
+            # that at least yields a plausible container, and record why.
+            candidate, prefix = identified
+            candidate.metadata = {**candidate.metadata, "codecUnverified": True}
+            return candidate, prefix, attempts
+        raise PreviewError(
+            "平台提供的候选源都无法读取，已尝试 "
+            f"{min(len(candidates), self.config.preview_candidate_probe_limit)} 个候选；"
+            f"最后原因：{errors[-1] if errors else '未知'}", 502)
+
+    def _identify_candidate(self, candidate: Any) -> dict[str, Any]:
+        """Read the leading bytes and identify the real tracks, codec unchecked."""
+        started = time.monotonic()
+        candidate.metadata = {**candidate.metadata, "probeStage": "range"}
+        collected = self._read_candidate_prefix(candidate)
+        range_ms = int((time.monotonic() - started) * 1000)
+        candidate.metadata = {**candidate.metadata, "probeStage": "tracks"}
+        track_started = time.monotonic()
+        probe = probe_media_bytes(collected, timeout=PROBE_TIMEOUT_SECONDS)
+        video_stream = next((stream for stream in probe.get("streams") or []
+                             if stream.get("codec_type") == "video"), None)
+        if video_stream is None:
+            raise PreviewError("该候选不含视频流", 502)
+        audio_stream = next((stream for stream in probe.get("streams") or []
+                             if stream.get("codec_type") == "audio"), None)
+        if audio_stream is None:
+            raise PreviewError("该候选只有画面，没有声音轨道", 502)
+        candidate.metadata = {
+            **candidate.metadata,
+            "codec": str(video_stream.get("codec_name") or "").lower() or None,
+            "width": candidate.metadata.get("width") or video_stream.get("width"),
+            "height": candidate.metadata.get("height") or video_stream.get("height"),
+            "audioCodec": str(audio_stream.get("codec_name") or "").lower() or None,
+        }
+        return {**probe, "_previewPrefix": collected, "_previewRangeMs": range_ms,
+                "_previewTrackMs": int((time.monotonic() - track_started) * 1000)}
+
+    def _read_candidate_prefix(self, candidate: Any) -> bytes:
+        # A platform-provided size allows the startup track table to be read in
+        # one round trip. Unknown sizes still use the tiny discovery range.
+        declared_size = candidate.metadata.get("contentLength")
+        initial_size = 1024
+        if isinstance(declared_size, (int, float)) and declared_size > 0:
+            initial_size = max(1024, min(CHUNK_BYTES, self.config.preview_probe_bytes,
+                                       int(declared_size * self.config.preview_prefetch_max_ratio)))
+        chunks, info = read_upstream_range(candidate.url, 0, initial_size, testing=self.config.testing,
+                                         timeout=PROBE_TIMEOUT_SECONDS)
+        total = info.get("totalBytes")
+        if info.get("status") != 206 or not total:
+            info["close"]()
+            raise UpstreamRangeUnsupported("媒体源不支持可验证的范围读取")
+        limit = min(self.config.preview_probe_bytes, int(total * self.config.preview_prefetch_max_ratio))
+        if limit < 1024:
+            info["close"]()
+            raise PreviewError("媒体源太小，无法在受限切片内验证编码", 502)
+        if initial_size > limit:
+            # A stale size must never enlarge the small-work read budget.
+            info["close"]()
+            chunks, info = read_upstream_range(candidate.url, 0, 1024, testing=self.config.testing,
+                                             timeout=PROBE_TIMEOUT_SECONDS)
+            if info.get("status") != 206 or info.get("totalBytes") != total:
+                info["close"]()
+                raise UpstreamRangeUnsupported("媒体源范围或长度发生变化")
+        collected = bytearray(b"".join(chunks))
+        candidate.metadata = {**candidate.metadata, "contentLength": total}
+        limit = _track_probe_limit(bytes(collected), limit)
+        if limit <= len(collected):
+            return bytes(collected)
+        chunks, remainder = read_upstream_range(candidate.url, len(collected), limit - len(collected), testing=self.config.testing,
+                                              timeout=PROBE_TIMEOUT_SECONDS)
+        if remainder.get("status") != 206 or remainder.get("totalBytes") != total:
+            remainder["close"]()
+            raise UpstreamRangeUnsupported("媒体源范围或长度发生变化")
+        for chunk in chunks:
+            collected.extend(chunk)
+        if len(collected) < 1024:
+            raise PreviewError("媒体源没有返回可播放的数据", 502)
+        return bytes(collected)
 
     def prepare(self, video_ids: list[str]) -> list[dict[str, Any]]:
         results = []
@@ -458,7 +690,10 @@ class PreviewManager:
             self._enqueue_prefetch(video_id, source.generation)
         except Exception as error:  # never leaks signed values
             with self._lock:
-                self._errors[video_id] = safe_error(error)[:300]
+                # PreviewError carries our own bounded source diagnosis. Keep
+                # its sanitized detail rather than returning only the class.
+                detail = str(error) if isinstance(error, PreviewError) else error
+                self._errors[video_id] = safe_error(detail)[:300]
         finally:
             with self._lock:
                 self._tasks.pop(video_id, None)
@@ -559,7 +794,8 @@ class PreviewManager:
         """Read a bounded prefix so the first player request is served locally."""
         entry = self._entry(source)
         key = self._cache_key(source.video_id, source.generation)
-        stored = entry.stored_bytes()
+        stored = len(entry.buffer)
+        initially_stored = stored
         target_seconds = max(1, self.config.preview_prefetch_seconds)
         min_stop = max(1, self.config.preview_prefetch_initial_bytes)
 
@@ -572,9 +808,15 @@ class PreviewManager:
             # The speculative budget is a ceiling for this resource, not an
             # allowance per request: bytes already relayed for the player are
             # kept, but speculation never adds on top of them.
-            return budget
+            return max(0, min(entry.prefix_limit, budget - len(entry.tail) - len(entry.suffix)))
 
-        while stored < planned_budget():
+        def enough_to_start() -> bool:
+            if stored < min_stop or not entry.total_bytes:
+                return False
+            return bool((source.bitrate and stored / max(1, source.bitrate / 8) >= target_seconds)
+                        or stored * 5 >= entry.total_bytes)
+
+        while stored < planned_budget() and not enough_to_start():
             request_bytes = min(self.config.preview_prefetch_initial_bytes, planned_budget() - stored)
             if request_bytes <= 0:
                 break
@@ -583,6 +825,7 @@ class PreviewManager:
             entry.etag = entry.etag or info["etag"]
             if info["status"] != 206:
                 entry.upstream_supports_range = False
+                info["close"]()
                 raise UpstreamRangeUnsupported()
             entry.upstream_supports_range = True
             written = 0
@@ -602,7 +845,7 @@ class PreviewManager:
                     break
             if stored >= min_stop and entry.total_bytes and stored * 5 >= entry.total_bytes:
                 break
-        return stored
+        return stored - initially_stored
 
     # ---- range relay -------------------------------------------------------
 
@@ -674,28 +917,67 @@ class PreviewManager:
         block = max(CHUNK_BYTES * 4, min(self.config.preview_prefetch_max_bytes, 2 * 1024 * 1024))
 
         def body() -> Iterator[bytes]:
+            nonlocal entry
             self.cache.pin(key)
             cursor = start
+            recoveries = 0
             try:
                 while cursor <= resolved_end:
-                    chunk = entry.slice(cursor, min(cursor + block, resolved_end + 1))
+                    # A warmed prefix may be shorter than a normal relay block.
+                    # Serve that available part immediately rather than opening
+                    # upstream again for an overlapping full block.
+                    cached_end = next((limit for begin, limit in entry.known_ranges()
+                                       if begin <= cursor < limit), cursor)
+                    chunk = entry.slice(cursor, min(cursor + block, resolved_end + 1, cached_end)) \
+                        if cached_end > cursor else None
                     if chunk:
                         yield chunk
                         cursor += len(chunk)
-                        if entry.covers(cursor, resolved_end):
-                            break
                         continue
-                    request_bytes = min(block, resolved_end - cursor + 1)
-                    written, honored = self._read_gap(entry, key, cursor, request_bytes)
-                    if not honored and cursor > 0:
-                        raise UpstreamRangeUnsupported("该媒体源不支持按范围读取，无法从中间位置继续播放")
-                    chunk = entry.slice(cursor, cursor + written)
-                    if not chunk:
-                        # A later range was requested first; report it instead
-                        # of serving bytes that are not the requested offset.
-                        raise PreviewError("内存预热缓存不完整，请重新开始播放", 409)
-                    yield chunk
-                    cursor += len(chunk)
+                    try:
+                        request_bytes = min(block, resolved_end - cursor + 1)
+                        chunks, info = read_upstream_range(entry.url, cursor, request_bytes, testing=self.config.testing)
+                        written = 0
+                        try:
+                            entry.upstream_supports_range = info["status"] == 206
+                            if not entry.upstream_supports_range and cursor > 0:
+                                raise UpstreamRangeUnsupported("该媒体源不支持按范围读取，无法从中间位置继续播放")
+                            if info["totalBytes"] is not None and info["totalBytes"] != total:
+                                raise GenerationChanged()
+                            for chunk in chunks:
+                                self.cache.store(key, entry, cursor, chunk)
+                                yield chunk
+                                cursor += len(chunk)
+                                written += len(chunk)
+                        finally:
+                            info["close"]()
+                            chunks.close()
+                        if not written:
+                            raise PreviewError("媒体源没有返回可播放的数据", 502)
+                    except GenerationChanged:
+                        raise
+                    except PreviewError as error:
+                        if error.status == 416 or recoveries >= MAX_PLAY_RECOVERIES:
+                            raise
+                        recoveries += 1
+                        # Opening the iterator succeeds before the CDN is read.
+                        # Recover here, at the first byte not yet sent, rather
+                        # than retrying only the creation of the lazy iterator.
+                        self._recover(video_id, generation)
+                        replacement = self.source_for(video_id, generation)
+                        if replacement is None:
+                            raise GenerationChanged()
+                        entry = self._entry(replacement)
+                        if (entry.total_bytes or replacement.content_length) != total:
+                            raise GenerationChanged()
+            except PreviewError as error:
+                with self._lock:
+                    current = self._sources.get(video_id)
+                    if current is not None and current.generation == generation:
+                        self._sources.pop(video_id, None)
+                        self._errors[video_id] = safe_error(str(error))[:300]
+                self.cache.drop(key)
+                raise
             finally:
                 self.cache.unpin(key)
 

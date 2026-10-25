@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { normalizeAnalysisUsage, analysisUsageSummary, formatEstimatedCost } from '../lib/analysis-usage.ts';
+import { normalizeAnalysisUsage, analysisUsageSummary, formatEstimatedCost, formatAnalysisCost } from '../lib/analysis-usage.ts';
 
 const visual = {
   requestedModel: 'qwen3.8-flash', requestCount: 1, attemptedRequestCount: 1,
@@ -46,3 +46,8 @@ assert.equal(formatEstimatedCost(0), '¥0.0000');
 assert.equal(formatEstimatedCost(0.0000008), '<¥0.0001', 'a positive tiny charge must not look free');
 assert.equal(formatEstimatedCost(0.00264), '¥0.0026');
 console.log('Analysis usage passed: exact token/audio units, combined cost, failed attempts, missing receipts, legacy/reused speech, pending state and small-charge precision.');
+const buddy = normalizeAnalysisUsage({ ...visual, provider: 'CodeBuddy', model: 'minimax-m3', credits: 1.25, knownCredits: 1.25, estimatedCostCny: null })!;
+assert.equal(analysisUsageSummary(buddy, 'ready'), '1.25 积分');
+assert.equal(formatAnalysisCost({ ...buddy, cloudAsr: complete.cloudAsr }), '1.25 积分 + 口播 ¥0.1206');
+assert.equal(formatAnalysisCost({ ...buddy, credits: null }), '1.25 积分起，部分待核对');
+assert.equal(normalizeAnalysisUsage({ ...buddy, credits: -1 })?.credits, null);

@@ -13,6 +13,7 @@ import socket
 import threading
 import time
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -23,6 +24,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
 from .analysis import AnalysisManager
+from .transcription import TranscriptionManager
 from .browser import BrowserManager
 from .compatibility import (
     CONNECTOR_FRESHNESS_SECONDS,
@@ -36,6 +38,7 @@ from .http_payload import encode_json
 from .media import cleanup_stale_temp
 from .preview import PreviewError, PreviewManager
 from .qwen import QwenClient, analysis_section_status
+from .codebuddy import analysis_client
 from .remote import GATEWAY_PORT, RemoteConnection, TunnelProcess
 from .security import (
     MIN_PASSWORD_LENGTH,
@@ -129,8 +132,13 @@ class HostHTTPServer(ThreadingHTTPServer):
         self.remote_error: str | None = None
         self.browser: BrowserManager | None = None
         self.previews: PreviewManager | None = None
+        self.transcriptions: TranscriptionManager | None = None
+        self.wechat = None
+        self.wechat_guard = threading.Lock()
 
     def server_close(self) -> None:
+        if self.transcriptions and not self.remote_connection:
+            self.transcriptions.shutdown()
         if self.previews:
             self.previews.shutdown()
         if self.browser and not self.remote_connection:
@@ -147,6 +155,12 @@ class HostRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, _format: str, *_args: Any) -> None:
         # Bodies and URLs may contain signed CDN values.  Never log requests.
         return
+
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            self.close_connection = True
 
     @property
     def config(self) -> HostConfig:
@@ -201,6 +215,28 @@ class HostRequestHandler(BaseHTTPRequestHandler):
         if not self._local_dashboard():
             raise ApiError(HTTPStatus.FORBIDDEN, message)
 
+    def _wechat_request(self, action, payload=None):
+        # Enforce this before importing the module or opening any archive. The
+        # remote gateway and LAN sessions never inherit access to WeChat data.
+        self._require_local_dashboard('微信归档仅允许在这台电脑的 localhost 工作台访问')
+        from .wechat.archive import ArchiveError
+        from .wechat.service import WeChatService
+        with self.server.wechat_guard:
+            if self.server.wechat is None:
+                self.server.wechat = WeChatService()
+            service = self.server.wechat
+        try:
+            if payload is None:
+                query = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                result = service.get(action, query)
+            else:
+                result = service.post(action, payload)
+        except ArchiveError as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from None
+        except (OSError, ValueError, KeyError):
+            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, '微信归档暂时不可用，请在读取管理中核对本机配置。') from None
+        self._send_json(HTTPStatus.OK, result)
+
     def _cors_origin(self) -> str | None:
         if self.server.remote_connection:
             return None  # The public browser talks to its same-origin Worker.
@@ -250,8 +286,13 @@ class HostRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Set-Cookie", cookie)
         for name, value in (extra_headers or {}).items():
             self.send_header(name, value)
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            # The browser navigated away or cancelled the request. This is a
+            # normal client-side abort, not a server error, so no traceback.
+            self.close_connection = True
 
     def _error(self, error: ApiError) -> None:
         headers = {"Retry-After": str(error.message.split(":", 1)[1])} if error.status == 429 and error.message.startswith("retry:") else None
@@ -365,6 +406,7 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                         "ok": True,
                         "service": "douyin-monitor-host",
                         "version": __version__,
+                        "analysisProvider": self.config.analysis_provider,
                         "hostTime": utc_now(),
                         **({"remote": self.server.tunnel.status() if self.server.tunnel else {
                             "state": "blocked" if self.server.remote_error else "not_configured",
@@ -399,6 +441,9 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._session()
+            if path.startswith('/api/wechat/'):
+                self._wechat_request(path.removeprefix('/api/wechat/'))
+                return
             if path.startswith("/api/previews/"):
                 status_match = re.fullmatch(r"/api/previews/(\d{1,32})/status", path)
                 if not status_match:
@@ -410,7 +455,14 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.OK, {"ok": True,
                         **self._preview_manager().status(status_match.group(1))})
             elif path == "/api/state":
-                state = self.database.state()
+                query = parse_qs(urlsplit(self.path).query)
+                requested_limit = (query.get("videos") or [""])[0]
+                if requested_limit and not requested_limit.isdigit():
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "作品数量范围无效")
+                # Existing clients need the complete snapshot for account history,
+                # charts and discoveries. Only explicitly limited reads are bounded.
+                video_limit = int(requested_limit) if requested_limit else None
+                state = self.database.state(video_limit=video_limit)
                 if self.server.browser:
                     state["connector"] = self.server.browser.status()
                     state["browser"] = self.server.browser.status()
@@ -435,13 +487,16 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, {"ok": True, "job": job})
             elif path in ("/api/qwen", "/api/qwen/status"):
                 secret = self.server.secrets.load()
-                client = QwenClient(self.config, secret)
+                client = analysis_client(self.config, secret)
                 self._send_json(
                     HTTPStatus.OK,
                     {
                         "ok": True,
                         "configured": client.configured,
-                        "model": str((secret or {}).get("model") or self.config.qwen_model),
+                        "model": client._model(),
+                        "analysisProvider": self.config.analysis_provider,
+                        "cloudAsrConfigured": QwenClient(self.config, secret).configured,
+                        "fallbackModel": "minimax-m3.1-flash" if self.config.analysis_provider == "codebuddy" else None,
                         "fps": self.config.qwen_fps,
                         "configurable": self._loopback(),
                     },
@@ -537,6 +592,9 @@ class HostRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(length))
         if kind != "full":
             self.send_header("Content-Range", f"bytes {resolved_start}-{resolved_end}/{total}")
+            # A cross-origin media element must be allowed to read the range
+            # metadata, otherwise seeking cannot be resolved.
+            self.send_header("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges")
         self.send_header("Cache-Control", "private, no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Cross-Origin-Resource-Policy", "same-site")
@@ -558,10 +616,15 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                 sent += len(chunk)
                 if sent >= length:
                     break
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             # The player left or seeked elsewhere: stop reading upstream instead
             # of finishing the transfer nobody is watching.
             pass
+        except PreviewError as error:
+            # The media headers have already been sent. Appending an API error
+            # response would corrupt the MP4 and its advertised byte range.
+            self.close_connection = True
+            print(f"[host-service] 播放传输中断（{type(error).__name__}）", flush=True)
         finally:
             self._close_preview_body(body)
 
@@ -646,12 +709,20 @@ class HostRequestHandler(BaseHTTPRequestHandler):
 
             self._session(require_csrf=True)
             payload = self._read_json()
+            if path.startswith('/api/wechat/'):
+                self._wechat_request(path.removeprefix('/api/wechat/'), payload)
+                return
             if path == "/api/browser/open":
                 self._require_local_dashboard("请在电脑工作台打开专用浏览器并完成抖音登录")
                 if not self.server.browser:
                     raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "专用浏览器服务未启动")
                 self.server.browser.open()
                 self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "message": "正在电脑打开抖音登录窗口"})
+            elif path == "/api/browser/resume-collection":
+                if not self.server.browser:
+                    raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "专用浏览器服务未启动")
+                self.server.browser.resume_collection()
+                self._send_json(HTTPStatus.OK, {"ok": True})
             elif path == "/api/migrate":
                 self._require_local_dashboard("旧数据迁移只能在主机 localhost 页面执行")
                 backup_name = datetime.now(timezone.utc).strftime("migration-%Y%m%dT%H%M%S-") + uuid.uuid4().hex[:8] + ".json"
@@ -679,6 +750,9 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                     raise ApiError(HTTPStatus.NOT_FOUND, "作品记录不存在")
                 results = self._preview_manager().prepare(candidate_ids)
                 self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "sources": results})
+            elif path == "/api/discoveries/clear":
+                cleared = self.database.clear_discoveries(payload.get("videoIds"))
+                self._send_json(HTTPStatus.OK, {"ok": True, "clearedCount": cleared})
             elif path == "/api/accounts/ack-updates":
                 accounts = payload.get("accounts")
                 if not isinstance(accounts, list):
@@ -689,7 +763,13 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                 account = payload.get("account")
                 if not isinstance(account, dict):
                     raise ApiError(HTTPStatus.BAD_REQUEST, "account 必须是对象")
-                self._send_json(HTTPStatus.OK, {"ok": True, "account": self.database.upsert_account(account)})
+                job, created = None, False
+                if payload.get("enqueueInitial") is True:
+                    saved, job, created = self.database.add_account_with_initial_job(account)
+                else:
+                    saved = self.database.upsert_account(account)
+                self._send_json(HTTPStatus.OK, {"ok": True, "account": saved,
+                    "reused": str(saved["id"]) != str(account.get("id")), "job": job, "created": created})
             elif path == "/api/accounts/remove":
                 removed = self.database.remove_account(str(payload.get("accountId") or ""))
                 self._send_json(HTTPStatus.OK, {"ok": True, "removed": removed})
@@ -700,8 +780,8 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                     self.database.upsert_link_video(resolved.video_id, resolved.canonical_url, resolved.source_url)
                     self._send_json(HTTPStatus.OK, {"ok": True, "reused": True, "video": self.database.get_video(resolved.video_id)})
                     return
-                if not QwenClient(self.config, self.server.secrets.load()).configured:
-                    raise ApiError(HTTPStatus.PRECONDITION_REQUIRED, "请先在主机 localhost 页面配置 Qwen API Key")
+                if not analysis_client(self.config, self.server.secrets.load()).configured:
+                    raise ApiError(HTTPStatus.PRECONDITION_REQUIRED, "视频分析服务尚未就绪，请检查主机的模型配置或 CodeBuddy 登录")
                 if not self._analysis_capture_ready():
                     raise ApiError(
                         HTTPStatus.PRECONDITION_REQUIRED,
@@ -742,6 +822,18 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                 job_payload = payload.get("payload")
                 if not isinstance(requested_type, str) or not isinstance(job_payload, dict):
                     raise ApiError(HTTPStatus.BAD_REQUEST, "type 与 payload 无效")
+                if requested_type == "transcribe_video":
+                    video_id = str(job_payload.get("videoId") or "")
+                    video = self.database.get_video(video_id)
+                    if not video:
+                        raise ApiError(HTTPStatus.NOT_FOUND, "视频不存在")
+                    if not self.config.auto_transcribe or not self.server.transcriptions:
+                        raise ApiError(HTTPStatus.PRECONDITION_REQUIRED, "电脑本地口播识别服务尚未启动")
+                    queued = self.database.queue_transcription(video_id, retry=job_payload.get("retry") is True)
+                    self.database.prioritize_transcription(video_id)
+                    self._send_json(HTTPStatus.OK, {"ok": True, "queued": queued is not None,
+                                                  "video": self.database.get_video(video_id)})
+                    return
                 canonical_type = CANONICAL_JOB_TYPES.get(requested_type)
                 if canonical_type == "analyze_video":
                     video = self.database.get_video(str(job_payload.get("videoId") or ""))
@@ -753,8 +845,8 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                         latest = next((job for job in self.database.list_jobs(500) if job.get("type") == "analyze_video" and str(job.get("payload", {}).get("videoId")) == str(video["id"])), None)
                         self._send_json(HTTPStatus.OK, {"ok": True, "reused": True, "created": False, "video": video, "job": latest})
                         return
-                    if not QwenClient(self.config, self.server.secrets.load()).configured:
-                        raise ApiError(HTTPStatus.PRECONDITION_REQUIRED, "请先在主机 localhost 页面配置 Qwen API Key")
+                    if not analysis_client(self.config, self.server.secrets.load()).configured:
+                        raise ApiError(HTTPStatus.PRECONDITION_REQUIRED, "视频分析服务尚未就绪，请检查主机的模型配置或 CodeBuddy 登录")
                     if not self._analysis_capture_ready():
                         raise ApiError(
                             HTTPStatus.PRECONDITION_REQUIRED,
@@ -960,6 +1052,8 @@ class HostRequestHandler(BaseHTTPRequestHandler):
 
 def create_server(config: HostConfig | None = None) -> HostHTTPServer:
     active_config = config or HostConfig.from_env()
+    if config is None and not active_config.testing and "DOUYIN_ANALYSIS_PROVIDER" not in os.environ:
+        active_config = replace(active_config, analysis_provider="codebuddy")
     active_config.ensure_directories()
     cleanup_stale_temp(active_config.temp_dir)
     database = Database(active_config)
@@ -978,6 +1072,10 @@ def create_server(config: HostConfig | None = None) -> HostHTTPServer:
         # On-demand playback resolves a source through the same dedicated
         # browser, so both listeners share one manager and one memory budget.
         server.previews = PreviewManager(active_config, database, server.browser)
+        if active_config.auto_transcribe:
+            server.transcriptions = TranscriptionManager(active_config, database, server.browser.capture_transcription_media)
+            analysis.local_transcriber = server.transcriptions
+            server.transcriptions.start()
     return server
 
 
@@ -989,6 +1087,7 @@ def create_remote_gateway(host: HostHTTPServer, connection: RemoteConnection, po
     # One preview manager serves both listeners, so a source resolved on the
     # local network can be streamed through the remote gateway and back.
     gateway.previews = host.previews
+    gateway.transcriptions = host.transcriptions
     return gateway
 
 
@@ -1012,7 +1111,7 @@ def main() -> None:
         print(f"[remote-host] {server.remote_error}", flush=True)
     print(
         f"[host-service] 已监听 http://{server.config.listen_host}:{server.config.listen_port} "
-        f"（数据目录 {server.config.data_dir}，Qwen {server.config.qwen_model}，完整视频 fps={server.config.qwen_fps}）",
+        f"（数据目录 {server.config.data_dir}，视频分析 {server.config.analysis_provider}）",
         flush=True,
     )
     try:

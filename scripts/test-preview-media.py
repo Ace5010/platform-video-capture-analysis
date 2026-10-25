@@ -20,11 +20,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from host_service.config import HostConfig  # noqa: E402
-from host_service.preview import PreviewSource  # noqa: E402
+from host_service.preview import PreviewSource, PreviewCache, _CacheEntry, GenerationChanged  # noqa: E402
 from host_service.server import create_server, create_remote_gateway  # noqa: E402
 
 PAYLOAD = bytes(range(256)) * 8192  # 2 MiB of deterministic container-like bytes
@@ -32,7 +33,34 @@ VIDEO_ID = "1234567890123456789"
 OTHER_VIDEO_ID = "1234567890123456790"
 ACCOUNT_ID = "preview-account"
 
-state: dict[str, Any] = {"ranged": 0, "full": 0, "served": 0, "ignoreRange": False, "path": "/media.mp4"}
+# Retain startup bytes and end metadata while a long video is played/seeked.
+# Later playback must not grow one entry to the size of the whole resource.
+long_payload = bytes(range(251)) * 40_000
+entry = _CacheEntry(url="fixture", fingerprint="v1", total_bytes=len(long_payload))
+entry.add(len(long_payload) - 4096, long_payload[-4096:])
+for offset in range(0, 7 * 1024 * 1024, 64 * 1024):
+    entry.add(offset, long_payload[offset:offset + 64 * 1024])
+assert entry.slice(0, 128 * 1024) == long_payload[:128 * 1024]
+assert entry.slice(len(long_payload) - 4096, len(long_payload)) == long_payload[-4096:]
+assert len(entry.buffer) == 2 * 1024 * 1024 and len(entry.tail) <= 2 * 1024 * 1024
+assert entry.stored_bytes() <= 4 * 1024 * 1024 + 64 * 1024
+try:
+    entry.add(0, b"changed version")
+    raise AssertionError("overlapping changed bytes must invalidate the resource")
+except GenerationChanged:
+    pass
+clock_value = 100.0
+with patch("host_service.preview.time.monotonic", side_effect=lambda: clock_value):
+    cache = PreviewCache(max_bytes=32 * 1024 * 1024, idle_seconds=900)
+    retained = cache.create("retained", "fixture", "v1")
+    cache.store("retained", retained, 0, b"startup")
+    clock_value += 180
+    assert cache.used_bytes() == 7, "repeat playback within 15 minutes should retain bytes"
+    clock_value += 901
+    assert cache.used_bytes() == 0, "idle bytes must expire"
+
+state: dict[str, Any] = {"ranged": 0, "full": 0, "served": 0, "ignoreRange": False,
+                         "rejectRemaining": 0, "path": "/media.mp4"}
 
 
 def make_handler(payload: bytes):
@@ -43,6 +71,12 @@ def make_handler(payload: bytes):
             return
 
         def _send(self, body: bool) -> None:
+            if self.path == "/expired.mp4" or state["rejectRemaining"]:
+                state["rejectRemaining"] = max(0, state["rejectRemaining"] - 1)
+                self.send_response(403)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if self.path != state["path"]:
                 self.send_response(404)
                 self.send_header("Content-Length", "0")
@@ -150,7 +184,27 @@ with tempfile.TemporaryDirectory(prefix="douyin-preview-test-") as temporary:
     try:
         import host_service.preview as preview_module
 
+        actual_open = preview_module._open_url
+        received = {"bytes": 0}
+
+        class ObservedResponse:
+            def __init__(self, response):
+                self.response = response
+
+            def __getattr__(self, name):
+                return getattr(self.response, name)
+
+            def read(self, size=-1):
+                data = self.response.read(size)
+                received["bytes"] += len(data)
+                return data
+
+        preview_module._open_url = lambda *args, **kwargs: ObservedResponse(actual_open(*args, **kwargs))
+
+        resolutions = {"count": 0}
+
         def fixture_resolve(self, video, *, check_cancelled=None):
+            resolutions["count"] += 1
             video_id = str(video["id"])
             # The isolated test host serves the verified object itself; the
             # production relay still only accepts the platform's HTTPS hosts.
@@ -218,7 +272,16 @@ with tempfile.TemporaryDirectory(prefix="douyin-preview-test-") as temporary:
         assert json.loads(raw)["sources"][0]["generation"] == generation
 
         media_path = f"/api/previews/{VIDEO_ID}/{generation}/media"
-        stored = server.previews.prewarm(server.previews.source_for(VIDEO_ID, generation))
+        # Measure explicit reads after the speculative worker has settled.
+        # Otherwise an unrelated queued prewarm can change the shared CDN byte
+        # counter while a fully cached startup range is being asserted.
+        server.previews._stopping.set()
+        server.previews._worker.join(timeout=5)
+        assert not server.previews._worker.is_alive()
+        source = server.previews.source_for(VIDEO_ID, generation)
+        added = server.previews.prewarm(source)
+        stored = server.previews._entry(source).stored_bytes()
+        assert 0 <= added <= stored, "prewarm only counts newly read bytes"
         # The speculative prewarm is what the host reads before any player
         # request, and it must stay a small fraction of the whole work.
         ratio_budget = max(1, int(len(PAYLOAD) * config.preview_prefetch_max_ratio))
@@ -226,6 +289,97 @@ with tempfile.TemporaryDirectory(prefix="douyin-preview-test-") as temporary:
         assert stored <= ratio_budget + config.preview_prefetch_initial_bytes, (
             f"prewarm stored {stored} bytes, above the bounded budget {ratio_budget}")
         assert stored < len(PAYLOAD) // 4, f"prewarm must stay far below the whole file (stored {stored})"
+
+        # A startup prefix shorter than the relay's normal block must be sent
+        # immediately. Opening the CDN again defeats the purpose of prewarming.
+        cache_key = server.previews._cache_key(VIDEO_ID, generation)
+        server.previews.cache.drop(cache_key)
+        entry = server.previews._entry(server.previews.source_for(VIDEO_ID, generation))
+        entry.total_bytes = len(PAYLOAD)
+        prefix = PAYLOAD[:128 * 1024]
+        server.previews.cache.store(cache_key, entry, 0, prefix)
+        before_startup = received["bytes"]
+        _, _, _, _, startup = server.previews.stream(VIDEO_ID, generation, 0, None)
+        try:
+            assert next(startup) == prefix, "startup must replay the cached prefix before opening upstream"
+            assert received["bytes"] == before_startup, "startup fetched already cached bytes again"
+        finally:
+            startup.close()
+
+        # An address can expire after the verified startup bytes were cached.
+        # Recovery must run while consuming the lazy body, at the same offset.
+        source = server.previews.source_for(VIDEO_ID, generation)
+        source.url = media_url.replace("/media.mp4", "/expired.mp4")
+        server.previews.cache.drop(cache_key)
+        entry = server.previews._entry(source)
+        entry.total_bytes = len(PAYLOAD)
+        server.previews.cache.store(cache_key, entry, 0, prefix)
+        before_recovery = resolutions["count"]
+        status, headers, body = request(port, "GET", media_path, cookie=cookie,
+                                        range_value="bytes=0-262143")
+        assert status == 206 and body == PAYLOAD[:262144], "expired source truncated the lazy relay"
+        assert int(headers["Content-Length"]) == len(body), "recovered body must match the advertised length"
+        assert resolutions["count"] == before_recovery + 1, "expired source must be resolved once"
+
+        # Persistent upstream failures have a bounded retry count, invalidate
+        # the unusable address, and never append JSON to an open media body.
+        server.previews.cache.drop(cache_key)
+        entry = server.previews._entry(server.previews.source_for(VIDEO_ID, generation))
+        entry.total_bytes = len(PAYLOAD)
+        server.previews.cache.store(cache_key, entry, 0, prefix)
+        before_failure = resolutions["count"]
+        state["rejectRemaining"] = 20
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        connection.request("GET", media_path, headers={"Cookie": cookie, "Range": "bytes=0-262143",
+                                                       "Origin": "http://localhost:3000"})
+        response = connection.getresponse()
+        try:
+            response.read()
+            raise AssertionError("persistent upstream failure must terminate the incomplete range")
+        except http.client.IncompleteRead as error:
+            assert error.partial == prefix, "API error bytes were appended to the MP4 body"
+        finally:
+            connection.close()
+            state["rejectRemaining"] = 0
+        assert resolutions["count"] == before_failure + preview_module.MAX_PLAY_RECOVERIES
+        assert server.previews.status(VIDEO_ID)["status"] == "error", "failed source stayed reusable"
+        fixture_resolve(server.previews, server.database.get_video(VIDEO_ID))
+
+        # A refreshed address for a different encoding must restart the player,
+        # never splice new bytes into an already-advertised resource version.
+        source = server.previews.source_for(VIDEO_ID, generation)
+        source.url = media_url.replace("/media.mp4", "/expired.mp4")
+        server.previews.cache.drop(cache_key)
+        entry = server.previews._entry(source)
+        entry.total_bytes = len(PAYLOAD)
+        server.previews.cache.store(cache_key, entry, 0, prefix)
+
+        def changed_resolve(video, *, check_cancelled=None):
+            changed = replace(source, generation="f" * 32, fingerprint="changed-encoding", url=media_url)
+            server.previews._sources[VIDEO_ID] = changed
+            return changed
+
+        with patch.object(server.previews, "_resolve", side_effect=changed_resolve):
+            _, _, _, _, changed_body = server.previews.stream(VIDEO_ID, generation, 0, 262143)
+            assert next(changed_body) == prefix
+            try:
+                next(changed_body)
+                raise AssertionError("a replacement encoding must not continue the old byte range")
+            except GenerationChanged:
+                pass
+            finally:
+                changed_body.close()
+        assert server.previews.status(VIDEO_ID)["generation"] == "f" * 32
+        fixture_resolve(server.previews, server.database.get_video(VIDEO_ID))
+
+        # A seek fills a later contiguous window over several upstream chunks.
+        # Replaying it must return every cached block, including after block one.
+        server.previews.cache.drop(server.previews._cache_key(VIDEO_ID, generation))
+        server.previews.config = replace(config, preview_prefetch_max_bytes=256 * 1024)
+        for _ in range(2):
+            status, _, body = request(port, "GET", media_path, cookie=cookie, range_value="bytes=524288-1572863")
+            assert status == 206 and body == PAYLOAD[524288:1572864], "seek window was truncated"
+        server.previews.config = config
 
         # ---- range relay ----------------------------------------------------
         status, headers, body = request(port, "GET", media_path, cookie=cookie, range_value="bytes=100-199")
@@ -269,12 +423,13 @@ with tempfile.TemporaryDirectory(prefix="douyin-preview-test-") as temporary:
         # A fresh source cannot be prewarmed when Range is unsupported.
         server.previews.cache.drop(server.previews._cache_key(VIDEO_ID, generation))
         state["served"] = 0
+        received["bytes"] = 0
         try:
             server.previews.prewarm(server.previews.source_for(VIDEO_ID, generation))
             raise AssertionError("prewarm must stop when the source ignores Range")
         except Exception as error:
             assert "范围" in str(error), error
-        assert state["served"] <= config.preview_prefetch_initial_bytes, state["served"]
+        assert received["bytes"] == 0, "unsupported Range must close before any speculative body read"
         state["ignoreRange"] = False
 
         # ---- bounded memory -------------------------------------------------
@@ -302,6 +457,16 @@ with tempfile.TemporaryDirectory(prefix="douyin-preview-test-") as temporary:
         # ---- re-check shares the same bounded budget ------------------------
         capped = replace(config, preview_cache_bytes=1024 * 1024)
         assert capped.preview_cache_bytes == 1024 * 1024
+        original_cap = server.previews.cache.max_bytes
+        server.previews.cache.max_bytes = capped.preview_cache_bytes
+        server.previews.cache.drop(server.previews._cache_key(VIDEO_ID, generation))
+        _, _, _, _, stream = server.previews.stream(VIDEO_ID, generation, 0, None)
+        streamed = bytearray()
+        for chunk in stream:
+            streamed.extend(chunk)
+            assert server.previews.cache.used_bytes() <= capped.preview_cache_bytes, "active playback exceeded memory cap"
+        assert bytes(streamed) == PAYLOAD, "memory eviction interrupted active playback"
+        server.previews.cache.max_bytes = original_cap
     finally:
         gateway.shutdown()
         gateway.server_close()
@@ -312,5 +477,6 @@ with tempfile.TemporaryDirectory(prefix="douyin-preview-test-") as temporary:
         thread.join(timeout=5)
 
 media.shutdown()
-print("Preview media passed: prepare/status, bounded prewarm, GET/HEAD/206/416 ranges, "
+print("Preview media passed: prepare/status, bounded prewarm, lazy expired-source recovery, bounded failures, "
+      "encoding isolation, GET/HEAD/206/416 ranges, "
       "host cache reuse, gateway access control, Range-ignoring upstream, memory cap, retired media paths.")

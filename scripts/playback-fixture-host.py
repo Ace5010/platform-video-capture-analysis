@@ -28,6 +28,7 @@ from host_service.server import create_server  # noqa: E402
 
 FIXTURE_ACCOUNT_ID = "browser-fixture"
 FIXTURE_VIDEO_IDS = ["1234567890123456700", "1234567890123456701", "1234567890123456702"]
+FIXTURE_LINK_IDS = ["1234567890123456703", "1234567890123456704"]
 STALL_AFTER_BYTES = 192 * 1024
 
 state: dict[str, Any] = {
@@ -47,7 +48,7 @@ stall_event = threading.Event()
 def build_media(path: Path) -> None:
     subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
         "-i", "testsrc=size=320x568:rate=30", "-f", "lavfi", "-i", "sine=frequency=440",
-        "-t", "8", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+        "-t", "30", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
         "-movflags", "+faststart", "-y", str(path)], check=True, timeout=60)
 
 
@@ -147,10 +148,34 @@ with tempfile.TemporaryDirectory(prefix="douyin-playback-fixture-") as temporary
             server.database._upsert_video(connection, {"id": video_id, "accountId": FIXTURE_ACCOUNT_ID,
                 "url": f"https://www.douyin.com/video/{video_id}", "title": f"测试作品 {index + 1}",
                 "description": f"测试作品 {index + 1}", "publishedAt": "2026-09-28T10:00:00Z",
-                "durationSeconds": 8, "likeCount": index, "commentCount": 0,
+                "durationSeconds": 30, "likeCount": index, "commentCount": 0,
                 "favoriteCount": 0, "shareCount": 0})
         candidate_metadata[video_id] = {"width": 320, "height": 568, "bitrate": 300_000,
             "contentLength": len(payload), "codec": "h264"}
+
+    for video_id in FIXTURE_LINK_IDS:
+        candidate_metadata[video_id] = dict(candidate_metadata[FIXTURE_VIDEO_IDS[0]])
+
+    def fixture_link(video_id: str, stage: str):
+        assert video_id in FIXTURE_LINK_IDS
+        url = f"https://www.douyin.com/video/{video_id}"
+        video = server.database.upsert_link_video(video_id, url, url)
+        reused = bool(video.get("analysis"))
+        video.update({"title": f"链接测试作品 {video_id[-1]}", "authorName": "链接测试作者",
+            "durationSeconds": 30, "analysisStatus": "ready" if reused else "processing"})
+        if stage in ("TRANSCRIPT", "COMPLETE"):
+            video.update({"transcript": "隔离口播结果：演示视频与结果同时呈现。", "transcriptStatus": "ready"})
+        if stage == "COMPLETE":
+            video.update({"analysisStatus": "ready", "analysis": {
+                "schemaVersion": "remotion-plan-v3", "contentAnalysis": {
+                    "quickOverview": "隔离内容结果：视频播放时，结果更新不会重置播放。",
+                    "keyInformation": "具体信息示例", "claimsAndEvidence": "补充解释示例",
+                    "visualDemonstrations": "画面演示示例", "scopeAndLimits": "适用范围示例"},
+                **{key: f"隔离制作规范：{key}" for key in ["projectSettings", "assetList", "shotTimeline",
+                    "visualDesign", "motionAndTransitions", "audioAndCaptions", "productionSteps", "uncertainties"]}}})
+        with server.database.transaction() as connection:
+            server.database._upsert_video(connection, video)
+        return {"ok": True, "reused": reused, "video": server.database.get_video(video_id)}
 
     import host_service.preview as preview_module
 
@@ -164,7 +189,7 @@ with tempfile.TemporaryDirectory(prefix="douyin-playback-fixture-") as temporary
             generation = previous.generation if previous and previous.fingerprint == fingerprint else uuid.uuid4().hex
             source = PreviewSource(video_id=video_id, generation=generation, url=candidate_url,
                 fingerprint=fingerprint, width=metadata["width"], height=metadata["height"],
-                bitrate=metadata["bitrate"], content_length=metadata["contentLength"], codec=metadata["codec"])
+                bitrate=metadata["bitrate"], content_length=metadata["contentLength"], codec=metadata["codec"], audio_codec="aac")
             self._sources[video_id] = source
             self._errors.pop(video_id, None)
         if not previous or previous.generation != generation:
@@ -181,6 +206,13 @@ with tempfile.TemporaryDirectory(prefix="douyin-playback-fixture-") as temporary
             command = line.strip()
             if command == "STATE":
                 print(json.dumps({key: value for key, value in state.items() if key != "cdnUrl"}), flush=True)
+            elif command.split(":", 1)[0] in ("LINK", "TRANSCRIPT", "COMPLETE"):
+                stage, video_id = command.split(":", 1)
+                print(json.dumps(fixture_link(video_id, stage)), flush=True)
+            elif command == "RESET_PREVIEWS":
+                with server.previews._lock:
+                    server.previews._sources.clear()
+                print("OK", flush=True)
             elif command == "IGNORE_RANGE":
                 state["ignoreRange"] = True
                 print("OK", flush=True)

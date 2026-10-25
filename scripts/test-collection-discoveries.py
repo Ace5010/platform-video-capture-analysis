@@ -11,6 +11,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import replace
+from contextlib import closing
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -219,6 +220,78 @@ def run() -> None:
             connection.close()
         require("video_media" not in tables, "the retired media registry must be dropped on migration")
 
+        # ---- dismiss notifications, preserving all saved business data -----
+        displayed_ids = [item["videoId"] for item in database.recent_discoveries()[0]]
+        concurrent = video("7530000000000000010")
+        emit("concurrent-discovery", "latest", account_payload("latest", [concurrent, *observed]))
+        with database.transaction() as connection:
+            database._upsert_video(connection, {"id": fresh["id"], "accountId": "account-a",
+                "transcript": "保存的完整口播。", "analysis": {"saved": True},
+                "analysisUsage": {"estimatedCostCny": 0.2}})
+        history_job, _ = database.create_job("analyze_video", {"accountId": "account-a",
+            "videoId": fresh["id"], "analysisVersion": "clear-fixture"})
+        database.save_analysis_failure(history_job["id"], "隔离测试的历史记录")
+        with closing(database.connect()) as connection:
+            preserved = {table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY id")]
+                for table in ("accounts", "videos", "snapshots", "analysis_runs", "jobs")}
+            receipts = [tuple(row) for row in connection.execute("SELECT * FROM processed_events ORDER BY event_id")]
+            markers = {row["video_id"]: dict(row) for row in connection.execute("SELECT * FROM collection_discoveries")}
+        require(database.clear_discoveries(displayed_ids) == 4, "clear must dismiss the complete displayed list")
+        items, counts = database.recent_discoveries()
+        require([item["videoId"] for item in items] == [concurrent["id"]] and counts == {"account-a": 1},
+                "a discovery received after the click must remain visible")
+        require(database.clear_discoveries(displayed_ids) == 0, "repeating a clear must be idempotent")
+        require(database.clear_discoveries([]) == 0, "an empty clear must be harmless")
+        with closing(database.connect()) as connection:
+            for table, before_rows in preserved.items():
+                require([tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY id")] == before_rows,
+                        f"clear must preserve every {table} row, including transcripts, analysis and costs")
+            require([tuple(row) for row in connection.execute("SELECT * FROM processed_events ORDER BY event_id")] == receipts,
+                    "clear must preserve event receipts")
+            for row in connection.execute("SELECT * FROM collection_discoveries"):
+                before_row = markers[row["video_id"]]
+                require(all(row[key] == value for key, value in before_row.items() if key != "cleared_at"),
+                        "clear must preserve marker timestamps and provenance")
+                require(bool(row["cleared_at"]) == (row["video_id"] in displayed_ids),
+                        "only requested markers may be marked cleared")
+        for invalid in (None, "all", [concurrent["id"], "bad-id"], [True], [concurrent["id"]] * 501):
+            try:
+                database.clear_discoveries(invalid)
+                require(False, "invalid clear input must be rejected")
+            except ValueError:
+                pass
+        require(len(database.recent_discoveries()[0]) == 1, "invalid input must not partially clear a valid entry")
+        emit("clear-recheck", "latest", account_payload("latest", [concurrent, *observed]))
+        emit("latest-1", "latest", account_payload("latest", [fresh, *history[:2]]))
+        require([item["videoId"] for item in database.recent_discoveries()[0]] == [concurrent["id"]],
+                "rechecking or replaying an old event must not restore a cleared notification")
+        reopened = Database(config)
+        reopened.initialize()
+        require([item["videoId"] for item in reopened.state()["discoveries"]] == [concurrent["id"]],
+                "clear must survive database reopen and page reload")
+        next_work = video("7530000000000000011")
+        emit("after-clear", "latest", account_payload("latest", [next_work, concurrent, *observed]))
+        require([item["videoId"] for item in database.recent_discoveries()[0]] == [next_work["id"], concurrent["id"]],
+                "a later genuinely new work must still appear")
+
+        # Rebuild only this isolated fixture's markers in the pre-clear schema.
+        # Additive migration must keep every legacy row and leave it visible.
+        with database.transaction() as connection:
+            legacy_rows = [tuple(row) for row in connection.execute(
+                "SELECT account_id,video_id,discovered_at,origin_job_id,origin_event_id,origin FROM collection_discoveries")]
+            connection.execute("DROP TABLE collection_discoveries")
+            connection.execute("CREATE TABLE collection_discoveries (account_id TEXT NOT NULL,video_id TEXT NOT NULL,"
+                "discovered_at REAL NOT NULL,origin_job_id TEXT,origin_event_id TEXT,origin TEXT NOT NULL DEFAULT 'manual_latest',"
+                "PRIMARY KEY(account_id,video_id))")
+            connection.executemany("INSERT INTO collection_discoveries VALUES(?,?,?,?,?,?)", legacy_rows)
+        reopened.initialize()
+        with closing(reopened.connect()) as connection:
+            migrated_rows = [tuple(row)[:-1] for row in connection.execute("SELECT * FROM collection_discoveries")]
+            require(migrated_rows == legacy_rows, "migration must keep every legacy marker field")
+            require(all(row["cleared_at"] is None for row in connection.execute("SELECT * FROM collection_discoveries")),
+                    "legacy discoveries must not be dismissed during migration")
+        require(len(reopened.recent_discoveries()[0]) == 6, "migration must keep legacy discovery eligibility")
+
         # ---- removing an account clears its entries -------------------------
         database.remove_account("account-a")
         items, counts = database.recent_discoveries()
@@ -232,4 +305,5 @@ if FAILURES:
         print(f" - {failure}")
     raise SystemExit(1)
 print("Collection discoveries passed: 72-hour window, append-only, idempotency, archive/link exclusion, "
-      "follower field group, late responses, real zero, retired media state and account removal.")
+      "follower field group, late responses, real zero, persistent clear, concurrency, data preservation, "
+      "legacy migration, retired media state and account removal.")
