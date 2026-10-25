@@ -64,6 +64,7 @@ class GenerationManager:
 
     def _execute(self, job):
         job = dict(job)
+        result = None
         try:
             variant = 'ui-' + job['id']
             result = self.runner(job['date'], model=job['model'], effort=job['effort'],
@@ -85,7 +86,12 @@ class GenerationManager:
         except ArchiveError as error:
             job.update(status='failed', error=str(error))
         except Exception as error:
-            job.update(status='failed', error=f'总结结果发布失败（{type(error).__name__}），请检查后台运行日志。')
+            action = '总结结果发布失败' if result is not None else '总结执行失败'
+            job.update(status='failed', error=f'{action}（{type(error).__name__}），请检查后台运行日志。')
+            if result is not None:
+                for key in ('run_id', 'credits', 'credit_source', 'elapsed_seconds'):
+                    if key in result:
+                        job[key] = result[key]
         finally:
             job['finished_at'] = datetime.now(timezone.utc).isoformat()
             with self.guard:

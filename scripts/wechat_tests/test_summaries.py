@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from host_service.wechat.archive import ArchiveError, build_export, save_export
 from host_service.wechat.summaries import day_bounds, covers_day, prepare_day, validate_summary, summary_for_browser, summary_scope, TZ
 from host_service.wechat.summarize import parse_result, billing_metadata, run, save, check_effort
+from host_service.wechat.generation import GenerationManager
 
 
 class SummaryTests(unittest.TestCase):
@@ -146,14 +147,109 @@ class SummaryTests(unittest.TestCase):
         valid=validate_summary(value,self.prepared)
         self.assertEqual(valid['topics'][0]['blocks'][0]['speaker'],'p001')
         self.assertEqual(validate_summary(valid,self.prepared),valid)
-        for mutation in ('wrong_speaker','unknown_reference','unknown_mention','duplicate_fields'):
+        for mutation in ('wrong_speaker','unknown_reference','unknown_mention'):
             bad=copy.deepcopy(value)
             if mutation=='wrong_speaker': bad['topics'][0]['blocks'][0]['speaker']='p002'
             elif mutation=='unknown_reference': bad['topics'][0]['blocks'][0]['refs']=['other-day']
             elif mutation=='unknown_mention': bad['topics'][0]['summary']='p999提出建议'
-            else: bad['topics'][0]['points']=['重复要点']
             with self.subTest(mutation=mutation), self.assertRaises(ArchiveError):
                 validate_summary(bad,self.prepared)
+
+    def test_new_formats_ignore_obsolete_fields_without_changing_input_or_sources(self):
+        refs = list(self.prepared['sources'])
+        for version in (2, 3):
+            value = {'format_version': version, 'overview': '当日群聊总结',
+                     'highlights': {'unexpected': 'p999'}, 'unknown_extra': ['ignored'],
+                     'topics': [{'title': '测试话题', 'summary': '测试正文', 'refs': refs,
+                                 'discussion_refs': refs, 'blocks': [],
+                                 'points': 'wrong type', 'views': [{'speaker': 'p999', 'refs': ['foreign']}],
+                                 'details': {'unexpected': True}, 'outcome': 42}],
+                     'excluded_messages': []}
+            original = copy.deepcopy(value)
+            with self.subTest(version=version):
+                clean = validate_summary(value, self.prepared)
+                self.assertEqual(value, original)
+                self.assertEqual(clean['highlights'], [])
+                self.assertEqual(clean['topics'][0]['views'], [])
+                self.assertEqual(clean['topics'][0]['points'], [])
+                self.assertEqual(clean['topics'][0]['details'], '')
+                self.assertEqual(clean['topics'][0]['outcome'], '')
+                self.assertEqual(clean['topics'][0]['refs'], refs)
+                self.assertEqual(validate_summary(clean, self.prepared), clean)
+                bad = copy.deepcopy(value)
+                bad['topics'][0]['refs'] = ['foreign']
+                with self.assertRaisesRegex(ArchiveError, '本日归档以外'):
+                    validate_summary(bad, self.prepared)
+        legacy = copy.deepcopy(self.summary)
+        legacy['highlights'] = ['旧版重点']
+        self.assertEqual(validate_summary(legacy, self.prepared)['highlights'], ['旧版重点'])
+
+    def test_paid_result_failure_reaches_job_with_reason_and_usage(self):
+        refs = list(self.prepared['sources'])
+        valid = {'format_version': 3, 'overview': '当日群聊总结', 'highlights': ['多余重点'],
+                 'topics': [{'title': '话题', 'summary': '正文', 'refs': refs,
+                             'discussion_refs': refs}], 'excluded_messages': []}
+        for mode, reason in [('coverage', '全天消息存在遗漏或冲突'),
+                             ('quote', '原话内容或人物与来源不一致'),
+                             ('json', '模型返回的总结不是有效 JSON')]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                old = {'version': 'old'}
+                save(root / 'summaries' / (self.day + '.json'), old)
+                value = copy.deepcopy(valid)
+                if mode == 'coverage':
+                    value['topics'][0]['refs'] = refs[:1]
+                    value['topics'][0]['discussion_refs'] = refs[:1]
+                elif mode == 'quote':
+                    value['topics'][0]['quotes'] = [{'ref': refs[0], 'speaker': 'p001', 'text': '改写原话'}]
+                result = '{invalid json' if mode == 'json' else json.dumps(value)
+                raw = json.dumps([{'type': 'message', 'role': 'assistant', 'providerData': {
+                    'model': 'fixture', 'rawUsage': {'credit': .22}}},
+                    {'type': 'result', 'subtype': 'success', 'result': result}])
+                def process(*args, **kwargs):
+                    def communicate(payload, timeout):
+                        kwargs['stdout'].write(raw.encode())
+                        kwargs['stdout'].flush()
+                    return SimpleNamespace(pid=123, returncode=0, communicate=communicate)
+                manager = GenerationManager(root)
+                job = {'id': 'a' * 32, 'date': self.day, 'model': 'fixture', 'effort': 'high',
+                       'started_at': '2026-10-21T00:00:00Z'}
+                with patch('host_service.wechat.summarize.prepare_day', return_value=self.prepared), \
+                     patch('host_service.wechat.summarize.check_effort'), \
+                     patch('host_service.wechat.summarize.subprocess.Popen', side_effect=process) as call:
+                    manager._execute(job)
+                latest = manager.latest(self.day)
+                self.assertEqual(latest['status'], 'failed')
+                self.assertIn(reason, latest['error'])
+                self.assertEqual(latest['credits'], .22)
+                self.assertEqual(latest['error_stage'], 'validate')
+                receipt = json.loads((root / 'summary-runs' / latest['run_id'] / 'receipt.json').read_text(encoding='utf-8'))
+                self.assertEqual(latest['error'], receipt['error'])
+                self.assertEqual(latest['elapsed_seconds'], receipt['elapsed_seconds'])
+                self.assertEqual(json.loads((root / 'summaries' / (self.day + '.json')).read_text()), old)
+                self.assertTrue((root / 'summary-runs' / (self.day + '.lock')).exists())
+                call.assert_called_once()
+
+    def test_extra_fields_publish_with_one_call(self):
+        refs = list(self.prepared['sources'])
+        value = {'format_version': 3, 'overview': '当日群聊总结', 'highlights': ['多余重点'],
+                 'topics': [{'title': '话题', 'summary': '正文', 'refs': refs,
+                             'discussion_refs': refs, 'points': ['多余要点']}], 'excluded_messages': []}
+        def process(*args, **kwargs):
+            def communicate(payload, timeout):
+                kwargs['stdout'].write(json.dumps({'subtype': 'success', 'result': value}).encode())
+                kwargs['stdout'].flush()
+            return SimpleNamespace(pid=123, returncode=0, communicate=communicate)
+        manager = GenerationManager(self.root)
+        with patch('host_service.wechat.summarize.check_effort'), \
+             patch('host_service.wechat.summarize.subprocess.Popen', side_effect=process) as call:
+            manager._execute({'id': 'b' * 32, 'date': self.day, 'model': 'fixture', 'effort': 'high',
+                              'started_at': '2026-10-21T00:00:00Z'})
+        latest = manager.latest(self.day)
+        self.assertEqual(latest['status'], 'complete')
+        self.assertEqual(summary_for_browser(self.root, self.day)['summary']['highlights'], [])
+        self.assertFalse((self.root / 'summary-runs' / (self.day + '.lock')).exists())
+        call.assert_called_once()
 
     def test_invisible_nickname_gets_stable_display_name(self):
         from host_service.wechat.summaries import display_name
