@@ -190,7 +190,7 @@ class SummaryTests(unittest.TestCase):
                  'topics': [{'title': '话题', 'summary': '正文', 'refs': refs,
                              'discussion_refs': refs}], 'excluded_messages': []}
         for mode, reason in [('coverage', '全天消息存在遗漏或冲突'),
-                             ('quote', '原话内容或人物与来源不一致'),
+                             ('foreign', '总结引用了本日归档以外的消息'),
                              ('json', '模型返回的总结不是有效 JSON')]:
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -200,8 +200,8 @@ class SummaryTests(unittest.TestCase):
                 if mode == 'coverage':
                     value['topics'][0]['refs'] = refs[:1]
                     value['topics'][0]['discussion_refs'] = refs[:1]
-                elif mode == 'quote':
-                    value['topics'][0]['quotes'] = [{'ref': refs[0], 'speaker': 'p001', 'text': '改写原话'}]
+                elif mode == 'foreign':
+                    value['topics'][0]['refs'] = ['other-day']
                 result = '{invalid json' if mode == 'json' else json.dumps(value)
                 raw = json.dumps([{'type': 'message', 'role': 'assistant', 'providerData': {
                     'model': 'fixture', 'rawUsage': {'credit': .22}}},

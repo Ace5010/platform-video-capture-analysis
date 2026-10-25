@@ -11,7 +11,7 @@ import time
 import uuid
 
 from .archive import ArchiveError
-from .summaries import prepare_day, validate_summary, model_messages
+from .summaries import prepare_day, validate_summary, compact_model_messages, repair_summary
 
 ROOT = Path(__file__).resolve().parent
 from .paths import runtime_root, data_root
@@ -47,7 +47,7 @@ def result_record(raw):
     return outer
 
 
-def parse_result(raw, prepared):
+def parse_result(raw, prepared, reference_map=None):
     outer = result_record(raw)
     if outer.get('is_error') or outer.get('subtype') not in (None, 'success'):
         raise ArchiveError('CLI 未成功完成；已保留执行记录，不自动重试')
@@ -60,12 +60,13 @@ def parse_result(raw, prepared):
             result = json.loads(result)
         except ValueError:
             raise ArchiveError('模型返回的总结不是有效 JSON') from None
+    result, repairs = repair_summary(result, prepared, reference_map)
     checked = validate_summary(result, prepared)
     for topic in checked['topics']:
         for view in topic['views']:
             if any(prepared['sources'][ref]['speaker'] != view['speaker'] for ref in view['refs']):
                 raise ArchiveError('单列观点混用了不同发言者的引用，已阻止发布')
-    return outer, checked
+    return dict(outer, local_repairs=repairs), checked
 
 
 def billing_metadata(raw):
@@ -137,11 +138,13 @@ def run(day, model='hy4-preview', data_dir=None, effort='high', variant=None):
               'editorial_contract': 'topic-synthesis-v3',
               'partial': prepared['partial'], 'coverage_end': prepared['coverage_end']}
     save(folder / 'receipt.json', record)
+    messages, reference_map = compact_model_messages(prepared)
+    save(folder / 'reference-map.json', {'source_hash': prepared['source_hash'], 'references': reference_map})
     payload = json.dumps({'task': '微信群单日总结验证 ' + day,
                           'date': day, 'timezone': 'Asia/Shanghai',
                           'coverage': {'full_day': prepared['complete'], 'end_exclusive': prepared['coverage_end'],
                                        'instruction': '仅总结输入覆盖的时段；未结束的一天不能描述成全天结论。'},
-                          'messages': model_messages(prepared)}, ensure_ascii=False)
+                          'messages': messages}, ensure_ascii=False)
     record['input_sha256'] = hashlib.sha256(payload.encode('utf-8')).hexdigest()
     prompt_bytes = (ROOT / 'summary-prompt.txt').read_bytes()
     record['prompt_sha256'] = hashlib.sha256(prompt_bytes).hexdigest()
@@ -187,7 +190,8 @@ def run(day, model='hy4-preview', data_dir=None, effort='high', variant=None):
         if process.returncode:
             raise ArchiveError(f'CLI 执行失败（退出码 {process.returncode}），已保留执行记录与用量')
         stage = 'validate'
-        _, summary = parse_result(raw, prepared)
+        parsed, summary = parse_result(raw, prepared, reference_map)
+        record['local_repairs'] = parsed['local_repairs']
         if summary.get('format_version') != 3:
             raise ArchiveError('模型未遵守话题整合规范 v3，已保留回执，不自动重试')
         stage = 'save'

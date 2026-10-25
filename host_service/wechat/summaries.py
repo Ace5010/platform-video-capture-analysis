@@ -1,5 +1,6 @@
 """按自然日准备最小输入、校验总结及原文引用。真实正文只留在本机或交给已授权的 Buddy 调用。"""
 from datetime import datetime, timedelta, timezone
+import copy
 import json
 from pathlib import Path
 import re
@@ -95,7 +96,9 @@ def prepare_day(data_dir, day):
             replies['m_' + digest(message['platformMessageId'])[:16]] = 'm_' + digest(target)[:16]
     return {"date": day, "group_name": config["group_name"], **summary_scope(ranges, day),
             "messages": minimal, "sources": sources, "people": {p["id"]: p["name"] for p in people.values()},
-            "source_hash": digest(payload), "message_count": len(selected), "replies": replies}
+            "source_hash": digest(payload), "message_count": len(selected), "replies": replies,
+            "external_source_ids": {'m_' + digest(m['platformMessageId'])[:16] for m in all_messages
+                                    if not start <= m['timestamp'] < end}}
 
 
 def readable_content(content):
@@ -134,6 +137,137 @@ def readable_content(content):
 def model_messages(prepared):
     return [dict(m, content=readable_content(m['content']),
                  reply_to=prepared.get('replies', {}).get(m['id'], '')) for m in prepared['messages']]
+
+
+def compact_model_messages(prepared):
+    """Short run-local IDs reduce copy errors; persisted IDs remain unchanged."""
+    aliases = {key: f'm{index:04}' for index, key in enumerate(prepared['sources'], 1)}
+    messages = [dict(message, id=aliases[message['id']],
+                     reply_to=aliases.get(message['reply_to'], '')) for message in model_messages(prepared)]
+    return messages, {alias: key for key, alias in aliases.items()}
+
+
+def repair_summary(value, prepared, reference_map=None):
+    """Repair only verifiable metadata; never infer missing prose or topics.
+
+    The strict validator still runs afterwards. Every change is auditable and
+    the original model response is kept by the caller.
+    """
+    if not isinstance(value, dict) or value.get('format_version') != 3:
+        return value, []
+    value = copy.deepcopy(value)
+    repairs, slots = [], []
+    sources = prepared['sources']
+    reference_map = reference_map or {}
+    if any(key not in sources for key in reference_map.values()):
+        raise ArchiveError('总结消息编号映射与当前归档不一致')
+
+    def add_refs(obj, key, path):
+        ids = obj.get(key)
+        if isinstance(ids, str):
+            ids = obj[key] = [ids]
+            repairs.append({'kind': 'reference_list', 'path': path})
+        if isinstance(ids, list):
+            slots.extend((ids, i, path) for i in range(len(ids)))
+
+    topics = value.get('topics')
+    if not isinstance(topics, list):
+        return value, repairs
+    for n, topic in enumerate(topics):
+        if not isinstance(topic, dict):
+            continue
+        path = f'topics[{n}]'
+        for key in ('refs', 'discussion_refs'):
+            add_refs(topic, key, path + '.' + key)
+        for key in ('blocks', 'comparisons'):
+            if isinstance(topic.get(key), list):
+                for i, row in enumerate(topic[key]):
+                    if isinstance(row, dict):
+                        add_refs(row, 'refs', f'{path}.{key}[{i}].refs')
+        if isinstance(topic.get('quotes'), list):
+            slots.extend((quote, 'ref', path + '.quotes') for quote in topic['quotes'] if isinstance(quote, dict))
+    if isinstance(value.get('excluded_messages'), list):
+        slots.extend((entry, 'id', 'excluded_messages') for entry in value['excluded_messages'] if isinstance(entry, dict))
+    for obj, key, _ in slots:
+        ref = obj.get(key) if isinstance(obj, dict) else obj[key]
+        if isinstance(ref, str):
+            obj[key] = reference_map.get(ref.strip(), ref.strip())
+
+    # Legacy long IDs: a unique 12-hex prefix plus an otherwise unassigned
+    # source can repair a corrupted suffix. Known cross-day IDs never qualify.
+    assigned = {ref for topic in topics if isinstance(topic, dict)
+                for ref in (topic.get('discussion_refs') if isinstance(topic.get('discussion_refs'), list) else [])
+                if isinstance(ref, str)}
+    excluded = {entry.get('id') for entry in value.get('excluded_messages', [])
+                if isinstance(entry, dict) and isinstance(entry.get('id'), str)} if isinstance(value.get('excluded_messages', []), list) else set()
+    missing = set(sources) - assigned - excluded
+    unknown = {obj.get(key) if isinstance(obj, dict) else obj[key] for obj, key, _ in slots
+               if isinstance(obj.get(key) if isinstance(obj, dict) else obj[key], str)} - set(sources)
+    corrections = {}
+    for ref in unknown - prepared.get('external_source_ids', set()):
+        if re.fullmatch(r'm_[0-9a-f]{16}', ref):
+            candidates = [key for key in sources if key.startswith(ref[:14])]
+            if len(candidates) == 1 and candidates[0] in missing:
+                corrections[ref] = candidates[0]
+    corrections = {ref: target for ref, target in corrections.items()
+                   if list(corrections.values()).count(target) == 1}
+    for old, new in sorted(corrections.items()):
+        repairs.append({'kind': 'reference_suffix', 'from': old, 'to': new})
+    for obj, key, _ in slots:
+        ref = obj.get(key) if isinstance(obj, dict) else obj[key]
+        if isinstance(ref, str) and ref in corrections:
+            obj[key] = corrections[ref]
+
+    all_assigned = set()
+    for n, topic in enumerate(topics):
+        if not isinstance(topic, dict):
+            continue
+        quotes = topic.get('quotes', [])
+        if isinstance(quotes, list):
+            kept = []
+            for q in quotes:
+                if not isinstance(q, dict) or not isinstance(q.get('ref'), str) or q['ref'] not in sources:
+                    kept.append(q)  # Unknown source IDs still fail strict validation.
+                    continue
+                src = sources[q['ref']]
+                own = readable_content(src['content']).split('\n引用', 1)[0]
+                text = q.get('text')
+                if isinstance(text, str) and text.strip() and q.get('speaker') == src['speaker'] and text.strip() in own:
+                    kept.append(q)
+                else:
+                    # Quotes are optional. Drop unfaithful quotations; retain
+                    # the full discussion and authored topic prose unchanged.
+                    repairs.append({'kind': 'omit_unfaithful_quote', 'topic': n, 'ref': q['ref']})
+            # Extra optional quotations do not invalidate an otherwise complete
+            # discussion. The selected quotations remain exact source text.
+            if len(kept) > 2:
+                repairs.append({'kind': 'limit_optional_quotes', 'topic': n, 'count': len(kept) - 2})
+                kept = kept[:2]
+            topic['quotes'] = kept
+        evidence = list(topic['refs']) if isinstance(topic.get('refs'), list) else []
+        for field in ('blocks', 'comparisons'):
+            for row in topic.get(field, []) if isinstance(topic.get(field, []), list) else []:
+                if isinstance(row, dict) and isinstance(row.get('refs'), list):
+                    evidence.extend(row['refs'])
+        for q in topic.get('quotes', []) if isinstance(topic.get('quotes', []), list) else []:
+            if isinstance(q, dict) and isinstance(q.get('ref'), str):
+                evidence.append(q['ref'])
+        members = topic.get('discussion_refs', [])
+        if isinstance(members, list) and all(isinstance(ref, str) and ref in sources for ref in members + evidence):
+            joined = list(dict.fromkeys(members + evidence))
+            expanded = expand_discussion(prepared, joined)
+            if set(expanded) != set(members):
+                repairs.append({'kind': 'include_evidence_and_replies', 'topic': n})
+                topic['discussion_refs'] = expanded
+            all_assigned.update(expanded)
+    entries = value.get('excluded_messages')
+    if isinstance(entries, list):
+        kept = [entry for entry in entries if not isinstance(entry, dict)
+                or not isinstance(entry.get('id'), str) or entry['id'] not in all_assigned]
+        if len(kept) != len(entries):
+            repairs.append({'kind': 'retain_assigned_messages', 'count': len(entries) - len(kept)})
+            value['excluded_messages'] = kept
+    return value, repairs
 
 
 def discussion_messages(prepared, topic=None):
@@ -182,7 +316,13 @@ def validate_summary(value, prepared):
     if not isinstance(topics, list) or not 1 <= len(topics) <= 64:
         raise ArchiveError("总结的话题数量无效")
     def references(ids):
-        if not isinstance(ids, list) or not 1 <= len(ids) <= (max(512, len(prepared['sources'])) if version >= 2 else 20) or any(not isinstance(i, str) or i not in prepared["sources"] for i in ids):
+        if not isinstance(ids, list):
+            raise ArchiveError('总结的消息引用格式无效')
+        if not ids:
+            raise ArchiveError('总结存在空的消息引用')
+        if len(ids) > (max(512, len(prepared['sources'])) if version >= 2 else 20):
+            raise ArchiveError('总结的消息引用数量超出当日范围')
+        if any(not isinstance(i, str) or i not in prepared["sources"] for i in ids):
             raise ArchiveError("总结引用了本日归档以外的消息")
         return list(dict.fromkeys(ids))
     clean = []

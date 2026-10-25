@@ -27,7 +27,7 @@ discussion_refs 应包含与话题有关的全部提问、答复、追问、补�
 输出格式
 只输出 JSON，不加代码围栏或解释：
 {"format_version":3,"overview":"当日群聊总结","highlights":[],"topics":[{"navigation_title":"简短目录标题","title":"完整话题标题","summary":"导语或完整短话题","blocks":[{"heading":"具体小标题","speaker":"","text":"整合后的观点与依据，可使用 p001 等人物 ID","refs":["消息ID"]}],"comparisons":[{"heading":"做法名称","text":"差异及人物归属","refs":["消息ID"]}],"quotes":[{"speaker":"p001","ref":"消息ID","text":"逐字原话节选"}],"progress":"有新增信息的进展，没有则空字符串","refs":["总结依据消息ID"],"discussion_refs":["本话题完整讨论的全部消息ID"]}],"excluded_messages":[{"id":"不属于任何话题的消息ID","reason":"无主题闲聊"}],"notes":[]}
-blocks、comparisons、quotes、excluded_messages 可以为空数组；每个话题、每个 block 和 comparison 的 refs 不能空。所有 refs 必须在该话题 discussion_refs 中。所有消息 ID 原样来自当天输入。不要输出 points、outcome、views、details。notes 只记录影响理解的缺失信息，最多八条。
+blocks、comparisons、quotes、excluded_messages 可以为空数组；每个话题、每个 block 和 comparison 的 refs 不能空。所有 refs 必须在该话题 discussion_refs 中。所有消息 ID 原样来自当天输入（例如 m0001），不要自行拼写长编号、猜编号或把 p001 人物 ID 用作消息 ID。不要输出 points、outcome、views、details。notes 只记录影响理解的缺失信息，最多八条。quotes 非必需，不确定能逐字匹配时留空，不自行添加表情、标点或补充文字。
 
 组织范例（虚构素材，仅示范写法，不是当天事实）
 上午 p001 做了三个角色，仍比单个 agent 费；p002 说明先由统筹做架构再拆任务、逐任务审查修复、阶段验收；p001 后来明确发现自己只分工、架构也交给开发，p002 确认。傍晚 p001 又说已尝试、暂时没有测出节省。
