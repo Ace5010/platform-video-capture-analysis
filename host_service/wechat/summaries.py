@@ -288,6 +288,22 @@ def repair_summary(value, prepared, reference_map=None):
         if len(kept) != len(entries):
             repairs.append({'kind': 'retain_assigned_messages', 'count': len(entries) - len(kept)})
             value['excluded_messages'] = kept
+        # Account for an isolated sticker that the model did not assign. This
+        # is an explicit non-assignment, not invented discussion or unread text.
+        # Text, photographs and any reply-connected message still fail closed.
+        excluded = {entry.get('id') for entry in kept if isinstance(entry, dict)}
+        connected = set(prepared.get('replies', {})) | set(prepared.get('replies', {}).values())
+        unassigned = []
+        for key, source in sources.items():
+            resources = source.get('resources', [])
+            if (key not in all_assigned | excluded | connected and resources
+                    and all(resource.get('kind') == 'sticker' for resource in resources)
+                    and re.fullmatch(r'\[表情(?:：[^\]\n]*)?\]', source.get('content', ''))):
+                value['excluded_messages'].append({'id': key, 'reason': '模型未归入讨论'})
+                unassigned.append(key)
+        if unassigned:
+            repairs.append({'kind': 'unassigned_isolated_stickers', 'ids': unassigned})
+            value.setdefault('notes', []).append(f'{len(unassigned)} 条独立表情未归入讨论，已保留在当天原文。')
     return value, repairs
 
 

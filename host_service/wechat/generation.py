@@ -6,7 +6,7 @@ import threading
 import uuid
 from .archive import ArchiveError
 from .summaries import prepare_day
-from .summarize import run, save, check_effort, SummaryFailure
+from .summarize import run, save, check_effort, SummaryFailure, parse_result
 from .resources import require_summary_resources
 from .models import require_input
 
@@ -29,6 +29,52 @@ class GenerationManager:
         if not matches:
             return None
         return max(matches, key=lambda row: row['started_at'])
+
+    def recover(self, request_id):
+        """Revalidate a paid result locally; keep the failed receipt as evidence."""
+        with self.guard:
+            if self.active or any(job['status'] in ('running', 'unknown') for job in self.history()):
+                raise ArchiveError('请等待总结任务结束并核对状态后恢复')
+            job = self.get(request_id)
+            if not job or job['status'] != 'failed' or not job.get('run_id'):
+                raise ArchiveError('没有可恢复的失败总结')
+            folder = (self.root / 'summary-runs' / job['run_id']).resolve()
+            if not folder.is_relative_to((self.root / 'summary-runs').resolve()):
+                raise ArchiveError('总结执行记录无效')
+            record = json.loads((folder / 'receipt.json').read_text(encoding='utf-8'))
+            if record.get('error_stage') != 'validate' or record.get('exit_code') != 0:
+                raise ArchiveError('本次没有可复用的完整模型输出')
+            lock = self.root / 'summary-runs' / (job['date'] + '.lock')
+            if lock.exists():
+                locked_at = datetime.fromisoformat(lock.read_text(encoding='utf-8'))
+                if abs((locked_at - datetime.fromisoformat(record['started_at'])).total_seconds()) > 1:
+                    raise ArchiveError('当前锁属于另一项执行记录，不能恢复')
+            prepared = prepare_day(self.root, job['date'])
+            if record['source_hash'] != prepared['source_hash']:
+                raise ArchiveError('归档已变化，不能用旧结果覆盖新内容')
+            mapping = json.loads((folder / 'reference-map.json').read_text(encoding='utf-8'))
+            if mapping['source_hash'] != prepared['source_hash']:
+                raise ArchiveError('总结编号映射与当前归档不一致')
+            if record.get('images') and record.get('image_count_submitted') != len(record['images']):
+                raise ArchiveError('原图片请求尚未核实，不能恢复')
+            outer, summary = parse_result((folder / 'stdout.json').read_text(encoding='utf-8-sig'), prepared, mapping['references'])
+            doc = dict(date=job['date'], source_hash=prepared['source_hash'], run_id=job['run_id'],
+                       summary=summary, partial=prepared['partial'], coverage_end=prepared['coverage_end'],
+                       missing_resources=record.get('missing_resources', []), resource_coverage=record.get('resource_coverage', {}))
+            audit = folder / 'local-recovery.json'
+            if audit.exists():
+                raise ArchiveError('已有恢复记录，请先核对发布状态')
+            save(audit, dict(original_job=job, repairs=outer['local_repairs'], recovered_at=datetime.now(timezone.utc).isoformat(), additional_credits=0))
+            target = self.root / 'summaries' / (job['date'] + '.json')
+            if target.exists():
+                save(folder / 'before-local-recovery-summary.json', json.loads(target.read_text(encoding='utf-8')))
+            save(self.root / 'summary-variants' / job['date'] / ('ui-' + job['id'] + '.json'), doc)
+            save(target, doc)
+            job.update(status='complete', recovered_error=job.pop('error', None), recovered_at=datetime.now(timezone.utc).isoformat())
+            save(self.root / 'generation-jobs' / (job['id'] + '.json'), job)
+            if lock.exists():
+                lock.rename(folder / 'resolved-by-local-recovery.lock')
+            return job
 
     def get(self, request_id):
         if not isinstance(request_id, str) or len(request_id) != 32 or any(c not in '0123456789abcdef' for c in request_id):

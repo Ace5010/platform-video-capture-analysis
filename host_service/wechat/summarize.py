@@ -200,13 +200,15 @@ def _run(day, model, data_dir, effort, variant, temporary):
                 payload += '\n以下完整图片属于消息 ' + inverse[source_id] + '：\n' + marker + '\n'
                 if asset.get('frame_count'):
                     payload += f"动图顺序：第 {asset['frame_index']}/{asset['frame_count']} 帧，持续 {asset['duration_ms']} 毫秒。\n"
+                if asset.get('tile_count'):
+                    payload += f"同一完整图片的无损分段 {asset['tile_index']}/{asset['tile_count']}，原图尺寸 {asset['source_size']}，像素区域 {asset['tile_box']}。按原图位置连贯阅读，所有分段合起来覆盖全部原图。\n"
                 image_manifest['images'].append({'marker': marker, 'sha256': asset['id'],
                                                  'path': str(path), 'mime': asset['mime']})
             save(folder / 'image-manifest.json', image_manifest)
             args[1:1] = ['--require', str(ROOT.parents[1] / 'scripts' / 'codebuddy-image-wire.cjs')]
             record['input_sha256'] = hashlib.sha256(payload.encode('utf-8')).hexdigest()
             record['images'] = [dict(message=source_id, sha256=asset['id'], bytes=asset['bytes'],
-                                     **{key:asset[key] for key in ('source_id','frame_index','frame_count','duration_ms') if key in asset})
+                                     **{key:asset[key] for key in ('source_id','frame_index','frame_count','duration_ms','tile_index','tile_count','tile_box','source_size') if key in asset})
                                 for source_id, asset, _ in images]
         env = dict(os.environ)
         for key in list(env):
@@ -253,6 +255,10 @@ def _run(day, model, data_dir, effort, variant, temporary):
             events = [json.loads(line) for line in audit_file.read_text(encoding='utf-8').splitlines()] if audit_file.exists() else []
             requests = [event for event in events if event.get('type') == 'image_request']
             responses = [event for event in events if event.get('type') == 'image_response']
+            if responses:
+                record['image_http_status'] = responses[-1]['status']
+                if not 200 <= responses[-1]['status'] < 300:
+                    raise ArchiveError(f"图片请求被服务拒绝（HTTP {responses[-1]['status']}），未生成总结")
             if len(requests) != 1 or len(requests[0]['images']) != len(images) or not any(200 <= event['status'] < 300 for event in responses):
                 raise ArchiveError('未核实全部图片实际提交并被服务接收，已保留回执，不发布总结')
             record['image_count_submitted'] = len(images)

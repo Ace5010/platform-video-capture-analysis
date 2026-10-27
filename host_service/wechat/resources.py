@@ -695,6 +695,32 @@ def require_summary_resources(prepared, *, allow_media=False, allow_missing=Fals
 
 MAX_SUMMARY_IMAGE_BYTES = 40 * 1024 * 1024
 MAX_SUMMARY_IMAGE_COUNT = 64
+MAX_SUMMARY_IMAGE_EDGE = 4096
+
+
+def _tile_summary_image(asset, file, temporary_dir):
+    """Lossless ordered PNG tiles; never resize, omit pixels or alter originals."""
+    from PIL import Image
+    from io import BytesIO
+    with Image.open(file) as picture:
+        width, height = picture.size
+        if max(width, height) <= MAX_SUMMARY_IMAGE_EDGE:
+            return [(asset, file)]
+        if temporary_dir is None:
+            raise ArchiveError('超长图片需要临时分段目录，未送入模型')
+        picture = picture.convert('RGBA')
+        boxes = [(x, y, min(width, x + MAX_SUMMARY_IMAGE_EDGE), min(height, y + MAX_SUMMARY_IMAGE_EDGE))
+                 for y in range(0, height, MAX_SUMMARY_IMAGE_EDGE)
+                 for x in range(0, width, MAX_SUMMARY_IMAGE_EDGE)]
+        tiles = []
+        for index, box in enumerate(boxes):
+            output = BytesIO(); picture.crop(box).save(output, format='PNG')
+            data = output.getvalue(); key = hashlib.sha256(data).hexdigest()
+            path = Path(temporary_dir) / (key + '.png'); path.write_bytes(data)
+            tiles.append((dict(asset, id=key, mime='image/png', bytes=len(data),
+                               source_id=asset.get('source_id', asset['id']), tile_index=index + 1,
+                               tile_count=len(boxes), tile_box=list(box), source_size=[width, height]), path))
+        return tiles
 
 
 def summary_images(root, prepared, *, temporary_dir=None, skipped=None):
@@ -757,6 +783,16 @@ def summary_images(root, prepared, *, temporary_dir=None, skipped=None):
                                 batch.append((message['id'],frame,frame_path))
                 except (OSError, ValueError, EOFError):
                     raise ArchiveError('图片或动图未能完整解码，未送入模型') from None
+            tiled = []
+            try:
+                for source, item, path in batch:
+                    for tile, tile_path in _tile_summary_image(item, path, temporary_dir):
+                        tiled.append((source, tile, tile_path))
+                        if tile_path != path:
+                            generated.append(tile_path)
+            except (OSError, ValueError, EOFError):
+                raise ArchiveError('图片未能完整解码，未送入模型') from None
+            batch = tiled
             size = sum(item[1]['bytes'] for item in batch)
             if total_bytes + size > MAX_SUMMARY_IMAGE_BYTES or len(images) + len(batch) > MAX_SUMMARY_IMAGE_COUNT:
                 raise ArchiveError('图片完整输入超过本次上限，未送入模型')

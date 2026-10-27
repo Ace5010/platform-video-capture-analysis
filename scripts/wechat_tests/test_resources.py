@@ -343,6 +343,36 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(missing_resources(prepared),[dict(message='m1',time='09:10:00',sender='甲',
                          kind='image',label='图片',reason='本机没有完整图片')])
 
+    def test_long_image_tiles_reconstruct_all_original_pixels_and_keep_blob(self):
+        from PIL import Image
+        from io import BytesIO
+        from hashlib import sha256
+        output = BytesIO()
+        original = Image.new('RGBA', (31, 12614), (10, 20, 30, 127))
+        for y in range(original.height):
+            original.putpixel((y % 31, y), (y % 256, 77, 88, 255))
+        original.save(output, format='PNG')
+        asset = save_blob(self.root, output.getvalue(), 'image/png', '长图')
+        prepared = {'sources': {}, 'messages': [{'id': 'm1', 'resources': [{'kind': 'image', 'assets': [asset]}]}]}
+        with tempfile.TemporaryDirectory(dir=self.root) as tmp:
+            images = summary_images(self.root, prepared, temporary_dir=tmp)
+            self.assertEqual(len(images), 4)
+            joined = Image.new('RGBA', original.size)
+            for index, (_, tile, path) in enumerate(images):
+                self.assertEqual(tile['tile_index'], index + 1)
+                self.assertEqual(tile['source_id'], asset['id'])
+                with Image.open(path) as piece:
+                    self.assertLessEqual(max(piece.size), 4096)
+                    joined.paste(piece, tile['tile_box'][:2])
+                self.assertEqual(sha256(path.read_bytes()).hexdigest(), tile['id'])
+            self.assertEqual(joined.tobytes(), original.tobytes())
+        self.assertEqual(blob_path(self.root, asset).read_bytes(), output.getvalue())
+        with tempfile.TemporaryDirectory(dir=self.root) as tmp, patch('host_service.wechat.resources.MAX_SUMMARY_IMAGE_COUNT', 3):
+            gaps = []
+            self.assertEqual(summary_images(self.root, prepared, temporary_dir=tmp, skipped=gaps), [])
+            self.assertEqual(len(gaps), 1)
+            self.assertFalse(list(Path(tmp).iterdir()))
+
     def test_oversized_animation_is_wholly_reported_and_static_image_still_read(self):
         from PIL import Image
         from io import BytesIO

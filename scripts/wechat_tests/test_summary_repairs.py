@@ -61,6 +61,47 @@ class RepairTests(unittest.TestCase):
         self.assertEqual(repairs, [])
         self.assertEqual(validate_summary(checked, self.prepared), checked)
 
+    def test_only_unconnected_sticker_omissions_are_accounted_without_inventing_topic(self):
+        value = copy.deepcopy(self.value)
+        value['excluded_messages'] = []
+        source = self.prepared['sources'][self.other]
+        source.update(content='[表情：未获取原件]', resources=[{'kind': 'sticker', 'status': 'ready'}])
+        outer, checked = self.parse(value)
+        self.assertEqual(checked['excluded_messages'], [{'id': self.other, 'reason': '模型未归入讨论'}])
+        self.assertEqual(checked['topics'][0]['summary'], value['topics'][0]['summary'])
+        self.assertIn('独立表情', checked['notes'][0])
+        self.assertEqual(outer['local_repairs'][-1]['kind'], 'unassigned_isolated_stickers')
+        self.assertEqual(repair_summary(checked, self.prepared)[1], [])
+        source['content'] = '需要纳入总结的真实观点'
+        with self.assertRaises(ArchiveError): self.parse(value)
+        source['content'] = '[图片：未获取原件]'
+        source['resources'] = [{'kind': 'image'}]
+        with self.assertRaises(ArchiveError): self.parse(value)
+        source.update(content='[表情：未获取原件]', resources=[{'kind': 'sticker'}])
+        self.prepared['replies'] = {self.other: 'external-parent'}
+        with self.assertRaises(ArchiveError): self.parse(value)
+
+    def test_recover_uses_paid_output_and_preserves_failure_and_fee(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); folder = root / 'summary-runs' / 'fixture-run'
+            record = dict(source_hash='fixture', error_stage='validate', exit_code=0, credits=.5)
+            job = dict(id='d'*32, run_id='fixture-run', date='2026-10-24', status='failed',
+                       credits=.5, started_at='2026-10-25T00:00:00Z', error='original failure')
+            save(folder/'receipt.json', record)
+            save(folder/'reference-map.json', dict(source_hash='fixture', references={}))
+            save(folder/'stdout.json', dict(subtype='success', result=self.value))
+            save(root/'generation-jobs'/(job['id']+'.json'), job)
+            manager = GenerationManager(root, runner=lambda *a, **kw: self.fail('must not call model'))
+            with patch('host_service.wechat.generation.prepare_day', return_value=dict(self.prepared,source_hash='changed')):
+                with self.assertRaises(ArchiveError): manager.recover(job['id'])
+            self.assertFalse((folder/'local-recovery.json').exists())
+            with patch('host_service.wechat.generation.prepare_day', return_value=self.prepared):
+                result = manager.recover(job['id'])
+            self.assertEqual((result['status'],result['credits']),('complete',.5))
+            self.assertEqual(json.loads((folder/'receipt.json').read_text()), record)
+            self.assertEqual(json.loads((folder/'local-recovery.json').read_text())['original_job'], job)
+            self.assertTrue((root/'summaries/2026-10-24.json').exists())
+
     def test_ambiguous_and_known_cross_day_ids_never_repaired(self):
         for mode in ('ambiguous', 'cross_day', 'unrelated', 'already_assigned', 'two_typos'):
             value = copy.deepcopy(self.value)
