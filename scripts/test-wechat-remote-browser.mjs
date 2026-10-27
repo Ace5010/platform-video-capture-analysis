@@ -32,21 +32,21 @@ try {
    await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({ok:true,...body})});
   });
   await page.goto('http://localhost:3000/?module=wechat&view=manage',{waitUntil:'domcontentloaded'});
-  try { await page.locator('.wxTopicReading h2').waitFor({timeout:30000}); }
+  try { await page.locator('.wxTopicReading h2').first().waitFor({timeout:30000}); }
   catch(error){console.log(JSON.stringify({url:page.url(),body:(await page.locator('body').innerText()).slice(0,700),calls,errors}));throw error;}
   assert.equal(await page.getByRole('button',{name:'读取管理',exact:true}).count(),0);
   assert.equal(await page.locator('.wxGenerate,.wxManagement,.wxLocalOnly').count(),0);
   assert.match(page.url(),/view=reading/);
-  if(width<740)await page.getByRole('button',{name:'切换话题 ▾',exact:true}).click();
   await page.getByRole('button',{name:'目录2',exact:true}).click();
-  assert.equal(await page.locator('.wxTopicReading h2').innerText(),'共享话题2');
-  await page.getByRole('button',{name:/核对完整讨论/}).click();
+  assert.equal(await page.locator('.wxTopicReading h2').nth(1).innerText(),'共享话题2');
+  await page.getByRole('button',{name:/查看讨论原文/}).nth(1).click();
   await page.locator('.wxSourcePane .wxMessage').last().waitFor();
   assert.equal(await page.locator('.wxSourcePane img').count(),0);
   assert.equal(await page.evaluate(()=>Boolean(window.leaked)),false);
   assert.match(calls.findLast(c=>c.path==='/api/wechat/original').query,/topic=1/);
-  await page.getByRole('button',{name:'返回阅读',exact:true}).click();
-  await page.getByRole('button',{name:'聊天原文',exact:true}).click();
+  await page.getByRole('button',{name:'返回',exact:true}).click();
+  await page.getByRole('button',{name:'更多操作',exact:true}).click();
+  await page.getByRole('button',{name:'查看当天全部聊天',exact:true}).click();
   await page.locator('.wxMessages .wxMessage').last().waitFor();
   await page.getByRole('button',{name:'筛选',exact:true}).click();
   await page.getByLabel('关键词',{exact:true}).fill('完整讨论');
@@ -54,8 +54,9 @@ try {
   await page.waitForFunction(()=>document.querySelector('.wxMessages')?.textContent.includes('匹配消息'));
   await page.waitForTimeout(200);
   assert.ok(calls.some(c=>c.path==='/api/wechat/search'&&c.body.keyword==='完整讨论'));
-  await page.getByRole('button',{name:'聊天总结',exact:true}).click();
-  await page.getByRole('combobox',{name:'聊天日期',exact:true}).selectOption('2026-10-23');
+  await page.getByRole('button',{name:'返回总结',exact:true}).click();
+  await page.getByRole('button',{name:'选择聊天日期',exact:true}).click();
+  await page.getByRole('button',{name:'2026-10-23',exact:true}).click();
   await page.waitForTimeout(200);
   assert.ok(calls.some(c=>c.path==='/api/wechat/summary'&&c.query.includes('date=2026-10-23')));
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);

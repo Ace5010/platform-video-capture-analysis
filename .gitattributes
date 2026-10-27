@@ -1,0 +1,3 @@
+# These vendored sources are byte-verified before loading on Windows.
+host_service/wechat/vendor/wechat_db.py text eol=lf
+host_service/wechat/vendor/wechat_accessibility.py text eol=lf

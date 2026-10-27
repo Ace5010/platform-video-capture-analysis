@@ -1,16 +1,20 @@
 import importlib.util
+from contextlib import closing
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from host_service.wechat.archive import ArchiveError, archive_status, build_export, save_export
-from host_service.wechat.reader import IncompleteRead, StrictLog, active_pid, check_wal_boundary, load_upstream, make_reader, read_rows
+from host_service.wechat.archive import ArchiveError, archive_status, atomic_json, build_export, save_export
+from host_service.wechat.reader import IncompleteRead, StrictLog, active_pid, check_wal_boundary, copy_stable_source, load_upstream, make_reader, read_rows
 
 ACCOUNT, GROUP = "wxid_fixture", "123_fixture@chatroom"
 START = 1792454400
@@ -25,6 +29,148 @@ def row(number, **overrides):
 
 
 class Tests(unittest.TestCase):
+    def test_reader_decrypts_frozen_copy_while_live_database_changes(self):
+        import shutil
+        module = load_upstream()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = root/'chosen'/'db_storage'/'contact'/'contact.db'
+            live.parent.mkdir(parents=True)
+            with closing(sqlite3.connect(live)) as con, con:
+                con.execute('CREATE TABLE fixture(value TEXT)')
+                con.execute("INSERT INTO fixture VALUES('before')")
+            rel = os.path.join('contact', 'contact.db')
+            def decrypt(_self, src, dst, key):
+                self.assertNotEqual(Path(src).resolve(), live.resolve())
+                with closing(sqlite3.connect(live)) as con, con:
+                    con.execute("UPDATE fixture SET value='after'")
+                shutil.copyfile(src, dst)
+            with patch.object(module.WeChatDB, '_extract_keys_pid', return_value={rel: bytes(32)}), \
+                 patch.object(module.WeChatDB, '_key_works', return_value=True), \
+                 patch.object(module.WeChatDB, '_decrypt_file', decrypt):
+                db = make_reader(module, root, 'chosen', 123, root/'cache')
+                con = db._open(rel)
+                try: self.assertEqual(con.execute('SELECT value FROM fixture').fetchone()[0], 'before')
+                finally: con.close(); db._keys.clear()
+            with closing(sqlite3.connect(live)) as con:
+                self.assertEqual(con.execute('SELECT value FROM fixture').fetchone()[0], 'after')
+            self.assertFalse(list((root/'cache').glob('snapshot-*')))
+
+    def test_snapshot_retries_whole_pair_when_live_source_changes(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'live.db'
+            source.write_bytes(b'old')
+            target = root / 'snapshot'; target.mkdir()
+            copy = shutil.copy2
+            calls = []
+            def changing_copy(src, dst):
+                result = copy(src, dst)
+                calls.append(str(src))
+                if len(calls) == 1:
+                    source.write_bytes(b'new stable generation')
+                return result
+            with patch('host_service.wechat.reader.shutil.copy2', side_effect=changing_copy), \
+                 patch('host_service.wechat.reader.time.sleep'):
+                frozen = copy_stable_source(source, target)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(frozen.read_bytes(), b'new stable generation')
+            source.write_bytes(b'later message during decryption')
+            self.assertEqual(frozen.read_bytes(), b'new stable generation')
+
+    def test_snapshot_busy_source_never_returns_a_torn_copy(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); source = root / 'live.db'
+            source.write_bytes(b'0'); target = root / 'snapshot'; target.mkdir()
+            copy = shutil.copy2
+            def changing_copy(src, dst):
+                result = copy(src, dst)
+                with source.open('ab') as stream: stream.write(b'1')
+                return result
+            with patch('host_service.wechat.reader.shutil.copy2', side_effect=changing_copy) as copying, \
+                 patch('host_service.wechat.reader.time.sleep'):
+                with self.assertRaises(IncompleteRead):
+                    copy_stable_source(source, target)
+            self.assertEqual(copying.call_count, 5)
+
+    def test_snapshot_checkpoint_removes_old_wal_before_retry(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); source = root/'live.db'; source.write_bytes(bytes(4096))
+            wal = Path(str(source)+'-wal'); wal.write_bytes(b'checkpoint in progress')
+            target = root/'snapshot'; target.mkdir()
+            (target/'source.db-wal').write_bytes(b'old attempt')
+            copy = shutil.copy2
+            def checkpoint(src, dst):
+                if Path(src) == wal:
+                    wal.unlink()
+                    raise FileNotFoundError()
+                return copy(src, dst)
+            with patch('host_service.wechat.reader.shutil.copy2', side_effect=checkpoint), \
+                 patch('host_service.wechat.reader.time.sleep'):
+                frozen = copy_stable_source(source, target)
+            self.assertEqual(frozen.read_bytes(), source.read_bytes())
+            self.assertFalse(Path(str(frozen)+'-wal').exists())
+
+    def test_snapshot_keeps_complete_wal_and_rejects_invalid_boundary(self):
+        import struct
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); source = root / 'live.db'; source.write_bytes(bytes(4096))
+            wal = Path(str(source) + '-wal')
+            header = struct.pack('>IIII', 0x377F0682, 3007000, 4096, 1) + b'newsalts' + bytes(8)
+            frame = struct.pack('>II', 1, 1) + b'newsalts' + bytes(4104)
+            wal.write_bytes(header + frame)
+            target = root / 'snapshot'; target.mkdir()
+            frozen = copy_stable_source(source, target)
+            self.assertEqual(Path(str(frozen)+'-wal').read_bytes(), wal.read_bytes())
+            wal.write_bytes(header + struct.pack('>II', 1, 0) + b'newsalts' + bytes(4104))
+            with patch('host_service.wechat.reader.time.sleep'):
+                with self.assertRaises(IncompleteRead):
+                    copy_stable_source(source, target)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows file sharing regression')
+    def test_atomic_save_waits_for_real_windows_reader(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'resources.json'
+            atomic_json(path, {'old': True})
+            reader = path.open('rb')
+            ready = threading.Event()
+            failures = []
+            def write():
+                ready.set()
+                try:
+                    atomic_json(path, {'complete': True})
+                except Exception as exc:
+                    failures.append(exc)
+            worker = threading.Thread(target=write)
+            worker.start()
+            try:
+                self.assertTrue(ready.wait(1))
+                time.sleep(.12)
+                self.assertEqual(json.loads(reader.read()), {'old': True})
+            finally:
+                reader.close()
+                worker.join(3)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(failures, [])
+            self.assertEqual(json.loads(path.read_text()), {'complete': True})
+            self.assertEqual(list(Path(folder).glob('*.tmp')), [])
+
+    def test_atomic_save_lock_timeout_preserves_original_and_cleans_temp(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'resources.json'
+            atomic_json(path, {'old': True})
+            error = PermissionError('fixture lock'); error.winerror = 32
+            with patch('host_service.wechat.archive.os.replace', side_effect=error) as replace, \
+                 patch('host_service.wechat.archive.time.sleep'):
+                with self.assertRaisesRegex(ArchiveError, '归档文件持续被占用'):
+                    atomic_json(path, {'new': True})
+            self.assertEqual(replace.call_count, 10)
+            self.assertEqual(json.loads(path.read_text()), {'old': True})
+            self.assertEqual(list(Path(folder).glob('*.tmp')), [])
+
     def build(self, rows):
         return build_export(ACCOUNT, GROUP, "虚构测试群", START, START + 86400, rows, {"wxid_a": "同名", "wxid_b": "同名"})
 
@@ -47,6 +193,20 @@ class Tests(unittest.TestCase):
         msg = self.build([row(1, message_content=compressed)])["messages"][0]
         self.assertEqual(msg["content"], text)
         self.assertEqual(msg["_source"]["message_content"]["encoding"], "base64")
+
+    def test_blank_member_name_uses_stable_sender_and_passes_official_validator(self):
+        names = {'wxid_a': ' \t\n\u3000', 'wxid_b': ' 真实昵称 '}
+        source = [row(1), row(2, sender_username='wxid_b')]
+        data = build_export(ACCOUNT, GROUP, '虚构测试群', START, START + 86400, source, names)
+        self.assertEqual(data['messages'][0]['accountName'], '未命名群友')
+        self.assertEqual(data['members'][0]['accountName'], '未命名群友')
+        self.assertEqual(data['messages'][0]['sender'], 'wxid_a')
+        self.assertEqual(data['messages'][0]['content'], source[0]['message_content'])
+        self.assertEqual(data['messages'][1]['accountName'], ' 真实昵称 ')
+        with tempfile.TemporaryDirectory() as tmp:
+            target = save_export(tmp, data)
+            self.assertEqual(len(archive_status(tmp)), 1)
+            self.assertEqual(json.loads(target.read_text(encoding='utf-8'))['messages'], data['messages'])
 
     def test_link_reply_and_media(self):
         link = '<msg><appmsg><type>5</type><title>链接标题</title><url>https://example.invalid/a</url></appmsg></msg>'

@@ -16,6 +16,8 @@ from host_service.wechat.generation import GenerationManager
 
 class RepairTests(unittest.TestCase):
     def setUp(self):
+        from host_service.wechat.models import CAPABILITIES
+        self.enterContext(patch.dict(CAPABILITIES, {'fixture': {'text': True}}))
         self.image = 'm_4ae26467823b2e82'
         self.text = 'm_66f2cb5e3ae3691f'
         self.other = 'm_1111111111111111'
@@ -143,14 +145,30 @@ class RepairTests(unittest.TestCase):
         self.assertEqual(checked['topics'][0]['quotes'][0]['text'], '每天签到支持新模型')
         self.assertEqual(outer['local_repairs'][0]['kind'], 'limit_optional_quotes')
 
+    def test_excluded_id_list_keeps_explicit_membership_without_inventing_reason(self):
+        value=copy.deepcopy(self.value)
+        value['excluded_messages']=['m0003']
+        outer,checked=self.parse(value,{'m0003':self.other})
+        self.assertEqual(checked['excluded_messages'],[{'id':self.other,'reason':'模型未归入讨论'}])
+        self.assertEqual(checked['topics'][0]['summary'],value['topics'][0]['summary'])
+        self.assertEqual(outer['local_repairs'][0]['kind'],'excluded_id_record')
+        value['excluded_messages']=['m9999']
+        with self.assertRaises(ArchiveError):self.parse(value)
+        value['excluded_messages']=[self.other,self.other]
+        with self.assertRaises(ArchiveError):self.parse(value)
+
     def test_run_publishes_compact_id_result_with_original_usage_and_audit(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            self.prepared['messages'][0]['resources']=[dict(kind='image',label='图片',status='missing',error='未取得完整图片')]
+            self.prepared['resource_coverage']={'missing':1,'ready':0,'total':1}
             value = copy.deepcopy(self.value)
+            value['format_version'] = 4
             topic = value['topics'][0]
+            topic['summary'] = '讨论了新模型的入口及签到使用经验。'
             topic.update(refs=['m0001', 'm0002'], discussion_refs=['m0001', 'm0002'])
-            topic['blocks'][0]['refs'] = ['m0002']
-            topic['quotes'][0].update(ref='m0002', text='每天签到支持新模型[表情]')
+            topic['blocks'] = []
+            topic['quotes'] = []
             value['excluded_messages'][0]['id'] = 'm0003'
             raw = json.dumps([{'type': 'message', 'role': 'assistant', 'providerData': {
                 'model': 'fixture', 'rawUsage': {'credit': .5}}},
@@ -158,6 +176,7 @@ class RepairTests(unittest.TestCase):
             def process(*args, **kwargs):
                 def communicate(payload, timeout):
                     self.assertEqual(json.loads(payload)['messages'][0]['id'], 'm0001')
+                    self.assertEqual(json.loads(payload)['coverage']['missing_resources'][0]['message'],'m0001')
                     kwargs['stdout'].write(raw.encode()); kwargs['stdout'].flush()
                 return SimpleNamespace(pid=123, returncode=0, communicate=communicate)
             manager = GenerationManager(root)
@@ -171,14 +190,19 @@ class RepairTests(unittest.TestCase):
             self.assertEqual((job['status'], job['credits']), ('complete', .5))
             folder = root/'summary-runs'/job['run_id']
             receipt = json.loads((folder/'receipt.json').read_text(encoding='utf-8'))
-            self.assertEqual(receipt['local_repairs'][0]['kind'], 'omit_unfaithful_quote')
+            self.assertEqual(receipt['editorial_contract'], 'discussion-briefs-v4')
+            self.assertEqual(receipt['local_repairs'], [])
+            self.assertEqual(receipt['missing_resources'][0]['message'],self.image)
             self.assertEqual((folder/'stdout.json').read_text(encoding='utf-8'), raw)
             mapping = json.loads((folder/'reference-map.json').read_text(encoding='utf-8'))
             self.assertEqual(mapping['references']['m0001'], self.image)
             self.assertEqual(mapping['source_hash'], 'fixture')
             self.assertFalse((root/'summary-runs/2026-10-24.lock').exists())
             with patch('host_service.wechat.summaries.prepare_day', return_value=self.prepared):
-                self.assertEqual(summary_for_browser(root, '2026-10-24')['status'], 'ready')
+                published=summary_for_browser(root, '2026-10-24')
+                self.assertEqual(published['status'], 'ready')
+                self.assertEqual(published['missing_resources'][0]['reason'],'未取得完整图片')
+            self.assertFalse(list((root/'cache').iterdir()))
 
 
 if __name__ == '__main__':

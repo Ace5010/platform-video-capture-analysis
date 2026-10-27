@@ -15,6 +15,9 @@ from .media import download_media, media_duration_seconds, remove_task_dir, _too
 from .recovery import AnalysisCancelled, safe_error, requires_user_action
 
 
+# The video queue and explicitly requested WeChat reads share one local model.
+LOCAL_ASR_GUARD = threading.Lock()
+
 def local_error(stderr):
     """Keep the actual exception, rather than the beginning of its traceback."""
     lines = [line.strip() for line in stderr.decode('utf-8', errors='replace').splitlines() if line.strip()]
@@ -77,6 +80,15 @@ class TranscriptionManager:
             self.stop_event.wait(1)
 
     def _run_local(self, path, directory, check, *, video=None):
+        while not LOCAL_ASR_GUARD.acquire(timeout=.5):
+            check()
+        try:
+            check()
+            return self._run_local_serial(path, directory, check, video=video)
+        finally:
+            LOCAL_ASR_GUARD.release()
+
+    def _run_local_serial(self, path, directory, check, *, video=None):
         deadline = time.monotonic()+900
         attempts = []
         for chunk_seconds in (28, 14, 7):

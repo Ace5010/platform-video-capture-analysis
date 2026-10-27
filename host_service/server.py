@@ -219,12 +219,12 @@ class HostRequestHandler(BaseHTTPRequestHandler):
         local = self._local_dashboard()
         # Authenticated remote readers share the saved archive. Capture,
         # generation and management remain local, checked before opening it.
-        read_only = (self.command == 'GET' and action in {'context', 'days', 'summary', 'original'}
+        read_only = (self.command == 'GET' and action in {'context', 'days', 'summary', 'original', 'asset'}
                      or self.command == 'POST' and action == 'search')
         if not local and not self.server.remote_connection:
             raise ApiError(HTTPStatus.FORBIDDEN, '请通过已登录的正式 HTTPS 工作台阅读微信归档')
         if not local and not read_only:
-            raise ApiError(HTTPStatus.FORBIDDEN, '微信读取管理和生成总结仅允许在电脑的 localhost 工作台执行')
+            raise ApiError(HTTPStatus.FORBIDDEN, '读取并总结仅允许在电脑的 localhost 工作台执行')
         from .wechat.archive import ArchiveError
         from .wechat.service import WeChatService
         with self.server.wechat_guard:
@@ -235,6 +235,27 @@ class HostRequestHandler(BaseHTTPRequestHandler):
             if payload is None:
                 query = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
                 result = service.get(action, query)
+                if action == 'asset':
+                    file, asset = result
+                    mime = asset['mime'] if asset['mime'] in ('image/jpeg', 'image/png', 'image/gif', 'image/webp') else 'application/octet-stream'
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header('Content-Type', mime)
+                    self.send_header('Content-Length', str(asset['bytes']))
+                    self.send_header('Cache-Control', 'private, no-store')
+                    self.send_header('X-Content-Type-Options', 'nosniff')
+                    self.send_header('Content-Security-Policy', "default-src 'none'; sandbox")
+                    self.send_header('Referrer-Policy', 'no-referrer')
+                    self.send_header('Content-Disposition', 'inline' if mime.startswith('image/') else 'attachment')
+                    origin = self._cors_origin()
+                    if origin:
+                        self.send_header('Access-Control-Allow-Origin', origin)
+                        self.send_header('Access-Control-Allow-Credentials', 'true')
+                        self.send_header('Vary', 'Origin')
+                    self.end_headers()
+                    with file.open('rb') as stream:
+                        while chunk := stream.read(64 * 1024):
+                            self.wfile.write(chunk)
+                    return
                 if not local and action == 'context':
                     result = {'groups': [{key: group[key] for key in
                               ('id', 'name', 'start', 'end', 'message_count', 'status') if key in group}
@@ -245,7 +266,7 @@ class HostRequestHandler(BaseHTTPRequestHandler):
         except ArchiveError as exc:
             raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from None
         except (OSError, ValueError, KeyError):
-            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, '微信归档暂时不可用，请在读取管理中核对本机配置。') from None
+            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, '微信归档暂时不可用，请在电脑的微信读取页面核对配置。') from None
         self._send_json(HTTPStatus.OK, result)
 
     def _cors_origin(self) -> str | None:

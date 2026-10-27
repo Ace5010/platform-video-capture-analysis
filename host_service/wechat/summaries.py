@@ -8,6 +8,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 
 from .archive import ArchiveError, digest
+from .resources import load_resources, browser_resources, coverage
 
 TZ = timezone(timedelta(hours=8))
 
@@ -22,9 +23,11 @@ def day_bounds(day):
     return int(start.timestamp()), int((start + timedelta(days=1)).timestamp())
 
 
-def load_archive(data_dir):
+def load_archive(data_dir, batch_metadata=None):
+    from .cleanup import exclusions, without_ranges
     root = Path(data_dir)
     config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+    cleaned = exclusions(root)
     messages, ranges = {}, []
     for file in sorted((root / "batches").glob("*.json")):
         doc = json.loads(file.read_text(encoding="utf-8"))
@@ -34,8 +37,12 @@ def load_archive(data_dir):
         scope = doc["_archive"]
         if scope["account_id"] != config["account_id"] or scope["chat_id"] != config["group_id"]:
             raise ArchiveError("归档包含未选择的账号或群")
-        ranges.append((scope["start"], scope["end"]))
+        if batch_metadata is not None:
+            batch_metadata.append(dict(scope, batch=file.stem, messages=len(doc['messages'])))
+        ranges.extend(without_ranges(scope["start"], scope["end"],cleaned))
         for message in doc["messages"]:
+            if any(a <= message['timestamp'] < b for a,b in cleaned):
+                continue
             mid = message["platformMessageId"]
             if mid in messages:
                 # 不同批次成员显示名可能变化；来源正文和身份必须一致。
@@ -71,9 +78,10 @@ def summary_scope(ranges, day, now=None):
             'partial': partial, 'coverage_end': end if complete else cutoff}
 
 
-def prepare_day(data_dir, day):
+def prepare_day(data_dir, day, *, archive=None, inventory=None):
     start, end = day_bounds(day)
-    config, all_messages, ranges = load_archive(data_dir)
+    config, all_messages, ranges = archive if archive is not None else load_archive(data_dir)
+    inventory = load_resources(data_dir, config) if inventory is None else inventory
     selected = [m for m in all_messages if start <= m["timestamp"] < end]
     people = {}
     sources, minimal = {}, []
@@ -85,8 +93,13 @@ def prepare_day(data_dir, day):
         display = {"id": source_id, "sender": people[sender]["name"], "speaker": people[sender]["id"],
                    "time": datetime.fromtimestamp(message["timestamp"], TZ).strftime("%H:%M:%S"),
                    "timestamp": message["timestamp"], "type": message["type"], "content": message["content"]}
+        resources = browser_resources(message, inventory)
+        if resources:
+            display['resources'] = resources
         sources[source_id] = display
         minimal.append({k: display[k] for k in ("id", "speaker", "time", "type", "content")})
+        if resources:
+            minimal[-1]['resources'] = resources
     payload = {"date": day, "timezone": "Asia/Shanghai", "messages": minimal}
     # Keep the existing source fingerprint stable; reply metadata is derived separately.
     replies = {}
@@ -97,6 +110,7 @@ def prepare_day(data_dir, day):
     return {"date": day, "group_name": config["group_name"], **summary_scope(ranges, day),
             "messages": minimal, "sources": sources, "people": {p["id"]: p["name"] for p in people.values()},
             "source_hash": digest(payload), "message_count": len(selected), "replies": replies,
+            "resource_coverage": coverage(selected, inventory),
             "external_source_ids": {'m_' + digest(m['platformMessageId'])[:16] for m in all_messages
                                     if not start <= m['timestamp'] < end}}
 
@@ -135,7 +149,8 @@ def readable_content(content):
 
 
 def model_messages(prepared):
-    return [dict(m, content=readable_content(m['content']),
+    return [dict(m, content=readable_content(m['content']) + ''.join(
+                     '\n' + resource.get('text', '') for resource in m.get('resources', []) if resource.get('text')),
                  reply_to=prepared.get('replies', {}).get(m['id'], '')) for m in prepared['messages']]
 
 
@@ -153,7 +168,7 @@ def repair_summary(value, prepared, reference_map=None):
     The strict validator still runs afterwards. Every change is auditable and
     the original model response is kept by the caller.
     """
-    if not isinstance(value, dict) or value.get('format_version') != 3:
+    if not isinstance(value, dict) or value.get('format_version') not in (3, 4):
         return value, []
     value = copy.deepcopy(value)
     repairs, slots = [], []
@@ -187,6 +202,12 @@ def repair_summary(value, prepared, reference_map=None):
         if isinstance(topic.get('quotes'), list):
             slots.extend((quote, 'ref', path + '.quotes') for quote in topic['quotes'] if isinstance(quote, dict))
     if isinstance(value.get('excluded_messages'), list):
+        # Some valid results return only the excluded IDs. Preserve that
+        # explicit decision without inventing a reason such as "idle chat".
+        for index, entry in enumerate(value['excluded_messages']):
+            if isinstance(entry, str):
+                value['excluded_messages'][index] = {'id': entry, 'reason': '模型未归入讨论'}
+                repairs.append({'kind': 'excluded_id_record', 'index': index})
         slots.extend((entry, 'id', 'excluded_messages') for entry in value['excluded_messages'] if isinstance(entry, dict))
     for obj, key, _ in slots:
         ref = obj.get(key) if isinstance(obj, dict) else obj[key]
@@ -277,6 +298,7 @@ def discussion_messages(prepared, topic=None):
         ids.update(r for v in topic.get('views', []) for r in v.get('refs', []))
     return [dict(id=key, sender=display_name(m['sender'], m.get('speaker', 'p000')),
                  speaker=m.get('speaker', ''), time=m['time'], content=readable_content(m['content']),
+                 resources=m.get('resources', []),
                  reply_to=prepared.get('replies', {}).get(key, ''))
             for key, m in prepared['sources'].items() if ids is None or key in ids]
 
@@ -293,8 +315,8 @@ def expand_discussion(prepared, ids):
         members = expanded
 
 
-def available_days(data_dir):
-    _, messages, ranges = load_archive(data_dir)
+def available_days(data_dir, *, archive=None):
+    _, messages, ranges = archive if archive is not None else load_archive(data_dir)
     days = sorted({datetime.fromtimestamp(m["timestamp"], TZ).strftime("%Y-%m-%d") for m in messages})
     return [{"date": day, **summary_scope(ranges, day)} for day in days]
 
@@ -309,7 +331,7 @@ def validate_summary(value, prepared):
     if not isinstance(value, dict):
         raise ArchiveError("模型没有返回有效总结")
     version = value.get('format_version', 1)
-    if version not in (1, 2, 3):
+    if version not in (1, 2, 3, 4):
         raise ArchiveError('总结规范版本无效')
     overview = _text(value.get("overview"), "总览", 2400)
     topics = value.get("topics")
@@ -329,6 +351,17 @@ def validate_summary(value, prepared):
     for topic in topics:
         if not isinstance(topic, dict):
             raise ArchiveError("话题格式无效")
+        if version == 4:
+            # Briefs have one paragraph; never silently truncate model prose.
+            if any(topic.get(key) for key in ('blocks', 'comparisons', 'quotes', 'progress',
+                                               'views', 'details', 'points', 'outcome')):
+                raise ArchiveError('讨论简介只保留标题和一段简介')
+            title = _text(topic.get('title'), '标题', 60)
+            brief = _text(topic.get('summary'), '简介', 280)
+            if '\n' in brief or '\r' in brief:
+                raise ArchiveError('讨论简介须为一个自然段')
+            if re.search(r'(?<![A-Za-z0-9])p\d{3}(?!\d)', title + brief):
+                raise ArchiveError('讨论简介不标注人物编号')
         # New formats use blocks. Ignore obsolete presentation fields before
         # validating them; they never contribute prose, people or references.
         if version >= 2:
@@ -371,7 +404,7 @@ def validate_summary(value, prepared):
                       "outcome": _text(topic.get("outcome", ""), "结论", 4000, True),
                       "views": checked_views, "refs": refs, "blocks": blocks,
                       "points": [_text(point, '要点', 1600) for point in bullets]}
-        if version == 3:
+        if version >= 3:
             members = references(topic.get('discussion_refs'))
             if not set(refs) <= set(members):
                 raise ArchiveError('总结依据没有全部纳入话题讨论')
@@ -391,7 +424,8 @@ def validate_summary(value, prepared):
                     raise ArchiveError('原话内容或人物与来源不一致')
                 item['quotes'].append({'ref': q['ref'], 'speaker': q['speaker'], 'text': text})
             item['discussion_refs'] = expand_discussion(prepared, members)
-            item['navigation_title'] = _text(topic.get('navigation_title', item['title']), '目录标题', 100)
+            item['navigation_title'] = (item['title'] if version == 4 else
+                                        _text(topic.get('navigation_title', item['title']), '目录标题', 100))
             item['progress'] = _text(topic.get('progress', ''), '讨论进展', 1600, True)
             comparisons = topic.get('comparisons', [])
             if not isinstance(comparisons, list) or len(comparisons) > 3:
@@ -424,12 +458,12 @@ def validate_summary(value, prepared):
                for m in re.finditer(r'(?<![A-Za-z0-9])p\d{3}(?!\d)', text)):
             raise ArchiveError('正文提及了不存在的群友')
     result = {"format_version": version, "overview": overview, "highlights": [_text(n, '重点', 500) for n in highlights], "topics": clean, "notes": [_text(n, "备注", 1000) for n in notes]}
-    if version == 3:
+    if version >= 3:
         excluded = value.get('excluded_messages')
         if not isinstance(excluded, list):
             raise ArchiveError('缺少全天消息归属核对')
         excluded_ids = set()
-        reasons = {'无主题闲聊', '独立系统消息', '无可读内容'}
+        reasons = {'无主题闲聊', '独立系统消息', '无可读内容', '模型未归入讨论'}
         for entry in excluded:
             if not isinstance(entry, dict) or entry.get('id') not in prepared['sources'] or entry.get('reason') not in reasons or entry['id'] in excluded_ids:
                 raise ArchiveError('未归入话题的消息记录无效')
@@ -451,20 +485,20 @@ def display_name(name, speaker):
     return name or f'未命名 {int(speaker[1:]):02}'
 
 
-def summary_for_browser(data_dir, day):
-    prepared = prepare_day(data_dir, day)
+def summary_for_browser(data_dir, day, *, prepared=None):
+    prepared = prepare_day(data_dir, day) if prepared is None else prepared
     path = Path(data_dir) / "summaries" / (day + ".json")
     if not path.exists():
         return {"date": day, "status": "missing", "complete": prepared["complete"]}
     doc = json.loads(path.read_text(encoding="utf-8"))
     validation_prepared = prepared
-    if doc['source_hash'] != prepared['source_hash'] and doc['summary'].get('format_version') == 3:
+    if doc['source_hash'] != prepared['source_hash'] and doc['summary'].get('format_version') in (3, 4):
         recorded = {r for t in doc['summary']['topics'] for r in t['discussion_refs']}
         recorded.update(e['id'] for e in doc['summary']['excluded_messages'])
         validation_prepared = dict(prepared, sources={k:v for k,v in prepared['sources'].items() if k in recorded})
     checked = validate_summary(doc["summary"], validation_prepared)
     for topic in checked['topics']:
-        topic['discussion_complete'] = checked['format_version'] == 3 and doc['source_hash'] == prepared['source_hash']
+        topic['discussion_complete'] = checked['format_version'] >= 3 and doc['source_hash'] == prepared['source_hash']
         topic['discussion_count'] = len(discussion_messages(prepared, topic))
         for quote in topic.get('quotes', []):
             quote['time'] = prepared['sources'][quote['ref']]['time']
@@ -472,5 +506,7 @@ def summary_for_browser(data_dir, day):
     people = {speaker: display_name(name, speaker) for speaker, name in prepared['people'].items()}
     return {"date": day, "status": "ready", "stale": doc["source_hash"] != prepared["source_hash"],
             "summary": checked, "people": people,
+            "missing_resources": doc.get('missing_resources', []),
+            "resource_coverage": doc.get('resource_coverage'),
             "partial": doc.get('partial', False), "coverage_end": doc.get('coverage_end'),
             "editorial_revision": doc.get('editorial_revision', '')}

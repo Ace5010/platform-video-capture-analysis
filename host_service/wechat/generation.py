@@ -7,6 +7,11 @@ import uuid
 from .archive import ArchiveError
 from .summaries import prepare_day
 from .summarize import run, save, check_effort, SummaryFailure
+from .resources import require_summary_resources
+from .models import require_input
+
+RECEIPT_FIELDS = ('run_id', 'credits', 'credit_source', 'elapsed_seconds', 'error_stage',
+                  'media_credits', 'summary_credits', 'media_models', 'known_credits', 'credits_pending')
 
 MODES = {'low': ('glm-5.3-flash', 'low'), 'high': ('hy4-preview', 'high'),
          'deepseek': ('deepseek-v4.1-flash', 'high')}
@@ -20,15 +25,25 @@ class GenerationManager:
         self.active = None
 
     def latest(self, day):
-        files = sorted((self.root / 'generation-jobs').glob('*.json'))
-        rows = [json.loads(p.read_text(encoding='utf-8')) for p in files]
-        matches = [r for r in rows if r['date'] == day]
+        matches = [r for r in self.history() if r['date'] == day]
         if not matches:
             return None
-        result = max(matches, key=lambda row: row['started_at'])
+        return max(matches, key=lambda row: row['started_at'])
+
+    def get(self, request_id):
+        if not isinstance(request_id, str) or len(request_id) != 32 or any(c not in '0123456789abcdef' for c in request_id):
+            raise ArchiveError('请求标识无效')
+        path = self.root / 'generation-jobs' / (request_id + '.json')
+        if not path.is_file():
+            return None
+        result = json.loads(path.read_text(encoding='utf-8'))
         if result['status'] == 'running' and result['id'] != self.active:
             result = dict(result, status='unknown', error='上次任务状态待核实，请先核对消耗，避免重复生成。')
         return result
+
+    def history(self):
+        return sorted((self.get(p.stem) for p in (self.root / 'generation-jobs').glob('*.json')),
+                      key=lambda row: row['started_at'], reverse=True)
 
     def start(self, day, mode, request_id):
         if mode not in MODES:
@@ -48,12 +63,17 @@ class GenerationManager:
             if previous and previous['status'] == 'unknown':
                 raise ArchiveError('上次任务状态待核实，请先核对消耗，避免重复生成')
             prepared = prepare_day(self.root, day)
+            require_summary_resources(prepared, allow_missing=True)
+            images = any(asset.get('mime','').startswith('image/') for message in prepared['messages']
+                         for resource in message.get('resources',[]) for asset in resource.get('assets',[]))
             if not prepared['summarizable'] or not prepared['messages']:
                 raise ArchiveError('这一天的聊天归档不完整，暂时不能总结')
             if (self.root / 'summary-runs' / (day + '.lock')).exists():
                 raise ArchiveError('这一天有执行记录待核实，暂不重复调用')
             model, effort = MODES[mode]
             check_effort(model, effort)
+            if images:
+                require_input(model, 'image')
             job = {'id': request_id, 'date': day, 'mode': mode, 'model': model, 'effort': effort,
                    'status': 'running', 'started_at': datetime.now(timezone.utc).isoformat(),
                    'partial': prepared['partial'], 'coverage_end': prepared['coverage_end']}
@@ -77,10 +97,11 @@ class GenerationManager:
                      json.loads(target.read_text(encoding='utf-8')))
             save(target, doc)
             job.update(status='complete', credits=result.get('credits'), elapsed_seconds=result.get('elapsed_seconds'), run_id=result['run_id'])
+            job.update({key: result[key] for key in RECEIPT_FIELDS if key in result})
         except SummaryFailure as error:
             receipt = error.receipt
             job.update(status='failed', error=str(error))
-            for key in ('run_id', 'credits', 'credit_source', 'elapsed_seconds', 'error_stage'):
+            for key in RECEIPT_FIELDS:
                 if key in receipt:
                     job[key] = receipt[key]
         except ArchiveError as error:
@@ -89,7 +110,7 @@ class GenerationManager:
             action = '总结结果发布失败' if result is not None else '总结执行失败'
             job.update(status='failed', error=f'{action}（{type(error).__name__}），请检查后台运行日志。')
             if result is not None:
-                for key in ('run_id', 'credits', 'credit_source', 'elapsed_seconds'):
+                for key in RECEIPT_FIELDS:
                     if key in result:
                         job[key] = result[key]
         finally:

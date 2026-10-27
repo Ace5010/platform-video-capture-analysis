@@ -1,0 +1,2 @@
+# Existing selected-account WeChat reader subprocess, separate from the host.
+PyMuPDF==1.28.2

@@ -36,6 +36,7 @@ try {
         format_version: 3, notes: [], topics: [{ title: '已有总结保留', navigation_title: '已有总结',
           summary: '已有结果继续可读。', blocks: [], comparisons: [], quotes: [],
           discussion_complete: true, discussion_count: 12 }] } };
+      else if (url.pathname.endsWith('/wechat/history')) body = { jobs: [{ id: 'fixture', kind: 'generate', date: '2026-10-25', model: 'deepseek-v4.1-flash', status: 'failed', started_at: '2026-10-25T03:46:57Z', error: reason, credits: 0.22, elapsed_seconds: 24.75 }] };
       else if (url.pathname.endsWith('/wechat/generation')) {
         polls++;
         body = { job: { id: 'fixture', date: '2026-10-25', model: 'deepseek-v4.1-flash',
@@ -49,20 +50,21 @@ try {
     assert.equal(await page.locator('.wxTopicReading h2').innerText(), '已有总结保留');
     assert.equal(await page.locator('.wxJobStatus').innerText(), reason);
     await page.screenshot({ path: fileURLToPath(new URL(`${name}-failure-reading.png`, output)) });
-    await page.getByRole('button', { name: '读取管理', exact: true }).click();
-    await page.locator('.wxHistory > summary').click();
+    await page.getByRole('button', { name: '更多操作', exact: true }).click();
+    await page.getByRole('button', { name: '读取记录与积分', exact: true }).click();
     await page.evaluate(() => Promise.all(document.getAnimations()
       .filter(animation => animation.effect?.getTiming().iterations !== Infinity)
       .map(animation => animation.finished.catch(() => {}))));
-    const record = page.locator('.wxHistory .wxRecord').first();
+    const record = page.locator('.wxHistoryOverlay .wxRecord').first();
     await record.getByText(reason, { exact: true }).waitFor();
     assert.match(await record.innerText(), /0\.22 积分/);
-    assert.match(await record.innerText(), /生成失败/);
+    assert.match(await record.innerText(), /失败/);
     await record.getByText(reason, { exact: true }).scrollIntoViewIfNeeded();
     await page.screenshot({ animations: 'disabled', path: fileURLToPath(new URL(`${name}-failure-history.png`, output)) });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
     assert.deepEqual(requests.filter(request => request.method !== 'GET'), []);
     assert.deepEqual(errors, []);
+    await page.getByRole('dialog', { name: '读取记录与积分' }).getByRole('button', { name: '关闭', exact: true }).click();
     if (viewport.width <= 740) {
       await page.getByRole('button', { name: '内容情报台', exact: true }).click();
       const accountSwitch = page.locator('.mobileAccountSwitch');

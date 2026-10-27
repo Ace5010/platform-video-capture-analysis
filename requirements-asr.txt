@@ -3,3 +3,7 @@ faster-whisper==1.2.1
 # Local CPU punctuation restoration; no transcript is uploaded.
 sherpa-onnx==1.13.2
 sherpa-onnx-bin==1.13.2
+# The shared host also reads compressed WeChat archive metadata.
+zstandard==0.25.0
+# Complete animated-image frame preparation in the summary host.
+Pillow==12.3.0

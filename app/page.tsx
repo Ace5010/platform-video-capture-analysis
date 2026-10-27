@@ -948,7 +948,7 @@ export default function Home() {
   }, [apiBase, authPhase, browserReady, applyAuthStatus]);
 
   useEffect(() => {
-    if (authPhase !== 'ready') return;
+    if (authPhase !== 'ready' || !navigationReady || activeModule !== 'content') return;
     const reader = createWorkspaceRefresh({
       prepare: migrateLegacyLocalData,
       state: loadHostState,
@@ -977,7 +977,7 @@ export default function Home() {
       window.removeEventListener('focus', refresh);
       window.removeEventListener('online', refresh);
     };
-  }, [authPhase, loadHostJobs, loadHostState, loadQwenStatus, migrateLegacyLocalData]);
+  }, [authPhase, navigationReady, activeModule, loadHostJobs, loadHostState, loadQwenStatus, migrateLegacyLocalData]);
 
   useEffect(() => {
     window.localStorage.setItem(activePlatformStoreKey, JSON.stringify(activePlatform));
@@ -1869,7 +1869,7 @@ export default function Home() {
     }
   };
 
-  if (authPhase !== 'ready' || !loaded) {
+  if (authPhase !== 'ready' || !navigationReady || (activeModule === 'content' && !loaded)) {
     const setupBlocked = authPhase === 'setup' && !isHostLocal;
     return <main className="accessGate">
       <section className="accessCard" aria-live="polite">
@@ -2189,7 +2189,7 @@ export default function Home() {
       </div>}
     </main>
       </div>
-      {wechatVisited && <WeChatWorkspace active={activeModule === 'wechat'} local={isHostLocal} request={wechatRequest} page={wechatPage} onPage={page => navigateObserve('wechat', page)} onTaskStatus={setWechatTask} />}
+      {wechatVisited && <WeChatWorkspace active={activeModule === 'wechat'} local={isHostLocal} request={wechatRequest} mediaBase={apiBase} page={wechatPage} onPage={page => navigateObserve('wechat', page)} onTaskStatus={setWechatTask} />}
     </div>
   );
 }

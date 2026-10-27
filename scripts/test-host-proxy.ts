@@ -140,3 +140,23 @@ for (const query of ['?group=../private','?group=group_test&date=invalid','?grou
 }
 assert.equal((await proxyHostRequest(request('/api/wechat/search',post({Origin:'https://untrusted.example'})),env)).status,403);
 console.log('WeChat gateway passed: exact saved-read routes, preserved group/date/topic, CSRF search and blocked management.');
+
+const assetId = 'a'.repeat(64);
+respond = async () => new Response(new Uint8Array([1, 2, 3]), { headers: {
+  'Content-Type': 'image/png', 'Content-Length': '3', 'X-Secret': token,
+} });
+const image = await proxyHostRequest(request(`/api/wechat/asset?group=group_test&asset=${assetId}&path=private`), env);
+assert.equal(image.status, 200);
+assert.equal(image.headers.get('Content-Type'), 'image/png');
+assert.equal(image.headers.get('Cache-Control'), 'private, no-store');
+assert.equal(image.headers.get('X-Secret'), null);
+assert.equal(requests.at(-1)?.url, `http://127.0.0.1:43130/api/wechat/asset?group=group_test&asset=${assetId}`);
+assert.equal((await image.arrayBuffer()).byteLength, 3);
+for (const query of [`?group=group_test&asset=../config`, `?group=group_test&asset=${assetId}&asset=${assetId}`]) {
+  assert.equal((await proxyHostRequest(request('/api/wechat/asset'+query), env)).status, 400);
+}
+for (const type of ['text/html', 'image/svg+xml', 'application/javascript']) {
+  respond = async () => new Response('unsafe', { headers: { 'Content-Type': type, 'Content-Length': '6' } });
+  assert.equal((await proxyHostRequest(request(`/api/wechat/asset?group=group_test&asset=${assetId}`), env)).status, 502);
+}
+console.log('WeChat registered assets passed: exact group/hash, private binary stream, no arbitrary paths or executable media.');

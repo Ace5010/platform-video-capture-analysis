@@ -151,6 +151,8 @@ def build_export(account, group, group_name, start, end, rows, names=None, evide
         mid = message_id(account, group, row)
         sender = sender_for(row) or "unknown:" + digest([account, group, row.get("shard"), row.get("real_sender_id")])
         name = names.get(sender) or ("未知成员" if sender.startswith("unknown:") else sender)
+        if not name.strip():
+            name = "未命名群友"
         code, text, reply, media = content_for(row, account, group, names)
         if code in (80, 81):
             sender, name = "SYSTEM", "系统"
@@ -189,7 +191,19 @@ def atomic_json(path, value, validator=None):
         json.loads(tmp.read_text(encoding="utf-8"))
         if validator:
             validator(tmp)
-        os.replace(tmp, path)
+        # Windows readers do not necessarily grant delete sharing. A brief
+        # dashboard read must not abort an otherwise saved capture. Keep the
+        # old complete file visible until replacement succeeds.
+        for attempt in range(10):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError as exc:
+                if getattr(exc, 'winerror', None) not in (5, 32, 33):
+                    raise
+                if attempt == 9:
+                    raise ArchiveError('归档文件持续被占用，已保留原记录，请稍后重试') from None
+                time.sleep(min(.05 * (attempt + 1), .25))
     finally:
         tmp.unlink(missing_ok=True)
 

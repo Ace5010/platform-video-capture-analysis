@@ -17,6 +17,8 @@ from host_service.wechat.generation import GenerationManager
 
 class SummaryTests(unittest.TestCase):
     def setUp(self):
+        from host_service.wechat.models import CAPABILITIES
+        self.enterContext(patch.dict(CAPABILITIES, {'fixture': {'text': True}}))
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -39,6 +41,17 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(set(self.prepared['messages'][0]), {'id', 'speaker', 'time', 'type', 'content'})
         self.assertNotIn('person', json.dumps(self.prepared['messages']))
 
+    def test_image_only_summary_never_invokes_media_pipeline(self):
+        manager=GenerationManager(self.root)
+        with patch('host_service.wechat.summarize.check_effort'), \
+             patch('host_service.wechat.summarize.prepare_media',side_effect=AssertionError('video must not run')) as media, \
+             patch('host_service.wechat.summarize.subprocess.Popen',side_effect=OSError('fixture')):
+            manager._execute({'id':'a'*32,'date':self.day,'model':'fixture','effort':'high','started_at':'2026-10-21'})
+        media.assert_not_called()
+        job=manager.latest(self.day)
+        self.assertEqual(job['media_credits'],0)
+        self.assertEqual(job['media_models'],[])
+
     def test_coverage_rejects_gap(self):
         self.assertTrue(covers_day([(0, 10), (10, 30)], 5, 20))
         self.assertFalse(covers_day([(0, 10), (11, 30)], 5, 20))
@@ -59,7 +72,7 @@ class SummaryTests(unittest.TestCase):
         prepared = dict(self.prepared, complete=False, summarizable=True, partial=True,
                         coverage_end=day_bounds(self.day)[0]+12*3600)
         refs = list(prepared['sources'])
-        summary = {'format_version':3,'overview':'当日群聊总结','topics':[{
+        summary = {'format_version':4,'overview':'当日群聊总结','topics':[{
             'title':'测试话题','summary':'测试观点','refs':refs,'discussion_refs':refs,
             'blocks':[],'comparisons':[],'quotes':[]}], 'excluded_messages':[]}
         payloads = []
@@ -186,12 +199,13 @@ class SummaryTests(unittest.TestCase):
 
     def test_paid_result_failure_reaches_job_with_reason_and_usage(self):
         refs = list(self.prepared['sources'])
-        valid = {'format_version': 3, 'overview': '当日群聊总结', 'highlights': ['多余重点'],
+        valid = {'format_version': 4, 'overview': '当日群聊总结', 'highlights': ['多余重点'],
                  'topics': [{'title': '话题', 'summary': '正文', 'refs': refs,
                              'discussion_refs': refs}], 'excluded_messages': []}
         for mode, reason in [('coverage', '全天消息存在遗漏或冲突'),
                              ('foreign', '总结引用了本日归档以外的消息'),
-                             ('json', '模型返回的总结不是有效 JSON')]:
+                             ('json', '模型返回的总结不是有效 JSON'),
+                             ('legacy', '模型未遵守讨论分段规范 v4')]:
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 old = {'version': 'old'}
@@ -202,6 +216,8 @@ class SummaryTests(unittest.TestCase):
                     value['topics'][0]['discussion_refs'] = refs[:1]
                 elif mode == 'foreign':
                     value['topics'][0]['refs'] = ['other-day']
+                elif mode == 'legacy':
+                    value['format_version'] = 3
                 result = '{invalid json' if mode == 'json' else json.dumps(value)
                 raw = json.dumps([{'type': 'message', 'role': 'assistant', 'providerData': {
                     'model': 'fixture', 'rawUsage': {'credit': .22}}},
@@ -232,9 +248,9 @@ class SummaryTests(unittest.TestCase):
 
     def test_extra_fields_publish_with_one_call(self):
         refs = list(self.prepared['sources'])
-        value = {'format_version': 3, 'overview': '当日群聊总结', 'highlights': ['多余重点'],
+        value = {'format_version': 4, 'overview': '当日群聊总结', 'highlights': ['多余重点'],
                  'topics': [{'title': '话题', 'summary': '正文', 'refs': refs,
-                             'discussion_refs': refs, 'points': ['多余要点']}], 'excluded_messages': []}
+                             'discussion_refs': refs, 'points': []}], 'excluded_messages': []}
         def process(*args, **kwargs):
             def communicate(payload, timeout):
                 kwargs['stdout'].write(json.dumps({'subtype': 'success', 'result': value}).encode())

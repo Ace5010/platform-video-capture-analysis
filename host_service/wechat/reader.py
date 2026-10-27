@@ -7,10 +7,12 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import struct
 import subprocess
 import tempfile
+import time
 import types
 
 from .archive import ArchiveError, member_ids_for
@@ -59,6 +61,38 @@ def source_stamp(path):
         except FileNotFoundError:
             entries.append(None)
     return entries
+
+
+def copy_stable_source(source, directory, attempts=5):
+    """Freeze encrypted DB + WAL before slow decryption; never alter the source."""
+    source = Path(source)
+    target = Path(directory) / 'source.db'
+    wal = Path(str(source) + '-wal')
+    target_wal = Path(str(target) + '-wal')
+    for attempt in range(attempts):
+        before = source_stamp(source)
+        try:
+            shutil.copy2(source, target)
+            if before[1] is not None:
+                shutil.copy2(wal, target_wal)
+            else:
+                target_wal.unlink(missing_ok=True)
+            if source_stamp(source) == before:
+                if before[1] is not None and target_wal.stat().st_size > 32:
+                    check_wal_boundary(target_wal, target.stat().st_size)
+                return target
+        except FileNotFoundError:
+            # A checkpoint or unfinished WAL commit can overlap the short copy.
+            # Discard both files and retry the pair, never a mixed generation.
+            pass
+        except IncompleteRead as exc:
+            if str(exc) not in ('WAL 正在写入，请稍后重试', 'WAL 尚无完整提交边界，请稍后重试'):
+                raise
+            if attempt + 1 == attempts:
+                raise
+        if attempt + 1 < attempts:
+            time.sleep(.1 * (attempt + 1))
+    raise IncompleteRead('数据库在制作读取副本时发生变化，请重试')
 
 
 def check_wal_boundary(path, db_size):
@@ -135,14 +169,22 @@ def make_reader(module, db_dir, account, pid, cache, contacts_only=False):
             finally:
                 module._decrypt_page = decrypt
 
+        def _db_path(self, rel):
+            return getattr(self, '_frozen_sources', {}).get(rel) or super()._db_path(rel)
+
         def _open(self, rel):
-            src = self._db_path(rel)
-            before = source_stamp(src)
-            conn = super()._open(rel)
-            if source_stamp(src) != before:
-                conn.close()
-                raise IncompleteRead("数据库在制作读取副本时发生变化，请重试")
-            return conn
+            src = super()._db_path(rel)
+            Path(self.workdir).mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix='snapshot-', dir=self.workdir) as directory:
+                frozen = copy_stable_source(src, directory)
+                self._frozen_sources = {rel: str(frozen)}
+                module.wxlog.failure_reason = None
+                try:
+                    # The upstream still decrypts, merges and quick-checks the
+                    # complete snapshot. New live messages cannot tear it.
+                    return super()._open(rel)
+                finally:
+                    self._frozen_sources = {}
 
     db = SelectedDB(db_dir=str(base), account=account, workdir=str(cache))
     if db.account != account:
@@ -215,7 +257,7 @@ def read_rows(db, group, start, end, page_size=200):
                     row = dict(original)
                     # 仅保留必要来源字段；不复制整个原表。
                     row = {k: row.get(k) for k in ("local_id", "server_id", "sort_seq", "local_type",
-                           "real_sender_id", "create_time", "message_content", "compress_content")}
+                           "real_sender_id", "create_time", "message_content", "compress_content", "packed_info_data")}
                     row.update(shard=shard, chat_id=group,
                                sender_username=mapping.get(row["real_sender_id"], ""))
                     rows.append(row)
@@ -274,5 +316,29 @@ def probe(pid, group_name, data_dir):
                     conn.close()
             return {"pid": pid, "db_dir": base, "account_dir": db.account, "account_id": db.wxid,
                     "matches": matches, "data_dir": str(Path(data_dir).resolve())}
+        finally:
+            db._keys.clear()
+
+
+def find_groups(config, group_name):
+    """Match contacts in the explicitly configured account; never read messages."""
+    pid = active_pid(config['pid'])
+    module = load_upstream()
+    cache_root = Path(config['data_dir']).resolve() / 'cache'
+    cache_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='groups-', dir=cache_root) as directory:
+        db = make_reader(module, config['db_dir'], config['account_dir'], pid, directory, contacts_only=True)
+        try:
+            if db.wxid != config['account_id']:
+                raise ArchiveError('来源账号标识不匹配')
+            matches = {}
+            for rel, _, _ in db._db_files:
+                conn = db._open(rel)
+                try:
+                    for row in conn.execute("SELECT username,nick_name FROM contact WHERE nick_name=? AND username LIKE '%@chatroom'", (group_name,)):
+                        matches[row[0]] = {'group_id': row[0], 'group_name': row[1]}
+                finally:
+                    conn.close()
+            return list(matches.values())
         finally:
             db._keys.clear()

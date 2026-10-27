@@ -8,7 +8,7 @@ const COOKIE_NAME = 'douyin_monitor_session';
 const MAX_BODY_BYTES = 64 * 1024;
 const GET_PATHS = new Set(['/health', '/api/auth/status', '/api/state', '/api/jobs', '/api/qwen', '/api/qwen/status']);
 const POST_PATHS = new Set(['/api/auth/login', '/api/auth/logout', '/api/accounts/upsert', '/api/accounts/remove', '/api/accounts/ack-updates', '/api/discoveries/clear', '/api/video-links/analyze', '/api/jobs', '/api/previews/prepare']);
-const WECHAT_READ_PATHS = new Set(['/api/wechat/context', '/api/wechat/days', '/api/wechat/summary', '/api/wechat/original']);
+const WECHAT_READ_PATHS = new Set(['/api/wechat/context', '/api/wechat/days', '/api/wechat/summary', '/api/wechat/original', '/api/wechat/asset']);
 // On-demand playback: the host resolves the low-resolution source itself, so
 // the gateway only ever forwards a registered work id and a source generation.
 const PREVIEW_STATUS_PATH = /^\/api\/previews\/\d{1,32}\/status$/;
@@ -106,17 +106,35 @@ export async function proxyHostRequest(request: Request, env: HostProxyEnvironme
     }
     if (WECHAT_READ_PATHS.has(path) && path !== '/api/wechat/context') {
       const fields = path === '/api/wechat/days' ? ['group']
+        : path === '/api/wechat/asset' ? ['group', 'asset']
         : path === '/api/wechat/original' ? ['group', 'date', 'topic'] : ['group', 'date'];
       for (const field of fields) {
         if (!url.searchParams.has(field)) continue;
         const value = url.searchParams.get(field) || '';
         const valid = field === 'group' ? /^[a-zA-Z0-9_-]{1,80}$/.test(value)
+          : field === 'asset' ? /^[a-f0-9]{64}$/.test(value)
           : field === 'date' ? /^\d{4}-\d{2}-\d{2}$/.test(value) : /^\d{1,2}$/.test(value);
         if (!valid || url.searchParams.getAll(field).length !== 1) return errorResponse(400, '微信阅读参数无效');
         target.searchParams.set(field, value);
       }
     }
     const upstream = await env.HOST_SERVICE.fetch(new Request(target, { method: request.method, headers, body, redirect: 'manual', signal }));
+    if (path === '/api/wechat/asset' && upstream.status === 200) {
+      const type = upstream.headers.get('Content-Type') || '';
+      const size = upstream.headers.get('Content-Length') || '';
+      if (!['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'application/octet-stream'].includes(type)
+          || !/^\d+$/.test(size) || Number(size) < 1 || Number(size) > 64 * 1024 * 1024
+          || !target.searchParams.has('group') || !target.searchParams.has('asset')) {
+        await upstream.body?.cancel();
+        return errorResponse(502, '微信群附件响应无效');
+      }
+      return new Response(upstream.body, { headers: {
+        'Content-Type': type, 'Content-Length': size, 'Cache-Control': 'private, no-store',
+        'Content-Disposition': type.startsWith('image/') ? 'inline' : 'attachment',
+        'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
+        'Content-Security-Policy': "default-src 'none'; sandbox",
+      } });
+    }
     if (mediaPath && [200, 206, 416].includes(upstream.status)) {
       if ((upstream.status !== 416 && upstream.headers.get('Content-Type')?.split(';')[0] !== 'video/mp4')
           || !/^bytes$/.test(upstream.headers.get('Accept-Ranges') || '')
