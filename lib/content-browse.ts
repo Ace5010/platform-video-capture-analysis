@@ -1,6 +1,21 @@
 export type ContentBrowseScope = 'all' | 'latest';
 export type ContentResultFilter = 'all' | 'available' | 'missing';
 
+/** Source metadata can contain a whole caption. Never use ASR or analysis as a heading. */
+export function videoDisplayTitle(video: { title: string; description: string }): string {
+  const source = (video.title.trim() || video.description.trim())
+    .replace(/(?<![A-Za-z0-9])(?:#[^\s#]+)+/gu, '').trim();
+  const firstLine = source.split(/\r?\n/u).find(line => line.trim())?.trim() || '';
+  const text = firstLine.replace(/\s+/gu, ' ');
+  const characters = Array.from(text);
+  if (characters.length <= 48) return text || '未命名视频';
+
+  // Prefer the source's opening sentence; preserve wording and never invent a summary.
+  const opening = Array.from(text.match(/^.*?(?:[。！？!?]|\.{3,}|…+)/u)?.[0] || '');
+  if (opening.length >= 8 && opening.length <= 48) return opening.join('');
+  return characters.slice(0, 47).join('').trimEnd() + '…';
+}
+
 /** The feed shows only the source description, with a repeated title omitted. */
 export function contentSourceDescription(video: { title: string; description: string }): string {
   const description = video.description.trim();

@@ -40,6 +40,8 @@ try {
   });
   await page.goto('http://localhost:3000', { waitUntil: 'domcontentloaded' });
   await page.locator('.compactVideoCopy').first().waitFor();
+  await mkdir('artifacts/detail-hover', { recursive: true });
+  await page.screenshot({ path: 'artifacts/detail-hover/feed-motion-desktop.png', fullPage: true });
   await page.evaluate(() => { window.motionRequests = []; });
   async function sample(selector, expected, closing = false) {
     return page.evaluate(({ selector, expected, closing }) => new Promise(resolve => {

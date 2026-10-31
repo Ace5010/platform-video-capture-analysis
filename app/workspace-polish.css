@@ -1,0 +1,135 @@
+/* Shared surface and motion language; scoped to the two Observe workspaces.
+   Higher specificity keeps these rules independent of workspace stylesheet order. */
+.observeShell {
+  --surface-rail: color-mix(in srgb, var(--ink) 3%, var(--paper));
+  --surface-hover: color-mix(in srgb, var(--green) 5%, var(--paper));
+  --surface-selected: color-mix(in srgb, var(--green) 9%, var(--paper));
+  --surface-shadow: 0 2px 5px #192b3b06, 0 12px 32px #192b3b0d;
+  --motion-settle: cubic-bezier(.2,.8,.2,1);
+  --nav-radius: 10px;
+  --nav-inset: 12px;
+}
+/* Navigation uses the same inset and row rhythm in both workspaces. */
+.observeShell .accountRail { padding: 20px 12px 16px; }
+.observeShell .railOptions { gap: 4px; padding: 4px 0 8px; }
+.observeShell :is(.railAccount, .railLink) { min-height: 48px; padding: 10px var(--nav-inset); border-radius: var(--nav-radius); }
+.observeShell .railAccount { grid-template-columns: 30px minmax(0, 1fr) auto; gap: 10px; padding-block: 8px; }
+.observeShell :is(.railAll, .railDiscoveries) { border-bottom: 0; margin-bottom: 0; }
+.observeShell .railDiscoveries { margin-bottom: 16px; }
+.observeShell .railAdd { margin-top: 20px; min-height: 44px; border-radius: var(--nav-radius); }
+.observeShell .railAccount:hover, .observeShell .railLink:hover { background: var(--surface-hover); }
+.observeShell .railCount { white-space: nowrap; }
+.observeShell .wxGroups { padding: 20px 12px 16px; }
+.observeShell .wxGroupOptions h2 { margin: 0 var(--nav-inset) 16px; line-height: 24px; }
+.observeShell .wxGroupOptions button { min-height: 48px; padding: 12px var(--nav-inset); border-radius: var(--nav-radius); line-height: 24px; overflow-wrap: anywhere; }
+.observeShell .wxGroups .wxAddGroupButton { margin-top: 20px; min-height: 44px; border-radius: var(--nav-radius); }
+.observeShell .navigation .navItem { gap: 10px; border-radius: var(--nav-radius); }
+.observeShell .navigation .navItem::before { border-radius: inherit; }
+.observeShell .navigation .navItem:hover { transform: none; }
+.observeShell .navIcon { width: 16px; height: 16px; font-size: 14px; flex: 0 0 16px; }
+@media (max-width: 740px) {
+  .observeShell .accountRail { padding: 8px 16px; }
+  .observeShell .railAccount { grid-template-columns: minmax(0, 1fr) auto; }
+  .observeShell .railDiscoveries { grid-column: 1 / -1; margin-bottom: 8px; }
+  .observeShell .railAdd { margin-top: 12px; }
+  .observeShell .navigation .navItem { gap: 6px; }
+}
+@media (max-width: 1100px) {
+  .observeShell .wxGroups { padding: 10px 12px; }
+  .observeShell .wxGroupOptions button { min-height: 44px; padding: 10px 12px; }
+  .observeShell .wxGroups .wxAddGroupButton { margin-top: 0; }
+}
+.observeShell .accountRail, .observeShell .wxGroups { background: var(--surface-rail); }
+.observeShell .wxTopics { background: color-mix(in srgb, var(--ink) 1%, var(--paper)); }
+.observeShell .wxGroupOptions button { border-color: transparent; margin-bottom: 4px; }
+.observeShell .wxGroupOptions button[aria-current] { background: var(--paper); box-shadow: 0 1px 4px #192b3b0a; }
+.observeShell .wxTopicOptions button[aria-current], .observeShell .railAccount[aria-pressed="true"], .observeShell .railLink[aria-pressed="true"] {
+  background: var(--surface-selected); border-color: transparent; box-shadow: inset 3px 0 var(--green);
+}
+.observeShell .wxModule button { transition: background-color 140ms, color 140ms, box-shadow 140ms, transform 140ms var(--motion-settle); }
+.observeShell .wxModule button:hover:not(:disabled) { background: var(--surface-hover); }
+.observeShell .wxModule .wxPrimary:hover:not(:disabled) { background: color-mix(in srgb, var(--green) 88%, var(--ink)); }
+.observeShell .wxModule .wxDanger:hover:not(:disabled) { background: #92251c; }
+.observeShell .wxModule button:active:not(:disabled) { transform: translateY(1px); }
+.observeShell .wxModule button:focus-visible, .observeShell .wxModule input:focus-visible, .observeShell .wxModule select:focus-visible {
+  outline: 2px solid var(--green); outline-offset: 3px;
+}
+.observeShell .wxModule input:focus, .observeShell .wxModule select:focus { box-shadow: 0 1px 3px #192b3b14, 0 5px 14px #192b3b09; }
+.observeShell .compactVideoRow { border-bottom-color: color-mix(in srgb, var(--line) 65%, transparent); transition: background-color 140ms; }
+.observeShell .compactVideoRow:hover { background: var(--surface-hover); }
+.observeShell .compactVideoRow[data-selected="true"] { background: var(--surface-selected); box-shadow: inset 3px 0 var(--green); }
+.observeShell .compactVideo:hover, .observeShell .railAccount:hover, .observeShell .railLink:hover { translate: none; }
+.observeShell .compactVideoCopy:hover, .observeShell .readerTabs button:hover { transform: none; }
+.observeShell .compactVideoCopy:hover { color: var(--green); }
+.observeShell .compactCover { border-color: transparent; background: var(--surface-rail); }
+.observeShell .accountCard, .observeShell .statCard { border-color: color-mix(in srgb, var(--line) 65%, transparent); box-shadow: 0 2px 8px #192b3b05; }
+.observeShell .readerTabs { background: var(--surface-rail); }
+.observeShell .readerTabs button { min-width: 5em; }
+.observeShell .wxDateButton { min-width: 112px; }
+.observeShell :is(time, .railCount, .compactVideoMetrics, .wxDateNavigation, .wxDateRange, .wxRecord, .wxJobStatus) { font-variant-numeric: tabular-nums; }
+.observeShell .wxJobStatus { min-height: 37px; }
+.observeShell .wxJobStatus[data-running="true"]::before {
+  content: ''; display: inline-block; width: 7px; height: 7px; margin-right: 9px;
+  border-radius: 50%; background: var(--green); vertical-align: .08em; animation: observeBusy 1.6s ease-in-out infinite;
+}
+.observeShell .wxTopicReading article { max-width: 760px; }
+.observeShell .wxTopicReading h2 { letter-spacing: -.02em; }
+.observeShell .wxTopicReading article + article { border-top-color: color-mix(in srgb, var(--line) 65%, transparent); }
+.observeShell .wxMoreMenu, .observeShell .wxDatePopover, .observeShell .observeSettings > div {
+  box-shadow: var(--surface-shadow); border-color: color-mix(in srgb, var(--line) 70%, transparent);
+  transform-origin: top; animation: observeMenuIn 160ms var(--motion-settle);
+}
+.observeShell .wxOverlay { animation: observeLayerIn 190ms var(--motion-settle); }
+.observeShell .wxOriginalLayer { animation: observeOriginalIn 220ms var(--motion-settle); }
+.observeShell .wxReadingStatus { position: relative; flex: 0 0 auto; }
+.observeShell .wxReadingStatus > summary { display: grid; place-items: center; width: 30px; height: 34px; list-style: none; cursor: pointer; color: var(--muted); border-radius: 7px; font-size: 20px; }
+.observeShell .wxReadingStatus > summary::-webkit-details-marker { display: none; }
+.observeShell .wxReadingStatus > summary:hover, .observeShell .wxReadingStatus[open] > summary { background: var(--surface-hover); color: var(--green); }
+.observeShell .wxReadingStatus > summary:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+/* Keep status details out of the reading flow, including native details transitions. */
+.observeShell .wxReadingStatus::details-content { position: absolute; right: 0; top: calc(100% + 8px); height: auto; overflow: visible; transition: none; z-index: 26; }
+.observeShell .wxReadingStatusPanel { width: min(330px, calc(100vw - 32px)); padding: 14px 16px; background: var(--paper); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--surface-shadow); font-size: 14px; line-height: 1.7; color: var(--muted); }
+.observeShell .wxReadingStatusPanel p { margin: 0; }
+.observeShell .wxReadingStatusPanel p + p { margin-top: 8px; }
+.observeShell .wxReadingStatusPanel { max-height: min(420px, 55dvh); overflow-y: auto; overscroll-behavior: contain; overflow-wrap: anywhere; scrollbar-width: thin; }
+.observeShell .wxMissingList h3 { margin: 0 0 10px; font-size: 14px; color: var(--ink); }
+.observeShell p + .wxMissingList { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.observeShell .wxMissingList ul { list-style: none; margin: 0; padding: 0; }
+.observeShell .wxMissingList li + li { margin-top: 12px; }
+.observeShell .wxMissingList strong, .observeShell .wxMissingList span { display: block; }
+.observeShell .wxMissingList span { margin-top: 4px; }
+@media (max-width:700px) {
+  .observeShell .wxReadingStatus { position: absolute; bottom: 14px; right: 14px; z-index: 24; }
+  .observeShell .wxReadingStatus > summary { width: 32px; height: 32px; background: var(--paper); box-shadow: 0 2px 10px #192b3b18; border: 1px solid var(--line); }
+  .observeShell .wxReadingStatus::details-content { top: auto; bottom: calc(100% + 8px); }
+}
+.observeShell .wxConfirm { animation: observeDialogIn 190ms var(--motion-settle); }
+.observeShell .wxConfirmBackdrop, .observeShell .wxGroupBackdrop { animation: observeFadeIn 150ms ease-out; }
+.observeShell .wxFilters { animation: observeMenuIn 160ms var(--motion-settle); }
+.observeShell .observeContent:not([hidden]), .observeShell .wxModule:not([hidden]) { animation: observeFadeIn 180ms ease-out; }
+.observeShell .observeContent .readingDialog:not(.isClosing) { animation: readerReveal 160ms var(--motion-settle); }
+.observeShell .observeContent .readingDialog.isClosing { animation: readerClose 120ms var(--motion-settle); }
+.observeShell .wxReadingPlaceholder { flex: 1; min-height: 0; overflow: hidden; }
+.observeShell .wxSkeletonReading { min-width: 0; padding: 26px 32px 40px; }
+.observeShell .wxSkeletonDirectory { padding: 24px 20px; border-right: 1px solid var(--line); background: color-mix(in srgb, var(--ink) 1%, var(--paper)); }
+.observeShell .wxSkeletonDirectory i { display: block; height: 14px; margin-bottom: 36px; border-radius: 4px; background: var(--surface-rail); }
+.observeShell .wxSkeletonArticle { max-width: 760px; margin: 0 auto 38px; animation: observeSkeleton 1.8s ease-in-out infinite; }
+.observeShell .wxSkeletonArticle i { display: block; height: 12px; margin-bottom: 14px; border-radius: 4px; background: var(--surface-rail); }
+.observeShell .wxSkeletonArticle i:first-child { width: 54%; height: 22px; margin-bottom: 22px; }
+.observeShell .wxSkeletonArticle i:last-child { width: 72%; }
+@keyframes observeFadeIn { from { opacity: .5; } to { opacity: 1; } }
+@keyframes observeMenuIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+@keyframes observeLayerIn { from { opacity: .4; transform: translateX(12px); } to { opacity: 1; transform: none; } }
+@keyframes observeOriginalIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: none; } }
+@keyframes observeDialogIn { from { opacity: 0; transform: translateY(8px) scale(.99); } to { opacity: 1; transform: none; } }
+@keyframes observeBusy { 50% { opacity: .4; } }
+@keyframes observeSkeleton { 50% { opacity: .45; } }
+@media (max-width: 700px) {
+  .observeShell .wxSkeletonReading { padding: 18px 14px 30px; }
+  .observeShell .wxSkeletonDirectory { padding: 20px 12px; }
+  .observeShell .wxDateButton { min-width: 100px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .observeShell *, .observeShell *::before, .observeShell *::after { animation: none !important; transition: none !important; }
+  .observeShell .wxModule button:active:not(:disabled) { transform: none; }
+}

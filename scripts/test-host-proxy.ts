@@ -120,9 +120,11 @@ console.log('HTTPS 主机网关检查通过：来源、白名单、Cookie、凭�
 respond = async () => Response.json({ ok: true, messages: [] });
 for (const [path, query] of [
   ['/api/wechat/context', ''],
+  ['/api/wechat/context', '?group=group_second'],
   ['/api/wechat/days', '?group=group_test'],
   ['/api/wechat/summary', '?group=group_test&date=2026-10-24'],
   ['/api/wechat/original', '?group=group_test&date=2026-10-24&topic=2'],
+  ['/api/wechat/original', '?group=group_test&date=2026-10-24&topic=120'],
 ]) {
   assert.equal((await proxyHostRequest(request(path+query+(query?'&':'?')+'target=private'), env)).status, 200);
   assert.equal(requests.at(-1)?.url, 'http://127.0.0.1:43130'+path+query);
@@ -137,6 +139,9 @@ for (const path of ['/api/wechat/read','/api/wechat/generate','/api/wechat/gener
 assert.equal(requests.length,beforeRestrictedWeChat);
 for (const query of ['?group=../private','?group=group_test&date=invalid','?group=group_test&date=2026-10-24&topic=-1','?group=group_test&group=other']) {
   assert.equal((await proxyHostRequest(request('/api/wechat/original'+query),env)).status,400);
+}
+for (const query of ['?group=../private', '?group=group_test&group=other']) {
+  assert.equal((await proxyHostRequest(request('/api/wechat/context'+query),env)).status,400);
 }
 assert.equal((await proxyHostRequest(request('/api/wechat/search',post({Origin:'https://untrusted.example'})),env)).status,403);
 console.log('WeChat gateway passed: exact saved-read routes, preserved group/date/topic, CSRF search and blocked management.');

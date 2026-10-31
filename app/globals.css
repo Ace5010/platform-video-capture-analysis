@@ -1,5 +1,6 @@
 @import 'tailwindcss';
 @import '../public/app-icons/observe-coral-brand.css';
+@import './workspace-polish.css';
 
 :root {
   color-scheme: only light;
@@ -856,7 +857,7 @@ button:active:not(:disabled) { transform: translateY(1px) scale(.98); }
 .compactVideoAuthor { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-bottom: 7px; }
 .compactAuthorName { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); font-size: 16px; font-weight: 700; line-height: 1.5; }
 .compactAuthorFollowers { color: #586a71; font-size: 14px; line-height: 1.5; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.compactVideoCopy { display: block; min-width: 0; font-size: 18px; font-weight: 600; line-height: 1.6; overflow-wrap: anywhere; }
+.compactVideoCopy { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; min-width: 0; font-size: 18px; font-weight: 600; line-height: 1.6; overflow-wrap: anywhere; }
 .compactVideoMeta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin-top: 5px; color: var(--muted); font-size: 14px; line-height: 1.5; }
 .compactVideoSummary { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; margin: 8px 0 12px; font-size: 15px; line-height: 1.75; color: #47585f; overflow-wrap: anywhere; }
 .compactVideoFooter { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; margin-top: 8px; }
@@ -1007,6 +1008,8 @@ button:active:not(:disabled) { transform: translateY(1px) scale(.98); }
 .previewMetadata, .videoPreview .analysisCosts { margin: 16px 0 0; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: #f0f5f4; font-size: 14px; }
 .previewMetadata > summary, .videoPreview .analysisCosts > summary { font-size: 14px; cursor: pointer; }
 .previewMetadata > p { margin: 14px 0 0; color: var(--muted); }
+.sourceVideoDescription .readingText { margin-top: 14px; font-size: var(--reading-size, 18px); line-height: 1.7; overflow-wrap: anywhere; }
+.sourceVideoDescription .readingText p:last-child { margin-bottom: 0; }
 .previewMetrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 16px; }
 .previewMetrics small, .previewMetrics b { display: block; font-size: 14px; }
 .previewMetrics small { color: var(--muted); margin-bottom: 4px; }

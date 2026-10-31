@@ -64,6 +64,7 @@
 .wxMessage time { color: var(--muted); font-size: 13px; }
 .wxMessage p { margin: 7px 0; white-space: pre-wrap; line-height: 1.8; font-size: 15px; }
 .wxMessageTarget { background: var(--selected-gradient); outline: 8px solid color-mix(in srgb,var(--green) 10%,transparent); border-radius: 4px; }
+.wxMessage > .wxTextButton + .wxTextButton { margin-left: 12px; }
 .wxOverlay { position: absolute; inset: 0; z-index: 30; background: var(--paper,#fff); display: flex; flex-direction: column; }
 .wxOverlay > header { display: flex; gap: 20px; justify-content: space-between; align-items: center; padding: 16px 28px; border-bottom: 1px solid var(--line); }
 .wxOverlay h2 { font-size: 18px; margin: 0; }
@@ -190,7 +191,7 @@
 .wxModelOptions button { text-align: left; font-size: 15px; padding: 10px 12px; }
 .wxAnalysisDate { margin-top: 14px; }
 .wxAnalysisDate input { flex: 1; }
-.wxAnalysisSetup .wxActions { justify-content: flex-end; position: sticky; bottom: 0; padding: 12px 0; background: var(--paper,#fff); }
+.wxAnalysisSetup .wxActions { justify-content: flex-end; padding: 12px 0; background: var(--paper,#fff); }
 .wxRunDetails { margin-top: 16px; }
 .wxRunDetails summary { cursor: pointer; }
 .wxRunDetails > div { display: flex; gap: 6px 16px; flex-wrap: wrap; border-top: 1px solid var(--line); margin-top: 12px; padding-top: 12px; }

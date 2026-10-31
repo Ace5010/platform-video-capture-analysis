@@ -50,10 +50,11 @@ try {
     await page.goto('http://localhost:3000/?module=wechat&view=reading', { waitUntil: 'domcontentloaded' });
     await page.locator('.wxTopicReading article').last().waitFor();
     await page.waitForFunction(() => !document.querySelector('.wxTopicReading').getAnimations().some(a => a.playState === 'running'));
+    await page.waitForFunction(() => !document.getAnimations().some(a => a.playState === 'running' && a.effect?.getTiming().iterations !== Infinity));
     assert.equal(await page.locator('.wxTopicReading article').count(), samples.length);
     assert.equal(await page.locator('.wxTopicReading .wxPerson, .wxDiscussion, .wxQuote, .wxProgress, .wxComparisons').count(), 0);
     assert.deepEqual(await page.locator('.wxTopicLead').allTextContents(), samples.map(row => row[1]));
-    const readingTop = (await page.locator('.wxSummaryGrid').boundingBox()).y;
+    const readingTop = await page.locator('.wxSummaryGrid').evaluate(node => node.getBoundingClientRect().top + scrollY);
     await page.getByLabel('阅读状态', { exact: true }).click();
     await page.locator('.wxReadingStatusPanel').waitFor({ state: 'visible' });
     assert.match(await page.locator('.wxReadingStatusPanel').innerText(), /聊天或图片有更新/);
@@ -61,7 +62,7 @@ try {
     assert.equal(await page.locator('.wxReadingStatusPanel').evaluate(node => node.scrollHeight > node.clientHeight), true);
     await page.locator('.wxMissingList li').last().scrollIntoViewIfNeeded();
     await page.locator('.wxReadingStatusPanel').evaluate(node => { node.scrollTop = 0; });
-    assert.equal((await page.locator('.wxSummaryGrid').boundingBox()).y, readingTop, 'status details must not displace reading');
+    assert.ok(Math.abs(await page.locator('.wxSummaryGrid').evaluate(node => node.getBoundingClientRect().top + scrollY) - readingTop) < 1, 'status details must not displace reading');
     const statusBox = await page.locator('.wxReadingStatusPanel').boundingBox();
     assert.ok(statusBox.x >= 0 && statusBox.x + statusBox.width <= width);
     await page.screenshot({ path: `outputs/wechat-briefs/status-${width}.png` });

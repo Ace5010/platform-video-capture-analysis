@@ -9,6 +9,7 @@ try {
  for (const width of [1440,390,320]) {
   const context=await browser.newContext({viewport:{width,height:900},locale:'zh-CN'});
   const calls=[];const errors=[];const page=await context.newPage();
+  let revision='a'.repeat(64);
   page.on('pageerror',e=>errors.push(e.message));
   const messages=[{id:'m0001',sender:'甲',time:'09:00:00',content:'<img src="https://exfil.invalid/private" onerror="window.leaked=true">'},
                   {id:'m0002',sender:'乙',time:'09:00:01',content:'这是已保存的完整讨论。'}];
@@ -22,9 +23,9 @@ try {
    if(path==='/api/auth/status')body={configured:true,authenticated:true,csrfToken:'c'.repeat(64),localHost:false};
    else if(path==='/api/state')body={accounts:[],videos:[],linkVideos:[],snapshots:[]};
    else if(path==='/api/jobs')body={jobs:[]};
-   else if(path==='/api/wechat/context')body={groups:[{id:'group_test',name:'共享测试群',start:1792796400,end:1792882800}],members:[{id:'u_test',name:'甲'}],batches:[],read_jobs:[]};
-   else if(path==='/api/wechat/days')body={days:['2026-10-23','2026-10-24'].map(date=>({date,ready:true,complete:true,summarizable:true}))};
-   else if(path==='/api/wechat/summary')body={status:'ready',people:{},summary:{format_version:3,notes:[],topics:[0,1].map(n=>({title:`共享话题${n+1}`,navigation_title:`目录${n+1}`,summary:'这段总结来自电脑已保存的归档。',discussion_complete:true,discussion_count:2}))}};
+   else if(path==='/api/wechat/context')body={revision,groups:[{id:'group_test',name:'共享测试群',start:1792796400,end:1792882800}],members:[{id:'u_test',name:'甲'}],batches:[],read_jobs:[]};
+   else if(path==='/api/wechat/days')body={days:['2026-10-23','2026-10-24',...(revision.startsWith('b')?['2026-10-25']:[])].map(date=>({date,ready:true,complete:true,summarizable:true}))};
+   else if(path==='/api/wechat/summary')body={status:'ready',people:{},summary:{format_version:3,notes:[],topics:Array.from({length:121},(_,n)=>({title:`共享话题${n+1}`,navigation_title:`目录${n+1}`,summary:revision.startsWith('b')?'电脑刚保存的新版总结。':'这段总结来自电脑已保存的归档。',discussion_complete:true,discussion_count:2}))}};
    else if(path==='/api/wechat/original')body={messages,total:2,complete:true};
    else if(path==='/api/wechat/search'){
     const data=r.postDataJSON();body=data.anchor?{messages,total:2,anchor:data.anchor,next:null}:{messages,total:2,next:null};
@@ -59,6 +60,25 @@ try {
   await page.getByRole('button',{name:'2026-10-23',exact:true}).click();
   await page.waitForTimeout(200);
   assert.ok(calls.some(c=>c.path==='/api/wechat/summary'&&c.query.includes('date=2026-10-23')));
+  await page.getByRole('button',{name:'目录101',exact:true}).click();
+  await page.waitForTimeout(500);
+  const summariesBefore=calls.filter(c=>c.path==='/api/wechat/summary').length;
+  const positionBefore=await page.locator('.wxTopicReading [data-topic-index="100"]').evaluate(node=>node.getBoundingClientRect().top);
+  assert.ok(await page.locator('.wxTopicReading').evaluate(node=>node.scrollTop)>0);
+  const contextRead=page.waitForResponse(r=>new URL(r.url()).pathname.endsWith('/wechat/context'));
+  await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
+  await contextRead;
+  await page.waitForTimeout(200);
+  assert.equal(calls.filter(c=>c.path==='/api/wechat/summary').length,summariesBefore,'unchanged archive must not reload reading');
+  revision='b'.repeat(64);
+  await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
+  await page.waitForFunction(()=>document.querySelector('.wxTopicReading')?.textContent.includes('电脑刚保存的新版总结。'),null,{timeout:5000});
+  assert.equal(await page.getByRole('button',{name:'目录101',exact:true}).getAttribute('aria-current'),'true','sync keeps the selected topic');
+  assert.ok(Math.abs(await page.locator('.wxTopicReading [data-topic-index="100"]').evaluate(node=>node.getBoundingClientRect().top)-positionBefore)<2,'sync keeps the reading position even when earlier topics change height');
+  assert.match(calls.findLast(c=>c.path==='/api/wechat/summary').query,/date=2026-10-23/,'sync keeps the selected date');
+  await page.getByRole('button',{name:'选择聊天日期',exact:true}).click();
+  assert.equal(await page.getByRole('button',{name:'2026-10-25',exact:true}).count(),1,'newly saved dates synchronize');
+  await page.getByRole('button',{name:'2026-10-25',exact:true}).click();
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
   assert.deepEqual(errors,[]);
   assert.ok(calls.filter(c=>c.method==='POST').every(c=>c.path==='/api/wechat/search'));

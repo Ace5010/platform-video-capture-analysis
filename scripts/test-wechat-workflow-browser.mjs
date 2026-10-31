@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir } from 'node:fs/promises';
 import { chromium } from 'playwright-core';
 
-const output = 'outputs/wechat-queue-20261027';
+const output = 'outputs/wechat-recovery-20261028';
 await mkdir(output, { recursive: true });
 const browser = await chromium.launch({ channel: 'chrome', headless: true });
 try {
@@ -11,7 +11,7 @@ try {
     const context = await browser.newContext({ viewport: { width, height: 900 }, locale: 'zh-CN' });
     await context.addInitScript(() => localStorage.setItem('douyin-monitor.sqlite-migration.v1', 'isolated-test'));
     const page = await context.newPage(), writes = [], errors = [];
-    let record = null, phase = 'reading';
+    let record = null, phase = 'reading', failContext = true;
     let pendingContexts = 0, peakContexts = 0;
     const contentReads = [];
     page.on('pageerror', error => errors.push(error.message));
@@ -26,6 +26,10 @@ try {
       else if (path.endsWith('/jobs')) body = { jobs: [] };
       else if (path.endsWith('/qwen/status')) body = {};
       else if (path.endsWith('/wechat/context')) {
+        if (failContext) {
+          failContext = false;
+          return route.abort('connectionrefused');
+        }
         if (record && width === 1440) {
           pendingContexts++;
           peakContexts = Math.max(peakContexts, pendingContexts);
@@ -56,18 +60,29 @@ try {
         body = { jobs: [record, { ...record, id: 'second-job', group: 'second', status: 'queued' }] };
       } else if (path.endsWith('/wechat/history')) body = { jobs: [
         ...(record ? [record] : []),
-        { id: 'old', kind: 'read_and_summarize', scope: 'date', date: '2026-10-24', model: 'deepseek-v4.1-flash', status: 'failed', started_at: '2026-10-25T03:00:00Z', credits: .18, error: '总结未通过校验，已有总结保留', children: [{ id: 'old-child', date: '2026-10-24', status: 'failed', model: 'deepseek-v4.1-flash', credits: .18 }] },
+        { id: 'old', kind: 'read_and_summarize', scope: 'date', phase: 'summarizing', date: '2026-10-24', model: 'deepseek-v4.1-flash', status: 'failed', started_at: '2026-10-25T03:00:00Z', credits: .18, error: '总结未通过校验，已有总结保留', children: [{ id: 'old-child', date: '2026-10-24', status: 'failed', model: 'deepseek-v4.1-flash', credits: .18 }] },
         { id: 'unverified', kind: 'generate', date: '2026-10-23', model: 'hy4-preview', status: 'failed', started_at: '2026-10-24T03:00:00Z', credits: null },
       ] };
       else throw new Error(`Unexpected API ${path}`);
       await route.fulfill({ contentType: 'application/json', body: JSON.stringify(body) });
     });
     await page.goto('http://localhost:3000/?module=wechat&view=manage', { waitUntil: 'domcontentloaded' });
+    const connectionError = page.getByRole('alert').filter({ hasText: '连接不到电脑后台，请检查后台和网络后重试。' });
+    await connectionError.waitFor();
+    assert.doesNotMatch(await connectionError.innerText(), /Failed to fetch/);
+    assert.deepEqual(writes, [], 'A disconnected read must not submit or retry any paid action');
+    await page.screenshot({ animations: 'disabled', path: `${output}/connection-error-${width}.png` });
+    await connectionError.getByRole('button', { name: '重试', exact: true }).click();
     await page.locator('.wxTopicReading h2').first().waitFor();
+    await connectionError.waitFor({ state: 'hidden' });
+    assert.deepEqual(writes, [], 'Retry must only reload saved content');
     assert.match(page.url(), /view=reading/);
     assert.equal(await page.getByRole('button', { name: '读取管理', exact: true }).count(), 0);
     assert.equal(await page.getByRole('button', { name: '聊天原文', exact: true }).count(), 0);
     assert.equal(await page.locator('.wxTopicOptions').isVisible(), true);
+    await page.locator('.wxSummaryGrid').evaluate(async element => {
+      await Promise.all(element.getAnimations().map(animation => animation.finished.catch(() => {})));
+    });
     const summaryTop = (await page.locator('.wxSummaryGrid').boundingBox()).y;
     assert.equal(await page.locator('.wxMissingResources').count(), 0);
     await page.getByLabel('阅读状态', { exact: true }).click();
@@ -78,15 +93,15 @@ try {
     });
     assert.equal(await page.locator('.wxReadingStatusPanel').evaluate(el => el.scrollWidth > el.clientWidth), false);
     assert.ok(Math.abs((await page.locator('.wxSummaryGrid').boundingBox()).y - summaryTop) < 1, 'Status panel must not shift the reading layout');
-    await page.screenshot({path:`${output}/missing-${width}.png`});
+    await page.screenshot({ animations: 'disabled',path:`${output}/missing-${width}.png`});
     await page.getByLabel('阅读状态', { exact: true }).click();
-    await page.screenshot({ path: `${output}/reading-${width}.png` });
+    await page.screenshot({ animations: 'disabled', path: `${output}/reading-${width}.png` });
     await page.getByRole('button', { name: '前一天', exact: true }).click();
     await page.getByRole('button', { name: '选择聊天日期', exact: true }).filter({ hasText: '2026-10-24' }).waitFor();
     await page.getByRole('button', { name: '后一天', exact: true }).click();
     await page.getByRole('button', { name: '读取并总结', exact: true }).click();
     const setup = page.getByRole('dialog', { name: '读取并总结', exact: true });
-    assert.equal(await setup.getByRole('button', { name: /从上次总结继续/ }).getAttribute('aria-pressed'), 'true');
+    assert.equal(await setup.getByRole('button', { name: /补齐未总结聊天/ }).getAttribute('aria-pressed'), 'true');
     assert.equal(await setup.getByRole('button', { name: 'DeepSeek V4.1 Flash', exact: true }).getAttribute('aria-pressed'), 'true');
     assert.equal(await setup.locator('select').count(), 0);
     assert.equal(await setup.getByRole('button', { name: '读取记录与积分', exact: true }).count(), 0);
@@ -96,23 +111,27 @@ try {
     await setup.getByRole('button', { name: '清空选择', exact: true }).click();
     assert.equal(await setup.getByRole('button', { name: '加入队列（0）' }).isDisabled(), true);
     await setup.getByRole('button', { name: '全选', exact: true }).click();
-    assert.equal(await setup.getByRole('button', { name: /从上次总结继续/ }).isDisabled(), true);
+    assert.equal(await setup.getByRole('button', { name: /补齐未总结聊天/ }).isDisabled(), true);
     await setup.getByLabel('新加入的学习群', { exact: true }).uncheck();
-    await setup.getByRole('button', { name: /从上次总结继续/ }).click();
-    await page.screenshot({ path: `${output}/setup-${width}.png` });
+    await setup.getByRole('button', { name: /补齐未总结聊天/ }).click();
+    await page.screenshot({ animations: 'disabled', path: `${output}/setup-${width}.png` });
+    await setup.evaluate(el => { el.scrollTop = el.scrollHeight; });
+    await setup.getByRole('button', { name: '加入队列（2）', exact: true }).scrollIntoViewIfNeeded();
+    assert.ok(await setup.evaluate(el => el.querySelector('p').getBoundingClientRect().bottom <= el.querySelector('.wxActions').getBoundingClientRect().top), 'Actions must not cover the scope explanation');
+    await page.screenshot({ animations: 'disabled', path: `${output}/setup-bottom-${width}.png` });
     await setup.getByRole('button', { name: '指定日期', exact: true }).click();
     await setup.getByLabel('总结日期', { exact: true }).fill('2026-10-24');
     assert.equal(await setup.getByLabel('总结日期', { exact: true }).inputValue(), '2026-10-24');
-    await page.screenshot({ path: `${output}/date-${width}.png` });
+    await page.screenshot({ animations: 'disabled', path: `${output}/date-${width}.png` });
     await setup.getByRole('button', { name: '全部聊天', exact: true }).click();
     assert.equal(await setup.getByLabel('总结日期', { exact: true }).count(), 0);
-    await setup.getByRole('button', { name: /从上次总结继续/ }).click();
+    await setup.getByRole('button', { name: /补齐未总结聊天/ }).click();
     await setup.getByRole('button', { name: 'GLM 5.3 Flash', exact: true }).click();
     await setup.getByRole('button', { name: '加入队列（2）', exact: true }).click();
     await setup.waitFor({ state: 'hidden' });
     await page.locator('.wxJobStatus', { hasText: '正在读取' }).waitFor();
     await page.getByLabel('读取队列').getByText('排队中', { exact: true }).waitFor();
-    await page.screenshot({ path: `${output}/queue-${width}.png` });
+    await page.screenshot({ animations: 'disabled', path: `${output}/queue-${width}.png` });
     assert.equal(await page.getByRole('button', { name: '读取并总结', exact: true }).isDisabled(), false);
     await page.getByRole('button', { name: '读取并总结', exact: true }).click();
     assert.equal(await setup.getByLabel(/AI 产品与实践交流群/).isDisabled(), true);
@@ -135,13 +154,14 @@ try {
     await history.getByText('0.42 积分', { exact: true }).waitFor();
     assert.match(await history.innerText(), /0\.18 积分/);
     assert.match(await history.innerText(), /积分待核实/);
+    assert.match(await history.innerText(), /总结未完成/);
     await history.locator('.wxRunDetails summary').click();
     await page.waitForFunction(() => {
       const details = document.querySelector('.wxRunDetails');
       return details?.open && getComputedStyle(details, '::details-content').opacity === '1'
         && details.clientHeight >= details.querySelector('div').clientHeight + details.querySelector('summary').clientHeight;
     });
-    await page.screenshot({ path: `${output}/history-${width}.png` });
+    await page.screenshot({ animations: 'disabled', path: `${output}/history-${width}.png` });
     assert.equal(await history.evaluate(el => el.scrollWidth > el.clientWidth), false);
     await history.getByRole('button', { name: '关闭', exact: true }).click();
     await page.getByRole('button', { name: '更多操作', exact: true }).click();
@@ -154,7 +174,7 @@ try {
     assert.equal(await cleanup.getByRole('button', { name: '确认清理', exact: true }).isDisabled(), true);
     assert.equal(writes.filter(w => w.path === '/api/wechat/cleanup').length, 0);
     assert.equal(await cleanup.evaluate(el => el.scrollWidth > el.clientWidth), false);
-    await page.screenshot({ path: `${output}/cleanup-${width}.png` });
+    await page.screenshot({ animations: 'disabled', path: `${output}/cleanup-${width}.png` });
     await cleanup.getByLabel('我确认清理以上记录', { exact: true }).check();
     await cleanup.getByRole('button', { name: '确认清理', exact: true }).click();
     await cleanup.waitFor({ state: 'hidden' });

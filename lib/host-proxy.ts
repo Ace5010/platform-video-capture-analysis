@@ -104,8 +104,8 @@ export async function proxyHostRequest(request: Request, env: HostProxyEnvironme
       if (!/^\d{1,3}$/.test(limit) || Number(limit) < 1 || Number(limit) > 100) return errorResponse(400, '任务数量范围无效');
       target.searchParams.set('limit', limit);
     }
-    if (WECHAT_READ_PATHS.has(path) && path !== '/api/wechat/context') {
-      const fields = path === '/api/wechat/days' ? ['group']
+    if (WECHAT_READ_PATHS.has(path)) {
+      const fields = path === '/api/wechat/context' || path === '/api/wechat/days' ? ['group']
         : path === '/api/wechat/asset' ? ['group', 'asset']
         : path === '/api/wechat/original' ? ['group', 'date', 'topic'] : ['group', 'date'];
       for (const field of fields) {
@@ -113,7 +113,7 @@ export async function proxyHostRequest(request: Request, env: HostProxyEnvironme
         const value = url.searchParams.get(field) || '';
         const valid = field === 'group' ? /^[a-zA-Z0-9_-]{1,80}$/.test(value)
           : field === 'asset' ? /^[a-f0-9]{64}$/.test(value)
-          : field === 'date' ? /^\d{4}-\d{2}-\d{2}$/.test(value) : /^\d{1,2}$/.test(value);
+          : field === 'date' ? /^\d{4}-\d{2}-\d{2}$/.test(value) : /^\d{1,9}$/.test(value);
         if (!valid || url.searchParams.getAll(field).length !== 1) return errorResponse(400, '微信阅读参数无效');
         target.searchParams.set(field, value);
       }

@@ -260,7 +260,7 @@ class HostRequestHandler(BaseHTTPRequestHandler):
                     result = {'groups': [{key: group[key] for key in
                               ('id', 'name', 'start', 'end', 'message_count', 'status') if key in group}
                               for group in result['groups']], 'members': result['members'],
-                              'batches': [], 'read_jobs': []}
+                              'batches': [], 'read_jobs': [], 'revision': result['revision']}
             else:
                 result = service.post(action, payload)
         except ArchiveError as exc:

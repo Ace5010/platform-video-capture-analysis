@@ -312,7 +312,7 @@ class WeChatService:
         self._ensure_queue_worker()
         services = self._services()
         if not services:
-            return {'groups': [], 'members': [], 'batches': [], 'read_jobs': []}
+            return {'groups': [], 'members': [], 'batches': [], 'read_jobs': [], 'revision': digest([])}
         selected = self._service_for(group) if group else services[0]
         contexts = [(s, s._single_context()) for s in services]
         result = next(c for s, c in contexts if s is selected)
@@ -340,14 +340,19 @@ class WeChatService:
             _, value, config, specs, _ = self.context_cache
             # Download progress changes frequently. Updating these small counts
             # must not reparse/revalidate every historical message again.
-            group = dict(value['groups'][0], resource_coverage=coverage_specs(specs, self._inventory(config)))
+            with self.data_guard:
+                inventory = self._inventory(config)
+                # Readers need an opaque change marker, never local paths,
+                # account identifiers or management/job records.
+                revision = digest([stamp, self.inventory_cache[0], datetime.now(TZ).date().isoformat()])
+            group = dict(value['groups'][0], resource_coverage=coverage_specs(specs, inventory))
             pending=self.root/'cleanup-pending.json'
             if pending.exists():
                 info=self.root/'cleanup-pending-info.json'
                 item=(json.loads(info.read_text(encoding='utf-8')) if info.exists() else
                       json.loads(pending.read_text(encoding='utf-8'))['preview'])
                 group['cleanup_pending']={'from':item['from_date'],'to':item['to_date']}
-            return dict(value, groups=[group], read_jobs=self.read_jobs())
+            return dict(value, groups=[group], read_jobs=self.read_jobs(), revision=revision)
 
     def _build_context(self):
         metadata = []

@@ -1,6 +1,20 @@
 import assert from 'node:assert/strict';
 
-import { browseContentVideos, collectionAccountScope, contentSourceDescription } from '../lib/content-browse.ts';
+import { browseContentVideos, collectionAccountScope, contentSourceDescription, videoDisplayTitle, orderContentVideosNewestFirst } from '../lib/content-browse.ts';
+
+const caption = '我做了一条Agent自动化流水线... ' + '完整发布文案与任务说明。'.repeat(30);
+const sourceVideo = Object.freeze({ title: caption, description: caption, transcript: '这是一段单独保存的口播稿' });
+assert.equal(videoDisplayTitle(sourceVideo), '我做了一条Agent自动化流水线...');
+assert.equal(sourceVideo.title, caption, 'display formatting preserves saved source text');
+assert.equal(videoDisplayTitle({ title: '短标题 #AI #教程', description: caption }), '短标题');
+assert.equal(videoDisplayTitle({ title: '短标题！#AI#教程', description: caption }), '短标题！');
+assert.equal(videoDisplayTitle({ title: 'C# 教程 #编程', description: '' }), 'C# 教程');
+assert.equal(videoDisplayTitle({ title: '标题第一行\n正文说明'.repeat(5), description: '' }), '标题第一行');
+assert.equal(videoDisplayTitle({ title: '', description: '仅有原始文案' }), '仅有原始文案');
+assert.equal(videoDisplayTitle({ ...sourceVideo, title: '', description: '' }), '未命名视频');
+assert.equal(videoDisplayTitle({ title: 'Kimi K3.1 Pro 与 GPT-6 Astra 的比较', description: '' }), 'Kimi K3.1 Pro 与 GPT-6 Astra 的比较');
+assert.equal(videoDisplayTitle({ title: '完整原文'.repeat(40), description: '' }), '完整原文'.repeat(11) + '完整原…');
+assert.equal(Array.from(videoDisplayTitle({ title: '🎬'.repeat(80), description: '' })).length, 48);
 
 // The list description is source material, never a transcript or generated summary.
 const completed = { title: 'AI 视频教程', description: '', transcript: '已保存的口播正文', analysis: { summary: '模型分析摘要' } };
@@ -127,6 +141,13 @@ assert.deepEqual(ids(browseContentVideos(mixedDates, accounts, {
   accountId: '', scope: 'all', result: 'all',
 })), ['newer-utc', 'same-instant', 'older-offset', 'invalid', 'unknown']);
 
+// A 26th publication precedes the 25th even when the older video was discovered later.
+assert.deepEqual(orderContentVideosNewestFirst([
+  { id: 'published-25', publishedAt: '2026-10-25T22:21:00+08:00', discoveredAt: '2026-10-26T12:00:00+08:00' },
+  { id: 'published-26-late', publishedAt: '2026-10-26T09:30:00+08:00', discoveredAt: '2026-10-26T09:31:00+08:00' },
+  { id: 'published-26-early', publishedAt: '2026-10-25T17:00:00Z', discoveredAt: '2026-10-26T10:00:00+08:00' },
+]).map(item => item.id), ['published-26-late', 'published-26-early', 'published-25']);
+
 assert.equal(collectionAccountScope('内容浏览', 'account-a', 'account-b'), 'account-a');
 assert.equal(collectionAccountScope('内容浏览', '', 'account-b'), '');
 assert.equal(collectionAccountScope('互动数据', 'account-a', 'account-b'), 'account-b');
@@ -134,4 +155,4 @@ assert.equal(collectionAccountScope('互动数据', 'account-a', ''), '');
 assert.equal(collectionAccountScope('信源管理', 'account-a', 'account-b'), '');
 assert.equal(collectionAccountScope('链接分析', 'account-a', 'account-b'), '');
 
-console.log('Content browsing validation passed: account filters, saved latest IDs, legacy fallback, partial results, publication chronology, link isolation, immutable sorting, and manual collection scope.');
+console.log('Content browsing validation passed: bounded source titles, transcript isolation, preserved original text, account filters, saved latest IDs, legacy fallback, partial results, publication chronology, link isolation, immutable sorting, and manual collection scope.');

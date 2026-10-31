@@ -393,6 +393,8 @@ class NativeWeChatTests(unittest.TestCase):
             self.assertEqual(result['groups'][0]['id'],self.group)
             self.assertEqual(result['batches'],[]);self.assertEqual(result['read_jobs'],[])
             self.assertNotIn('account_label',result['groups'][0])
+            self.assertRegex(result['revision'], r'^[a-f0-9]{64}$')
+            self.assertEqual(result['revision'], self.service.context()['revision'])
             self.assertEqual(dict(headers)['Cache-Control'],'private, no-store')
             for path in paths[1:]:self.assertEqual(remote.request('GET',path,origin=origin)[0],200)
             self.assertEqual(remote.request('POST','/api/wechat/search',self.query,origin=origin)[1]['total'],120)

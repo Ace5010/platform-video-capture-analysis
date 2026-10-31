@@ -74,6 +74,29 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(self.service.context()['groups'][0]['summary_end'], end)
             self.assertEqual(build.call_count, 1)
 
+    def test_read_revision_tracks_saved_content_without_exposing_metadata(self):
+        from host_service.wechat.resources import scope
+        first = self.service.context()['revision']
+        self.assertRegex(first, r'^[a-f0-9]{64}$')
+        self.assertEqual(self.service.context()['revision'], first)
+        save(self.root/'read-jobs'/('b'*32+'.json'), dict(id='b'*32, status='failed', started_at='2026-10-20', error='fixture'))
+        self.assertEqual(self.service.context()['revision'], first)
+        config = json.loads((self.root/'config.json').read_text(encoding='utf-8'))
+        save(self.root/'resources.json', dict(version=1, scope=scope(config), messages={}))
+        resources = self.service.context()['revision']
+        self.assertNotEqual(resources, first)
+        _, end = day_bounds(self.days[0])
+        target = self.root/'summaries'/(self.days[0]+'.json')
+        save(target, dict(source_hash='fixture', summary={}, coverage_end=end))
+        published = self.service.context()['revision']
+        self.assertNotEqual(published, resources)
+        save(target, dict(source_hash='fixture', summary={'topics': []}, coverage_end=end))
+        revised = self.service.context()['revision']
+        self.assertNotEqual(revised, published)
+        self.assertEqual(WeChatService(self.root).context()['revision'], revised)
+        target.unlink()
+        self.assertNotEqual(self.service.context()['revision'], revised)
+
     def generate(self, day, **kwargs):
         self.calls.append(day)
         prepared = prepare_day(self.root, day)
